@@ -1,0 +1,250 @@
+% =====================================================================
+%  hkjjxy-format.sty —— 海口经济学院 本科毕业论文（设计）LaTeX 格式包
+%  依据：《附件13 论文格式（修订10.21）》
+%  用法：\documentclass[12pt,a4paper,fontset=windows,UTF8]{ctexart}
+%        \usepackage{hkjjxy-format}
+%  编译：XeLaTeX 运行两次（第二次生成目录与交叉引用）
+%
+%  每条设置后的【X-x】编号与《论文格式要求_逐条清单.md》一一对应，
+%  需要核对某条规则时，直接在该 md 文件里搜索编号即可。
+% =====================================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{hkjjxy-format}[2026/10/10 v1.0 Haikou University of Economics Thesis Format]
+
+% ---------------- 【A-1 / A-2】纸张与页边距 ----------------
+\RequirePackage{geometry}
+\geometry{top=30mm,bottom=30mm,left=25mm,right=20mm}
+
+% ---------------- 基础宏包 ----------------
+\RequirePackage[fleqn]{amsmath}   % 【F-6】公式；fleqn 实现【F-1】缩进到 \mathindent
+\RequirePackage{graphicx}         % 【E】插图
+\RequirePackage{booktabs}         % 【D-2/D-3】三线表
+\RequirePackage{makecell}         % 表头换行
+\RequirePackage{caption}          % 【E-3】图题格式
+\RequirePackage{enumitem}         % 【C-9】参考文献列表
+\RequirePackage{tocloft}          % 【C-1】目录格式
+\RequirePackage{float}            % 【D-8】表格位置 [H]
+\RequirePackage{perpage}          % 【C-8.3】脚注每页重新编号
+\RequirePackage{indentfirst}      % 首段也缩进
+\RequirePackage{array}            % 表格列格式
+\RequirePackage{tabularx}         % 表格首列自适应宽度
+\RequirePackage{exscale}          % 公式五号字下 cmex 尺寸可缩放，消除 Size substitutions 警告
+\RequirePackage{hyperref}         % 交叉引用超链接（参考文献/图表跳转）
+
+\hypersetup{hidelinks,colorlinks=false,bookmarksnumbered=true,bookmarksopen=true}
+
+% 公式为五号(10.5pt)时 cmex 无对应尺寸，固定映射以消除 Size substitutions 警告
+\makeatletter
+\DeclareFontShape{OMX}{cmex}{m}{n}{<-7.5>cmex7 <7.5-8.5>cmex8 <8.5-9.5>cmex9 <9.5->cmex10}{}
+\makeatother
+
+% ================= 全局字体 =================
+\setmainfont{Times New Roman}                  % 西文：Times New Roman
+\setCJKmainfont{SimSun}[AutoFakeBold=3]        % 中文：宋体（合成加粗 = Word 的「宋体+加粗」）
+\setCJKsansfont{SimHei}                        % 黑体本身即粗体，不再二次加粗
+% ctex 字族（\songti \heiti \kaishu \fangsong 背后的族名）同步处理，
+% 否则正文里写 \bfseries 会报 "Font shape TU/xxx/b/n undefined"
+\setCJKfamilyfont{zhsong}{SimSun} [AutoFakeBold=3]
+\setCJKfamilyfont{zhkai}{KaiTi}   [AutoFakeBold=3]
+\setCJKfamilyfont{zhfs}{FangSong} [AutoFakeBold=3]
+\setCJKfamilyfont{zhhei}{SimHei}  [BoldFont=SimHei]   % 黑体不再叠加假粗
+
+% ================= 【C-6.4】正文版式 =================
+\setlength{\parindent}{2\ccwd}    % 首行缩进 2 字符
+\linespread{1.5}\selectfont       % 1.5 倍行距
+\xeCJKsetup{CJKspace=true}
+
+% ================= 【J-3】页码：页脚居中，无页眉 =================
+% ctexart 默认 pagestyle=headings（页眉印章节名、页码在右上），
+% 与格式要求「页码页面底端居中」不符，改为 plain；封面/声明/目录首页由 \thispagestyle{empty} 单独屏蔽
+\pagestyle{plain}
+
+% ================= 题目信息（在正文中用 \cnTitle{...} 填写） =================
+\newcommand{\cnTitle}[1]{\gdef\theCnTitle{#1}}
+\newcommand{\enTitle}[1]{\gdef\theEnTitle{#1}}
+\newcommand{\cnSubTitle}[1]{\gdef\theCnSubTitle{#1}}   % 副标题（可选，如「——以XX为例」）
+\cnTitle{（在此填写中文题目）}
+\enTitle{（English Title Here）}
+\cnSubTitle{}
+
+% ================= 【C-7】各级标题 =================
+% 注意：ctex 新版用 \ctexset；每组必须写成单行，换行会被解析为 \par 导致 key 失效
+\ctexset{section = { format={\heiti\zihao{-3}\raggedright}, name={,}, number={\arabic{section}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={6pt}, afterskip={6pt}, runin=false }}
+\ctexset{subsection = { format={\heiti\zihao{4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={4pt}, afterskip={4pt}, runin=false }}
+\ctexset{subsubsection = { format={\heiti\zihao{-4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}.\arabic{subsubsection}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={3pt}, afterskip={3pt}, runin=false }}
+\ctexset{paragraph = { format={\songti\zihao{-4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}.\arabic{subsubsection}.\arabic{paragraph}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={3pt}, afterskip={3pt}, runin=false }}
+
+% 【C-1.1】目录收录到三级标题；四级编号保留但不进目录
+\setcounter{secnumdepth}{4}
+\setcounter{tocdepth}{3}
+
+% ================= 【C-1】目录外观：宋体小四、各级顶格、全部带虚线 =================
+\renewcommand{\cftsecfont}{\zihao{-4}\songti}
+\renewcommand{\cftsubsecfont}{\zihao{-4}\songti}
+\renewcommand{\cftsubsubsecfont}{\zihao{-4}\songti}
+\renewcommand{\cftsecpagefont}{\zihao{-4}\songti}
+\renewcommand{\cftsubsecpagefont}{\zihao{-4}\songti}
+\renewcommand{\cftsubsubsecpagefont}{\zihao{-4}\songti}
+% 三级标题全部顶格（缩进为 0）
+\setlength{\cftsecindent}{0pt}
+\setlength{\cftsubsecindent}{0pt}
+\setlength{\cftsubsubsecindent}{0pt}
+% 序号占宽：按「1 / 1.1 / 1.1.1」自然宽度 + 空一格，条目文字随序号自然后移
+\setlength{\cftsecnumwidth}{1.6em}
+\setlength{\cftsubsecnumwidth}{2.6em}
+\setlength{\cftsubsubsecnumwidth}{3.6em}
+\setlength{\cftbeforesecskip}{0pt}
+\setlength{\cftbeforesubsecskip}{0pt}
+% 一级条目（摘要/关键词/引言/各章/参考文献/致谢）也带点线引导符
+\renewcommand{\cftsecleader}{\cftdotfill{\cftdotsep}}
+
+% ---------- 目录/表目录/图目录 总标题：宋体小二加粗居中 ----------
+\renewcommand{\contentsname}{目\hspace{4\ccwd}录}
+\renewcommand{\listtablename}{表\hspace{2\ccwd}目\hspace{2\ccwd}录}
+\renewcommand{\listfigurename}{图\hspace{2\ccwd}目\hspace{2\ccwd}录}
+\renewcommand{\cfttoctitlefont}{\hfil\songti\zihao{-2}\bfseries}
+\renewcommand{\cftaftertoctitle}{\hfil\vspace*{6mm}}
+\renewcommand{\cftlottitlefont}{\hfil\songti\zihao{-2}\bfseries}
+\renewcommand{\cftafterlottitle}{\hfil\vspace*{6mm}}
+\renewcommand{\cftloftitlefont}{\hfil\songti\zihao{-2}\bfseries}
+\renewcommand{\cftafterloftitle}{\hfil\vspace*{6mm}}
+
+% ---------- 表目录/图目录条目：宋体小四、顶格、点线 ----------
+\renewcommand{\cfttabfont}{\zihao{-4}\songti}
+\renewcommand{\cfttabpagefont}{\zihao{-4}\songti}
+\setlength{\cfttabindent}{0pt}
+\setlength{\cftbeforetabskip}{0pt}
+\renewcommand{\cftfigfont}{\zihao{-4}\songti}
+\renewcommand{\cftfigpagefont}{\zihao{-4}\songti}
+\setlength{\cftfigindent}{0pt}
+\setlength{\cftbeforefigskip}{0pt}
+
+% ================= 【C-8】脚注：①②… 每页重编号，宋体/TNR 五号 =================
+% 把带圈数字区（U+2460–U+2473）声明为 CJK 字符类，强制用中文字体渲染，避免 Times 无此字形
+\xeCJKDeclareCharClass{CJK}{"2460 -> "2473}
+\MakePerPage{footnote}
+% 带圈数字 ①②③…（直接用 Unicode 字形，字体统一，不依赖符号字体；超过 ⑩ 回退为 (11) 形式）
+\newcommand{\circlednum}[1]{\ifcase#1\or ①\or ②\or ③\or ④\or ⑤\or ⑥\or ⑦\or ⑧\or ⑨\or ⑩\else(#1)\fi}
+\renewcommand{\thefootnote}{\circlednum{\arabic{footnote}}}
+\renewcommand{\footnotesize}{\zihao{5}\songti}
+
+% ================= 【E-2/E-3】图题：图下方、居中、黑体五号 =================
+\renewcommand{\figurename}{图\hspace{1\ccwd}}
+\DeclareCaptionFont{wuhaohei}{\zihao{5}\heiti\bfseries}
+\captionsetup[figure]{position=below, justification=centering, singlelinecheck=false, font=wuhaohei, labelfont=wuhaohei, textfont=wuhaohei, labelsep=quad, skip=4pt}
+
+% ================= 【D】表格 =================
+\newcounter{tblnum}
+% 【D-4】表题样式一：表号与表名居中连排（样张默认，推荐）
+\newcommand{\biaotou}[1]{\refstepcounter{tblnum}\phantomsection\addcontentsline{lot}{table}{表\thetblnum\quad #1}\begin{center}\linespread{1}\selectfont\zihao{5}\heiti\bfseries 表\thetblnum\quad #1\end{center}\vspace{-6pt}}
+% 【D-4】表题样式二：表号居左 / 表名居中 / 单位居右（如需改回此样式，把上面的 \biaotou 注释掉即可）
+\newcommand{\biaotouLR}[3][]{\refstepcounter{tblnum}\begin{center}\linespread{1}\selectfont\zihao{5}\heiti\bfseries\begin{tabular}{@{}p{0.14\linewidth} p{0.58\linewidth} r @{}} 表\thetblnum & \centering #2 & #1\end{tabular}\end{center}\vspace{-6pt}}
+% 【D-2/D-3】三线表环境：顶/底线 1.5 磅，栏目线 0.5 磅；表体宋体五号、单倍行距
+\newenvironment{thestab}[1][htbp]{\begin{table}[#1]\centering\linespread{1}\selectfont\zihao{5}\songti\setlength{\heavyrulewidth}{1.5bp}\setlength{\lightrulewidth}{0.5bp}\setlength{\cmidrulewidth}{0.5bp}\renewcommand{\arraystretch}{1.15}}{\end{table}}
+% 【D-7】表下方资料出处说明：小五号
+\newcommand{\tabnote}[1]{\par\vspace{2pt}\noindent{\linespread{1}\selectfont\zihao{-5}\songti #1}\par}
+% 【D】一体化三线表环境（推荐）：表题 + 表体 + 表注打包进同一个浮动体，
+%     避免三者各自浮动而分离。用法：
+%       \begin{thesTab}[htbp]{表名}{表注}
+%         \begin{tabularx}{0.86\linewidth}{X c c c} ...... \end{tabularx}
+%       \end{thesTab}
+%     需要 \label 时写在表名里：\begin{thesTab}{表名\label{tab:x}}{表注}
+\makeatletter
+\newenvironment{thesTab}[3][htbp]{%
+  \begin{table}[#1]\refstepcounter{tblnum}\phantomsection\addcontentsline{lot}{table}{表\thetblnum\quad #2}\centering
+  \def\thesTabNote{#3}%
+  \linespread{1}\selectfont\zihao{5}\songti
+  \setlength{\heavyrulewidth}{1.5bp}\setlength{\lightrulewidth}{0.5bp}\setlength{\cmidrulewidth}{0.5bp}%
+  \renewcommand{\arraystretch}{1.15}%
+  {\heiti\bfseries 表\thetblnum\quad #2\par}\vspace{2pt}}{%
+  \if\relax\detokenize{\thesTabNote}\relax\else\par\vspace{2pt}\noindent{\zihao{-5}\songti \thesTabNote\par}\fi
+  \end{table}}
+\makeatother
+
+% ================= 【F】公式 =================
+\RequirePackage{mathtools}
+% 【F-3】编号格式「（1）式」：用 mathtools 自定义 tag，避免 LaTeX 默认再套一层 ( )
+\newtagform{cn}{（}{）式}
+\usetagform{cn}
+\setlength{\mathindent}{2\ccwd}                          % 【F-1】左缩进 2 字符
+\AtBeginDocument{\everydisplay\expandafter{\the\everydisplay\linespread{1}\selectfont\zihao{5}\songti}}
+\setlength{\abovedisplayskip}{0.5\baselineskip}
+\setlength{\belowdisplayskip}{0.5\baselineskip}
+\setlength{\abovedisplayshortskip}{0.5\baselineskip}
+\setlength{\belowdisplayshortskip}{0.5\baselineskip}
+
+% ================= 【C-9】参考文献列表 =================
+\newlist{thesref}{enumerate}{1}
+\setlist[thesref]{label={[\arabic*]}, align=left, labelwidth=2.2em, labelsep=0pt, leftmargin=2.2em, itemindent=0pt, itemsep=0pt, parsep=0pt, topsep=0pt, partopsep=0pt, format={\linespread{1}\selectfont\zihao{5}\songti\sloppy\emergencystretch=2em}}
+
+% ================= 不带编号的一级块（参考文献、致谢） =================
+% 【M】不带冒号，黑体小四，顶格，两端对齐，并自动进目录
+\newcommand{\unnumsec}[1]{\par\vspace{4pt}\noindent{\heiti\zihao{-4}\linespread{1.5}\selectfont #1}\par\vspace{4pt}\phantomsection\addcontentsline{toc}{section}{#1}}
+
+% ================= 摘要区：中文题目、英文题目 =================
+% 【C-2】中文题目：黑体小二居中；有副标题时下一行同字号排
+\newcommand{\cnTitleBlock}{%
+  \begin{center}\heiti\zihao{-2}\linespread{1.5}\selectfont
+    \theCnTitle
+    \ifx\theCnSubTitle\empty\else\\\theCnSubTitle\fi
+  \end{center}\vspace{6mm}}
+% 【C-4】英文题目：Times New Roman 小三居中
+\newcommand{\enTitleBlock}{\begin{center}{\linespread{1.5}\selectfont\zihao{-3}\bfseries \theEnTitle}\end{center}\vspace{4mm}}
+
+% 【C-3】中文摘要：标签楷体小四加粗，正文楷体五号
+\newcommand{\cnAbstract}[1]{\phantomsection\addcontentsline{toc}{section}{摘要}\noindent{\kaishu\zihao{-4}\bfseries 摘\quad 要：}{\kaishu\zihao{5} #1}}
+% 【C-3】中文关键词
+\newcommand{\cnKeywords}[1]{\par\vspace{4mm}\phantomsection\addcontentsline{toc}{section}{关键词}\noindent{\kaishu\zihao{-4}\bfseries 关键词：}{\kaishu\zihao{5} #1}}
+% 【C-5】英文摘要
+\newcommand{\enAbstract}[1]{\par\vspace{4mm}\noindent{\linespread{1.5}\selectfont\zihao{5}\bfseries Abstract:}\space{\linespread{1.5}\selectfont\zihao{5} #1}}
+% 【C-5】英文关键词
+\newcommand{\enKeywords}[1]{\par\vspace{3mm}\noindent{\linespread{1.5}\selectfont\zihao{5}\bfseries Key words:}\space{\linespread{1.5}\selectfont\zihao{5} #1}}
+
+% ================= 【L-2】声明页（宋体小四，统一字号） =================
+\newcommand{\statementpage}{%
+  \thispagestyle{empty}
+  \begin{center}
+    {\heiti\zihao{2}\linespread{1.5}\selectfont 声\ \ \ 明}
+  \end{center}
+  \vspace{8mm}
+  \noindent{\songti\zihao{-4}\linespread{1.5}\selectfont
+  本人郑重声明：所呈交的毕业论文（设计），是本人在指导老师指导下，独立进行研究工作所取得的成果；除文中已经注明引用的内容外，本毕业论文（设计）的研究成果不包含任何他人享有著作权的内容；对本论文（设计）所涉及的研究工作做出贡献的其他个人和集体，均已在文中以明确方式标明。}
+  \vspace{20mm}
+  \begin{flushright}
+    \linespread{1.6}\selectfont\zihao{-4}\songti
+    \begin{tabular}{@{}l@{}}
+      本人签名：\underline{\hspace{4cm}} \\[4mm]
+      日\qquad 期：\underline{\hspace{1cm}} 年 \underline{\hspace{0.8cm}} 月 \underline{\hspace{0.8cm}} 日
+    \end{tabular}
+  \end{flushright}
+  \newpage
+}
+
+% ================= 【C-1】目录页：主目录 +（有条目时）表目录 + 图目录 =================
+% 标题由 tocloft 自动输出（宋体小二加粗居中），此处不再手写，避免出现两个「目录」
+% 图目录/表目录按需输出：正文中有图/表才印，没有就不印。
+% 通过 aux 文件记录全文图表总数，第二次编译时即可判断
+\makeatletter
+\AtEndDocument{%
+  \immediate\write\@auxout{\string\gdef\string\hktabtotal{\arabic{tblnum}}}%
+  \immediate\write\@auxout{\string\gdef\string\hkfigtotal{\arabic{figure}}}}
+\makeatother
+\newcommand{\tocpage}{%
+  \thispagestyle{empty}
+  \tableofcontents
+  \ifdefined\hktabtotal
+    \ifnum\hktabtotal>0\relax
+      \vspace{2\baselineskip}
+      \listoftables
+    \fi
+  \fi
+  \ifdefined\hkfigtotal
+    \ifnum\hkfigtotal>0\relax
+      \vspace{2\baselineskip}
+      \listoffigures
+    \fi
+  \fi
+  \newpage
+}
+
+\endinput
