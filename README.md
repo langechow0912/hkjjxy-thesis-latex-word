@@ -24,9 +24,14 @@ thesis-format/
 │   ├── 企业筹资风险研究/
 │   └── 以岭药业财务风险分析/
 │
+├── web/                        # FastAPI 后端 + 单文件前端（无 CDN 依赖）
+├── deploy/Caddyfile            # 反向代理 + 自动 HTTPS
+├── docker-compose.server.yml   # 服务器部署（应用 + Caddy）
+│
 └── docs/
     ├── new-school-guide.md     # 新增学校的 6 步操作手册
-    └── lessons-learned.md      # 本轮踩坑清单（改新学校前先看）
+    ├── lessons-learned.md      # 本轮踩坑清单（改新学校前先看）
+    └── deploy-oracle.md        # Oracle Cloud 免费 ARM 实例部署步骤
 ```
 
 ## 一、环境
@@ -70,15 +75,64 @@ python -m core.build --school hkjjxy --sample "企业筹资风险研究"
 
 **改格式的顺序**：先改 `profile.yaml` → 再同步 `format.sty` 里对应编号的行 → 重跑 build → 对照回归基准。
 
-## 四、已知事项
+## 四、Web 界面
+
+浏览器里上传 Word 稿 → 自动转 LaTeX → 在线校对 → 生成并下载 PDF / Word。
+
+**本地直接跑**
+
+```bash
+pip install -r requirements.txt
+python web/app.py                 # 打开 http://127.0.0.1:8000
+```
+
+**Docker（本机部署）**
+
+```bash
+docker compose up -d              # 首次会构建镜像，约 10~20 分钟
+docker compose logs -f            # 看日志
+docker compose down               # 停止
+```
+
+**服务器部署（Oracle Cloud 免费 ARM + HTTPS）**
+
+```bash
+cp .env.example .env && nano .env        # 填域名
+docker compose -f docker-compose.server.yml up -d --build
+```
+
+完整步骤（开实例、放行 80/443、装 Docker、DNS、自检、加访问密码）见
+**[docs/deploy-oracle.md](docs/deploy-oracle.md)**。
+
+注意两点：
+
+- 镜像约 **3~4 GB**（TeX Live + LibreOffice 都是大件），磁盘要留够
+- 中文字体**跨平台自动回退**：`format.sty` 用 `\IfFontExistsTF` 依次探测——
+  Windows 用 SimSun / SimHei / KaiTi / FangSong；Linux 容器里没有这些字体（且不打包进镜像，版权原因），
+  自动回退到镜像里预装的开源字体：Noto Serif CJK SC（≈宋体）、Noto Sans CJK SC（≈黑体）、
+  AR PL UKai CN（≈楷体）、Liberation Serif（≈Times New Roman）。
+  本机目录 `docker-compose.yml` 仍会挂载宿主机 `C:\Windows\Fonts`，挂了就优先用 Windows 字体。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/schools` | 学校列表（读 `schools/` 目录） |
+| `POST /api/convert` | 上传 .docx → 返回 tex 源码 |
+| `POST /api/build` | 提交构建，返回 job id |
+| `GET /api/job/{id}` | 任务状态与日志 |
+| `GET /api/download/{id}/{pdf\|docx}` | 下载产物 |
+
+## 五、已知事项
 
 - 参考文献列表偶有 7pt 左右的轻微溢出，已用 `\emergencystretch=2em` 收敛，不影响观感
 - 封面模板是**占位符版**（题目/姓名/学院等为「三号字 黑体」提示文字），需按实际信息填写
 - 样例 PDF/Word 含论文全文，公开仓库前请先脱敏
+- docx → tex 是**启发式**转换：靠编号识别标题，无编号的标题识别不出来，必须人工校对
 
-## 五、版本
+## 六、版本
 
 - **v1.0**（2026-10-10）格式包 + 《企业筹资风险研究》全链路
 - **v1.1**（2026-10-12）插图 / 图目录；修 ctexart 默认页眉；修 Word 端 `\newpage` 被跳过；PDF 封面改用 Word 前 2 页
 - **v2.0**（2026-10-12）重构为 `core` + `schools` 分层：学校差异全部抽到 `profile.yaml`，
   引擎只维护一份；修正文表题编号恒为 0；新增 CLI 与操作手册
+- **v2.1**（2026-10-12）服务器部署：字体跨平台回退（Windows 字体 ↔ Noto CJK 开源字体）、
+  Caddy 自动 HTTPS、`docs/deploy-oracle.md` 部署手册

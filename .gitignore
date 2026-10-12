@@ -11,3 +11,4 @@ __pycache__/
 *.tmp
 ~$*.docx
 samples/*/*/*.sty
+.env

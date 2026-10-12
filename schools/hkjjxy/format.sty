@@ -39,15 +39,39 @@
 \makeatother
 
 % ================= 全局字体 =================
-\setmainfont{Times New Roman}                  % 西文：Times New Roman
-\setCJKmainfont{SimSun}[AutoFakeBold=3]        % 中文：宋体（合成加粗 = Word 的「宋体+加粗」）
-\setCJKsansfont{SimHei}                        % 黑体本身即粗体，不再二次加粗
+% 跨平台字体回退（重要）：
+%   Windows 有 宋体/黑体/楷体/仿宋，Linux 容器里一个都没有，直接写死会编译失败。
+%   这里用 fontspec 的 \IfFontExistsTF 按顺序探测：首选 → 次选 → 兜底。
+%   Linux 容器里装 fonts-noto-cjk + fonts-arphic-* + fonts-liberation 即可命中次选。
+% #1=输出宏 #2=首选 #3=次选 #4=兜底（后判定的覆盖先判定的，故首选优先级最高）
+\newcommand{\thesPickFont}[4]{%
+  \newcommand{#1}{#4}%
+  \IfFontExistsTF{#3}{\renewcommand{#1}{#3}}{}%
+  \IfFontExistsTF{#2}{\renewcommand{#1}{#2}}{}}
+
+\thesPickFont{\fRoman}{Times New Roman}{Liberation Serif}{TeX Gyre Termes}
+\thesPickFont{\fSong} {SimSun}   {Noto Serif CJK SC}{Noto Serif SC}
+\thesPickFont{\fHei}  {SimHei}   {Noto Sans CJK SC} {Noto Sans SC}
+\thesPickFont{\fKai}  {KaiTi}    {AR PL UKai CN}    {Noto Serif CJK SC}
+\thesPickFont{\fFang} {FangSong} {AR PL UMing CN}   {Noto Serif CJK SC}
+
+% 注意：\setCJKfamilyfont 抓第二个参数时不展开后面的记号，
+% 所以必须用 \edef 先把字体名展开好，再执行整条调用（不能靠 \expandafter 现展）
+\edef\thesTmp{\noexpand\setmainfont{\fRoman}}\thesTmp            % 西文（Linux 回退 Liberation Serif）
+\edef\thesTmp{\noexpand\setCJKmainfont{\fSong}[AutoFakeBold=3]}\thesTmp   % 宋体 + 合成加粗
+\edef\thesTmp{\noexpand\setCJKsansfont{\fHei}}\thesTmp           % 黑体本身即粗体
 % ctex 字族（\songti \heiti \kaishu \fangsong 背后的族名）同步处理，
 % 否则正文里写 \bfseries 会报 "Font shape TU/xxx/b/n undefined"
-\setCJKfamilyfont{zhsong}{SimSun} [AutoFakeBold=3]
-\setCJKfamilyfont{zhkai}{KaiTi}   [AutoFakeBold=3]
-\setCJKfamilyfont{zhfs}{FangSong} [AutoFakeBold=3]
-\setCJKfamilyfont{zhhei}{SimHei}  [BoldFont=SimHei]   % 黑体不再叠加假粗
+\edef\thesTmp{\noexpand\setCJKfamilyfont{zhsong}{\fSong}[AutoFakeBold=3]}\thesTmp
+\edef\thesTmp{\noexpand\setCJKfamilyfont{zhkai}{\fKai}[AutoFakeBold=3]}\thesTmp
+\edef\thesTmp{\noexpand\setCJKfamilyfont{zhfs}{\fFang}[AutoFakeBold=3]}\thesTmp
+% 黑体：Windows 的 SimHei 没有独立粗体，显式指定自身避免叠加假粗；
+%       Linux 的 Noto Sans CJK 有真正的 Bold，交给 fontspec 自动探测
+\IfFontExistsTF{SimHei}{%
+  \setCJKfamilyfont{zhhei}{SimHei}[BoldFont=SimHei]%
+}{%
+  \edef\thesTmp{\noexpand\setCJKfamilyfont{zhhei}{\fHei}}\thesTmp
+}
 
 % ================= 【C-6.4】正文版式 =================
 \setlength{\parindent}{2\ccwd}    % 首行缩进 2 字符

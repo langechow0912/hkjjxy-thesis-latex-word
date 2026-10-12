@@ -1,0 +1,16 @@
+.git
+.gitignore
+.gitattributes
+__pycache__/
+*.pyc
+*.aux
+*.log
+*.out
+*.toc
+*.lot
+*.lof
+*.synctex.gz
+~$*.docx
+samples/*/*/*.sty
+docs/
+README.md

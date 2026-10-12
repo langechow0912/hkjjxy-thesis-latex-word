@@ -1,0 +1,28 @@
+# Caddy 配置：{$DOMAIN} 取自容器的 DOMAIN 环境变量（在 .env 里设置）
+# Caddy 会自动向 Let's Encrypt 申请并续期证书，无需手动配置。
+
+{$DOMAIN} {
+	encode gzip
+
+	# 上传的 docx 可能较大（含图片），放宽请求体限制到 200MB
+	request_body {
+		max_size 200MB
+	}
+
+	# 构建一次要 1~2 分钟，放宽代理超时
+	reverse_proxy thesis:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+			dial_timeout 30s
+		}
+	}
+
+	# 强烈建议开启访问密码，否则任何人都能上传文件并触发编译。
+	# 生成密码哈希：docker run --rm caddy:2-alpine caddy hash-password --plaintext '你的密码'
+	# 然后取消下面三行注释，把 BASICAUTH 换成 用户名 哈希值：
+	# basicauth {
+	# 	admin $2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG
+	# }
+}

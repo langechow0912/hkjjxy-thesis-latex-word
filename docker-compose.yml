@@ -1,0 +1,19 @@
+services:
+  thesis-format:
+    build: .
+    image: thesis-format:latest
+    container_name: thesis-format
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+      THESIS_XELATEX: xelatex
+      THESIS_SOFFICE: soffice
+      THESIS_TMP: /tmp/thesis
+    volumes:
+      # 论文与产物持久化到宿主机，重建容器不丢
+      - ./samples:/app/samples
+      # 中文字体（SimSun / SimHei / KaiTi）来自宿主机，不打包进镜像
+      - /c/Windows/Fonts:/usr/share/fonts/windows:ro
+    restart: unless-stopped

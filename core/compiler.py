@@ -50,7 +50,7 @@ def convert_pdf(cfg, src, outdir, log=print):
         if os.path.isfile(expect):
             return expect
         log("  LibreOffice 未产出，重试 %d/3" % attempt)
-    raise SystemExit("LibreOffice 转换失败：%s" % src)
+    raise RuntimeError("LibreOffice 转换失败：%s" % src)
 
 
 def extract_front_pages(cfg, docx_path, out_pdf, tmp_dir, log=print):
