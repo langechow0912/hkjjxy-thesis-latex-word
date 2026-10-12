@@ -1,0 +1,123 @@
+# =====================================================================
+#  海口经济学院 本科毕业论文（设计）—— 格式档案
+#  依据：《附件13 论文格式（修订10.21）》
+#
+#  本文件是「数值真源」：
+#    - Python 侧（core/docxbuild.py）直接读这里，不含硬编码数值
+#    - LaTeX 侧（同目录 format.sty）逐一手工同步，行尾带【X-x】编号
+#    - 规则条款与编号对照见同目录 rules.md
+#  改格式时：先改这里 → 再同步 format.sty 里对应【编号】的行 → 重跑 build
+# =====================================================================
+
+school:
+  id: hkjjxy
+  name: 海口经济学院
+  basis: 附件13 论文格式（修订10.21）
+
+latex:
+  package_name: hkjjxy-format     # tex 里 \usepackage{hkjjxy-format}
+  main: main.tex
+  engine: xelatex
+  passes: 3                        # 至少 2 遍目录才收敛，3 遍保险
+
+# ---------------- 页面 ----------------
+page:
+  width: 210mm
+  height: 297mm
+  margins:
+    top: 30mm
+    bottom: 30mm
+    left: 25mm
+    right: 20mm
+  pagenum:
+    position: footer               # footer | header
+    align: center                  # center | right | left
+  body_page_start: 1               # 正文节页码重新从 1 起
+
+# ---------------- 正文 ----------------
+body:
+  font_cn: 宋体
+  font_en: Times New Roman
+  size: 12                         # 小四
+  linespread: 1.5
+  first_indent: 2                  # 首行缩进 2 字符
+
+# ---------------- 各级标题 ----------------
+heading:
+  levels:
+    1: {font: 黑体, size: 15, before: 12, after: 6}     # 小三
+    2: {font: 黑体, size: 14, before: 8,  after: 4}      # 四号
+    3: {font: 黑体, size: 12, before: 6,  after: 3}      # 小四
+  unnum: {font: 黑体, size: 12, before: 54, after: 6}    # 参考文献 / 致谢
+
+# ---------------- 摘要区 ----------------
+abstract:
+  font: 楷体
+  title_font: 黑体
+  title_size: 18                   # 小二
+  en_title_size: 15                # 小三
+  label_size: 12                   # 「摘要：」「关键词：」小四
+  body_size: 10.5                  # 摘要正文 五号
+
+# ---------------- 表格 ----------------
+table:
+  list_title: 表目录
+  caption:
+    position: above                # 表题在表上方
+    font: 黑体
+    size: 10.5                     # 五号
+    bold: true
+    align: center
+    before: 4
+    after: 2
+    linespread: 1.0
+  body:
+    size: 10.5                     # 表体 五号
+    linespread: 1.0
+    first_col_align: left          # 首列左对齐，其余居中
+  note: {size: 9}                  # 表注 小五
+  toprule_bp: 1.5                  # 顶/底线
+  midrule_bp: 0.5                  # 栏目线
+
+# ---------------- 插图 ----------------
+figure:
+  dir: figures
+  default_width_frac: 0.82         # 缺省图宽 = 版心宽 × 0.82
+  list_title: 图目录
+  caption:
+    position: below                # 图题在图下方
+    font: 黑体
+    size: 10.5
+    bold: true
+    align: center
+    before: 2
+    after: 6
+    linespread: 1.0
+
+# ---------------- 参考文献 ----------------
+reference:
+  size: 10.5                       # 五号
+  linespread: 1.2
+  hanging: 24                      # 悬挂缩进（pt）
+
+# ---------------- 目录 ----------------
+toc:
+  title: 目　录
+  title_size: 18                   # 小二
+  depth: 3                         # 收录到三级标题
+  leader: dots                     # 点线引导
+  entry_size: 12                   # 条目 小四
+  entry_font: 宋体
+  linespread: 1.5
+  front_entries: [摘要, 关键词]    # 非 \section 但要进目录的块
+  loose_match: [参考文献, 致谢]     # 页码匹配时容忍字符间空白
+
+# ---------------- 封面 ----------------
+cover:
+  template: "{school}/cover-template.docx"
+  pages: 2                         # 封面 + 声明，取前 2 页嵌进 PDF
+  front_pdf: front.pdf
+
+# ---------------- 输出 ----------------
+output:
+  docx_name: "{sample}-毕业论文（可编辑）{suffix}.docx"
