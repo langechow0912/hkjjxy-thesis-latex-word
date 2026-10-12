@@ -25,12 +25,15 @@ thesis-format/
 │   └── 以岭药业财务风险分析/
 │
 ├── web/                        # FastAPI 后端 + 单文件前端（无 CDN 依赖）
-├── deploy/Caddyfile            # 反向代理 + 自动 HTTPS
+├── deploy/
+│   ├── Caddyfile               #   反向代理 + 自动 HTTPS
+│   └── local/                  #   本机部署：启动 / 隧道 / 自检脚本
 ├── docker-compose.server.yml   # 服务器部署（应用 + Caddy）
 │
 └── docs/
     ├── new-school-guide.md     # 新增学校的 6 步操作手册
     ├── lessons-learned.md      # 本轮踩坑清单（改新学校前先看）
+    ├── deploy-local-tunnel.md  # 本机部署 + Cloudflare Tunnel 公网访问
     └── deploy-oracle.md        # Oracle Cloud 免费 ARM 实例部署步骤
 ```
 
@@ -94,6 +97,22 @@ docker compose logs -f            # 看日志
 docker compose down               # 停止
 ```
 
+**本机部署 + 公网访问（Cloudflare Tunnel，免费 HTTPS）**
+
+不需要公网 IP：本机跑服务，隧道主动向外拨一条长连接，把 `127.0.0.1:8000` 映射到你自己的域名。
+
+```bash
+deploy\local\start.bat            # 1) 先改脚本里的口令，再双击启动服务
+deploy\local\install-tunnel.bat   # 2) 建隧道、绑域名、注册为 Windows 服务
+deploy\local\install-autostart.bat  # 3) 可选：开机自动启动 Web 服务
+
+python deploy/local/selftest.py --base https://thesis.你的域名.com \
+       --user 用户名 --pass 口令      # 4) 跑一遍完整自检
+```
+
+完整步骤、运维命令、国内访问慢时改 cpolar 的备选方案见
+**[docs/deploy-local-tunnel.md](docs/deploy-local-tunnel.md)**。
+
 **服务器部署（Oracle Cloud 免费 ARM + HTTPS）**
 
 ```bash
@@ -120,6 +139,16 @@ docker compose -f docker-compose.server.yml up -d --build
 | `POST /api/build` | 提交构建，返回 job id |
 | `GET /api/job/{id}` | 任务状态与日志 |
 | `GET /api/download/{id}/{pdf\|docx}` | 下载产物 |
+| `GET /api/health` | 健康检查（免口令，隧道探活用） |
+
+公网暴露前用环境变量加固，都在 `deploy/local/start.bat` 里设置：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `THESIS_AUTH_USER` / `THESIS_AUTH_PASS` | 空 | 设了就开启 HTTP Basic 口令；留空则任何人都能访问 |
+| `THESIS_MAX_JOBS` | 2 | 同时编译上限，超了返回 503 让对方排队 |
+| `THESIS_MAX_UPLOAD_MB` | 20 | 上传 docx 大小上限 |
+| `THESIS_KEEP_JOBS` | 50 | 内存中保留的任务数，超出自动回收临时目录 |
 
 ## 五、已知事项
 
@@ -127,6 +156,8 @@ docker compose -f docker-compose.server.yml up -d --build
 - 封面模板是**占位符版**（题目/姓名/学院等为「三号字 黑体」提示文字），需按实际信息填写
 - 样例 PDF/Word 含论文全文，公开仓库前请先脱敏
 - docx → tex 是**启发式**转换：靠编号识别标题，无编号的标题识别不出来，必须人工校对
+- 图片在**上传转换**那一步落到 `<论文目录>/figures/`。构建时若换了论文名，服务端会尝试把
+  图片补回去；补不回就直接报错，不会产出「成功但没有图」的 PDF
 
 ## 六、版本
 
@@ -136,3 +167,5 @@ docker compose -f docker-compose.server.yml up -d --build
   引擎只维护一份；修正文表题编号恒为 0；新增 CLI 与操作手册
 - **v2.1**（2026-10-12）服务器部署：字体跨平台回退（Windows 字体 ↔ Noto CJK 开源字体）、
   Caddy 自动 HTTPS、`docs/deploy-oracle.md` 部署手册
+- **v2.2**（2026-10-12）本机部署 + 公网访问：HTTP Basic 口令、并发与上传上限、任务自动回收，
+  `deploy/local/` 启动与隧道脚本、端到端自检脚本、`docs/deploy-local-tunnel.md`

@@ -11,4 +11,6 @@ __pycache__/
 *.tmp
 ~$*.docx
 samples/*/*/*.sty
+samples/*/*-selftest/
+samples/*/_source/
 .env
