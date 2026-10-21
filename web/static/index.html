@@ -112,6 +112,49 @@
     <div id="log" style="display:none"></div>
     <div class="files" id="files"></div>
   </div>
+  <div class="card" id="cloudCard" style="display:none">
+    <h2><span class="num">云</span>云端排版（大易论文排版开放接口）</h2>
+    <div class="hint" style="margin-top:0;margin-bottom:12px">
+      把 Word 稿交给官方排版引擎，按选定院校的规范直接出成品；适合还没做本地 profile 的学校。
+      预览免费，<b>导出成品会计费</b>（同一任务最多计一次）。
+    </div>
+    <div class="row">
+      <div>
+        <label>院校关键词 → 选规范</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="dpQ" placeholder="如：海口经济学院">
+          <button class="ghost" id="dpSearch" style="flex:none">搜索</button>
+        </div>
+        <select id="dpRule" style="margin-top:8px"><option value="">先搜索规范</option></select>
+      </div>
+      <div>
+        <label>中文标题（必填）</label>
+        <input type="text" id="dpTitle" placeholder="论文题目">
+        <label style="margin-top:8px">作者中文名（必填）</label>
+        <input type="text" id="dpAuthor" placeholder="姓名">
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div><label>导师（选填）</label><input type="text" id="dpTutor"></div>
+      <div><label>专业班级（选填）</label><input type="text" id="dpSubject"></div>
+      <div><label>英文标题（选填）</label><input type="text" id="dpTitleEn"></div>
+    </div>
+    <div style="margin-top:14px">
+      <div class="drop" id="dpDrop">
+        <b>点击或拖拽 Word 稿到这里</b>
+        <small>支持 .docx / .doc，选好规范与题目信息后再点「开始云端排版」</small>
+      </div>
+      <input type="file" id="dpFile" accept=".docx,.doc" hidden>
+    </div>
+    <div class="btns" style="margin-top:12px">
+      <button id="dpGo" disabled>开始云端排版</button>
+      <span id="dpState" style="font-size:12px;color:var(--tx3)"></span>
+    </div>
+    <div class="msg" id="dpMsg"></div>
+    <div id="dpLog" style="display:none"></div>
+    <div id="dpSuggest"></div>
+    <div class="files" id="dpFiles"></div>
+  </div>
 </main>
 
 <script>
@@ -205,6 +248,143 @@ drop.addEventListener('drop', e=>{
 $('go').onclick = () => build(true,true);
 $('onlypdf').onclick = () => build(true,false);
 $('onlydocx').onclick = () => build(false,true);
+
+/* ---------- 云端排版通道（大易论文排版开放接口）---------- */
+let dpFile = null, dpJob = null, dpTimer = null;
+
+function dpShow(msg, kind){
+  const m = $('dpMsg');
+  m.textContent = msg;
+  m.className = 'msg ' + (kind || 'ok');
+}
+
+async function cloudInit(){
+  // 后端没配 PAT 时整条通道不显示，避免让人点了才发现不可用
+  try{
+    const info = await fetch('/api/dayipaper').then(r=>r.json());
+    if(info.enabled) $('cloudCard').style.display = 'block';
+  }catch(e){ /* 旧后端没有这个接口，静默隐藏 */ }
+}
+
+async function searchRules(){
+  const q = $('dpQ').value.trim();
+  if(!q){ dpShow('先填院校关键词', 'err'); return; }
+  dpShow('搜索中…');
+  try{
+    const r = await fetch('/api/dayipaper/rules?q=' + encodeURIComponent(q) + '&size=10').then(x=>x.json());
+    if(r.detail) throw new Error(r.detail);
+    const items = r.items || [];
+    $('dpRule').innerHTML = items.length
+      ? items.map(i=>`<option value="${i.id}">${i.name}${i.targetSchoolName?'（'+i.targetSchoolName+'）':''}</option>`).join('')
+      : '<option value="">没搜到规范</option>';
+    dpShow(items.length ? `找到 ${items.length} 条规范（共 ${r.total} 条）` : '没搜到，换个关键词试试',
+           items.length ? 'ok' : 'err');
+  }catch(e){ dpShow('搜索失败：' + e.message, 'err'); }
+}
+
+function dpPick(file){
+  dpFile = file;
+  $('dpGo').disabled = false;
+  dpShow('已选：' + file.name);
+}
+
+async function startCloud(){
+  if(!dpFile){ dpShow('请先选一个 Word 稿', 'err'); return; }
+  const ruleId = $('dpRule').value;
+  if(!ruleId){ dpShow('请先搜索并选择规范', 'err'); return; }
+  const title = $('dpTitle').value.trim(), author = $('dpAuthor').value.trim();
+  if(!title || !author){ dpShow('题目和作者名是接口必填项', 'err'); return; }
+
+  const fd = new FormData();
+  fd.append('file', dpFile);
+  fd.append('ruleId', ruleId);
+  fd.append('title', title);
+  fd.append('authorName', author);
+  fd.append('tutorName', $('dpTutor').value.trim());
+  fd.append('subjectName', $('dpSubject').value.trim());
+  fd.append('titleEn', $('dpTitleEn').value.trim());
+
+  $('dpGo').disabled = true;
+  $('dpLog').style.display = 'block';
+  $('dpLog').textContent = '';
+  $('dpFiles').innerHTML = '';
+  $('dpSuggest').innerHTML = '';
+  dpShow('提交中…');
+  try{
+    const r = await fetch('/api/dayipaper/format', {method:'POST', body:fd}).then(x=>x.json());
+    if(r.detail) throw new Error(r.detail);
+    dpJob = r.job;
+    dpPoll();
+  }catch(e){
+    dpShow('提交失败：' + e.message, 'err');
+    $('dpGo').disabled = false;
+  }
+}
+
+async function dpPoll(){
+  clearTimeout(dpTimer);
+  const j = await fetch('/api/dayipaper/job/' + dpJob).then(x=>x.json());
+  if(j.detail){ dpShow('任务查询失败：' + j.detail, 'err'); $('dpGo').disabled = false; return; }
+  $('dpLog').textContent = j.log.join('\n');
+  $('dpLog').scrollTop = $('dpLog').scrollHeight;
+  $('dpState').textContent = j.statusLabel || j.stage || j.state;
+  if(j.state === 'running'){ dpTimer = setTimeout(dpPoll, 1500); return; }
+
+  $('dpGo').disabled = false;
+  if(j.state === 'error'){ dpShow('云端排版失败，看日志', 'err'); return; }
+  dpShow('排版完成：' + (j.taskId || ''), 'ok');
+  renderSuggestions(j.suggestions);
+  renderCloudFiles(j);
+}
+
+function renderSuggestions(items){
+  const box = $('dpSuggest');
+  if(!items || !items.length){ box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="hint">引擎有 ${items.length} 处不确定，导出前建议先核对：</div>` +
+    items.map(i=>`<div class="msg ok" style="display:block">${i.message}` +
+      (i.rowText ? ` <b>「${i.rowText}」</b>` : '') +
+      (i.linkUrl ? ` <a href="${i.linkUrl}" target="_blank" rel="noreferrer">${i.linkLabel || '查看说明'}</a>` : '') +
+      `</div>`).join('');
+}
+
+function renderCloudFiles(j){
+  const box = $('dpFiles');
+  box.innerHTML = '';
+  if(j.preview){
+    const a = document.createElement('a');
+    a.className = 'chip';
+    a.href = '/api/dayipaper/preview/' + j.id;   // 每次现取地址，原地址 3 分钟就失效
+    a.target = '_blank';
+    a.textContent = '预览 PDF';
+    box.appendChild(a);
+  }
+  const exp = document.createElement('a');
+  exp.className = 'chip';
+  exp.href = '/api/dayipaper/download/' + j.id + '?confirm=true';
+  exp.textContent = j.exported ? '重新下载 Word' : '导出 Word（计费）';
+  exp.onclick = e => {
+    // 计费动作必须有明确确认，误点一次就是一次扣费
+    if(!j.exported && !confirm('导出接口按次计费（同一任务最多只计一次），确认导出？')) e.preventDefault();
+  };
+  box.appendChild(exp);
+}
+
+$('dpSearch').onclick = searchRules;
+$('dpQ').addEventListener('keydown', e => { if(e.key === 'Enter') searchRules(); });
+const dpDropEl = $('dpDrop'), dpInput = $('dpFile');
+dpDropEl.onclick = () => dpInput.click();
+dpInput.onchange = e => { if(e.target.files[0]) dpPick(e.target.files[0]); };
+['dragenter','dragover'].forEach(ev => dpDropEl.addEventListener(ev, e=>{
+  e.preventDefault(); dpDropEl.classList.add('over');
+}));
+['dragleave','drop'].forEach(ev => dpDropEl.addEventListener(ev, e=>{
+  e.preventDefault(); dpDropEl.classList.remove('over');
+}));
+dpDropEl.addEventListener('drop', e=>{
+  const f = e.dataTransfer.files[0]; if(f) dpPick(f);
+});
+$('dpGo').onclick = startCloud;
+cloudInit();
 
 loadSchools();
 </script>

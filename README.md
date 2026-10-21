@@ -12,7 +12,8 @@ thesis-format/
 │   ├── toc.py                  #   目录页码探测（两遍构建）
 │   ├── compiler.py             #   同步 sty / 抽取封面页 / 调 XeLaTeX
 │   ├── profile.py              #   profile.yaml 加载与单位换算
-│   └── tools.py                #   xelatex / soffice 路径解析
+│   ├── tools.py                #   xelatex / soffice 路径解析
+│   └── dayipaper.py            #   云端排版：大易排版开放接口（与本地流水线并行的另一条通道）
 │
 ├── schools/hkjjxy/             # 海口经济学院
 │   ├── profile.yaml            #   数值真源（Python 侧直接读）
@@ -29,10 +30,12 @@ thesis-format/
 │   ├── Caddyfile               #   反向代理 + 自动 HTTPS
 │   └── local/                  #   本机部署：启动 / 隧道 / 自检脚本
 ├── docker-compose.server.yml   # 服务器部署（应用 + Caddy）
+├── tests/                      # 离线测试（本地假服务，不联网、不计费）
 │
 └── docs/
     ├── new-school-guide.md     # 新增学校的 6 步操作手册
     ├── lessons-learned.md      # 本轮踩坑清单（改新学校前先看）
+    ├── dayipaper-api.md        # 云端排版通道：六个接口、计费红线、排查清单
     ├── deploy-local-tunnel.md  # 本机部署 + Cloudflare Tunnel 公网访问
     └── deploy-oracle.md        # Oracle Cloud 免费 ARM 实例部署步骤
 ```
@@ -66,6 +69,20 @@ python -m core.build --school hkjjxy --sample "企业筹资风险研究"
 4. pass2 用真页码生成正式 docx（目录是 TOC 域，F9 可重算）
 5. 正式 docx 前 N 页 → `front.pdf`
 6. 同步 `format.sty` → XeLaTeX ×3 → `main.pdf`
+
+### 还没做 profile 的学校：走云端排版
+
+本地流水线要求先有 profile；没有 profile 的学校可以直接调大易论文的排版开放接口出成品 Word：
+
+```bash
+$env:DAYIPAPER_PAT = "开放平台申请的PAT"
+python -m core.dayipaper --search 海口经济学院                      # 查规范 ID，不花钱
+python -m core.dayipaper --file 论文.docx --school 海口经济学院 \
+       --title "题目" --author "姓名" --out out                       # 出 docx
+```
+
+六个接口（搜索→上传→发起→轮询→建议→导出）、计费红线、排查清单见
+**[docs/dayipaper-api.md](docs/dayipaper-api.md)**。前端也有一张「云端排版」卡片。
 
 ## 三、两侧的职责边界
 
@@ -140,6 +157,12 @@ docker compose -f docker-compose.server.yml up -d --build
 | `GET /api/job/{id}` | 任务状态与日志 |
 | `GET /api/download/{id}/{pdf\|docx}` | 下载产物 |
 | `GET /api/health` | 健康检查（免口令，隧道探活用） |
+| `GET /api/dayipaper` | 云端通道状态（有没有配 PAT） |
+| `GET /api/dayipaper/rules?q=` | 规范搜索，返回 `ruleId` |
+| `POST /api/dayipaper/format` | 上传 .docx + 规范 + 题目信息 → job id |
+| `GET /api/dayipaper/job/{id}` | 云端任务状态、进度文案、排版建议 |
+| `GET /api/dayipaper/preview/{id}` | 跳转预览 PDF（地址 3 分钟失效，故每次现取） |
+| `GET /api/dayipaper/download/{id}?confirm=true` | 导出成品（**计费**，必须显式确认） |
 
 公网暴露前用环境变量加固，都在 `deploy/local/start.bat` 里设置：
 
@@ -149,6 +172,8 @@ docker compose -f docker-compose.server.yml up -d --build
 | `THESIS_MAX_JOBS` | 2 | 同时编译上限，超了返回 503 让对方排队 |
 | `THESIS_MAX_UPLOAD_MB` | 20 | 上传 docx 大小上限 |
 | `THESIS_KEEP_JOBS` | 50 | 内存中保留的任务数，超出自动回收临时目录 |
+| `DAYIPAPER_PAT` | 空 | 云端排版的 PAT；留空 = 整条云端通道关闭 |
+| `THESIS_MAX_CLOUD_JOBS` / `THESIS_CLOUD_POLL` / `THESIS_CLOUD_TIMEOUT` | 3 / 2 / 900 | 云端任务并发、轮询间隔（秒，≥1）、轮询超时 |
 
 ## 五、已知事项
 
@@ -158,6 +183,9 @@ docker compose -f docker-compose.server.yml up -d --build
 - docx → tex 是**启发式**转换：靠编号识别标题，无编号的标题识别不出来，必须人工校对
 - 图片在**上传转换**那一步落到 `<论文目录>/figures/`。构建时若换了论文名，服务端会尝试把
   图片补回去；补不回就直接报错，不会产出「成功但没有图」的 PDF
+- **云端排版是可选通道**：没配 `DAYIPAPER_PAT` 时前端不显示这一块，本地流水线完全不受影响
+- 云端成品只有 Word（.docx / .doc），**没有对应的 LaTeX 源码**；要改版式还得回到本地 profile 那条路
+- 导出接口**计费**，所以 Web 端点导出要过二次确认，同一任务导出后会走缓存不再重复请求
 
 ## 六、版本
 
@@ -169,3 +197,6 @@ docker compose -f docker-compose.server.yml up -d --build
   Caddy 自动 HTTPS、`docs/deploy-oracle.md` 部署手册
 - **v2.2**（2026-10-12）本机部署 + 公网访问：HTTP Basic 口令、并发与上传上限、任务自动回收，
   `deploy/local/` 启动与隧道脚本、端到端自检脚本、`docs/deploy-local-tunnel.md`
+- **v2.3**（2026-10-21）接入大易论文排版开放接口：`core/dayipaper.py`（六步客户端 + CLI）、
+  `/api/dayipaper/*` 六个路由、前端「云端排版」卡片、17 项离线端到端测试；
+  导出计费二次确认、轮询间隔下限 1 秒、下载地址 3 分钟现取现下

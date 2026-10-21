@@ -18,6 +18,14 @@
     POST /api/build     {school,name,tex}   提交构建，返回 job id
     GET  /api/job/{id}                      任务状态与日志
     GET  /api/download/{id}/{pdf|docx}      下载产物
+
+云端排版通道（大易论文排版开放接口，见 core/dayipaper.py 与 docs/dayipaper-api.md）：
+    GET  /api/dayipaper                     通道是否可用（有没有配 PAT）
+    GET  /api/dayipaper/rules?q=&size=      规范搜索，返回 ruleId 列表
+    POST /api/dayipaper/format              上传 .docx + 规范 + 题目信息，返回 job id
+    GET  /api/dayipaper/job/{id}            云端任务状态、进度文案、排版建议
+    GET  /api/dayipaper/preview/{id}        跳转到刚取的预览 PDF 地址（原地址 3 分钟失效）
+    GET  /api/dayipaper/download/{id}       导出成品（**计费**，必须带 confirm=true）
 """
 import argparse
 import base64
@@ -36,11 +44,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core import build as corebuild          # noqa: E402
+from core import dayipaper                   # noqa: E402
 from core import docx2tex, profile as P      # noqa: E402
 
 try:
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, HTMLResponse
+    from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+    from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
     from pydantic import BaseModel
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import Response
@@ -65,6 +74,15 @@ AUTH_ON = bool(AUTH_USER and AUTH_PASS)
 MAX_RUNNING = int(os.environ.get("THESIS_MAX_JOBS", "2") or 2)
 MAX_UPLOAD_MB = int(os.environ.get("THESIS_MAX_UPLOAD_MB", "20") or 20)
 KEEP_JOBS = int(os.environ.get("THESIS_KEEP_JOBS", "50") or 50)
+
+# ---- 云端排版通道（大易论文排版开放接口）----
+# PAT 只从环境变量 DAYIPAPER_PAT 读（core/dayipaper.py 每次调用现取），没配就整条通道不可用。
+# 云端任务不占 CPU（只是长轮询），所以并发上限和本地编译的 MAX_RUNNING 分开算，
+# 但它们同样受 KEEP_JOBS 回收策略管理。
+MAX_CLOUD = int(os.environ.get("THESIS_MAX_CLOUD_JOBS", "3") or 3)
+# 轮询间隔对方有硬性下限：低于 1 秒会被风控拦，core/dayipaper.py 里还会再夹一次。
+CLOUD_POLL = float(os.environ.get("THESIS_CLOUD_POLL", "2") or 2)
+CLOUD_TIMEOUT = float(os.environ.get("THESIS_CLOUD_TIMEOUT", "900") or 900)
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -98,11 +116,18 @@ app.add_middleware(BasicAuthMiddleware)
 @app.get("/api/health")
 def health():
     return {"ok": True, "auth": AUTH_ON,
-            "running": sum(1 for j in JOBS.values() if j["state"] == "running")}
+            "running": _running_count(),
+            "cloud": sum(1 for j in JOBS.values()
+                         if j.get("kind") == "cloud" and j["state"] == "running")}
 
 
 def _running_count():
-    return sum(1 for j in JOBS.values() if j["state"] == "running")
+    """只数本地编译任务：云端排版只是长轮询，不该挤占 XeLaTeX 的并发额度。"""
+    return sum(1 for j in JOBS.values() if j["state"] == "running" and j.get("kind") != "cloud")
+
+
+def _cloud_running_count():
+    return sum(1 for j in JOBS.values() if j["state"] == "running" and j.get("kind") == "cloud")
 
 
 # 最近一次上传转换落地的目录（进程内），用于论文改名后把图片补回来
@@ -151,10 +176,10 @@ class BuildReq(BaseModel):
     docx: bool = True
 
 
-def _new_job():
+def _new_job(kind="build"):
     with _LOCK:
         jid = "j%03d" % (len(JOBS) + 1)
-        job = {"id": jid, "state": "running", "log": [], "files": {},
+        job = {"id": jid, "kind": kind, "state": "running", "log": [], "files": {},
                "tmp": tempfile.mkdtemp(prefix="thesis-web-"), "t": time.time()}
         JOBS[jid] = job
     _reap_jobs()
@@ -263,7 +288,7 @@ def api_build(req: BuildReq):
 @app.get("/api/job/{job_id}")
 def api_job(job_id: str):
     job = JOBS.get(job_id)
-    if not job:
+    if not job or job.get("kind") == "cloud":
         raise HTTPException(404, "任务不存在")
     return {"id": job["id"], "state": job["state"], "log": job["log"],
             "files": {k: os.path.basename(v) for k, v in job["files"].items()}}
@@ -278,6 +303,192 @@ def api_download(job_id: str, kind: str):
     return FileResponse(path, filename=os.path.basename(path))
 
 
+# ---------------------------------------------------------------- 云端排版通道
+# 复用 JOBS（kind="cloud"）：本地编译要跑 3 遍 XeLaTeX，云端只是长轮询，
+# 所以并发额度和 _running_count 分开算，避免云端任务把本地编译挡在门外。
+def _dp_call(fn, *args, **kwargs):
+    """把接口异常翻成 HTTP 错误：鉴权类原样透出，其余归为 502。"""
+    try:
+        return fn(*args, **kwargs)
+    except dayipaper.ApiError as exc:
+        status = exc.http_status if exc.http_status in (400, 401, 403, 413, 429) else 502
+        raise HTTPException(status, str(exc))
+
+
+def _cloud_job(job_id):
+    job = JOBS.get(job_id)
+    if not job or job.get("kind") != "cloud":
+        raise HTTPException(404, "云端排版任务不存在")
+    return job
+
+
+@app.get("/api/dayipaper")
+def api_dp_info():
+    return {"enabled": dayipaper.has_token(), "base": dayipaper.base_url(),
+            "maxJobs": MAX_CLOUD, "poll": max(CLOUD_POLL, dayipaper.MIN_INTERVAL),
+            "timeout": CLOUD_TIMEOUT, "running": _cloud_running_count()}
+
+
+@app.get("/api/dayipaper/rules")
+def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关键词"),
+                 size: int = Query(5, ge=1, le=20)):
+    if not dayipaper.has_token():
+        raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
+    return _dp_call(dayipaper.search_rules, q, page_size=size)
+
+
+@app.post("/api/dayipaper/format")
+async def api_dp_format(file: UploadFile = File(...),
+                        ruleId: str = Form(...),
+                        title: str = Form(...),
+                        authorName: str = Form(...),
+                        titleEn: str = Form(""),
+                        subTitle: str = Form(""),
+                        subTitleEn: str = Form(""),
+                        authorNameEn: str = Form(""),
+                        tutorName: str = Form(""),
+                        tutorNameEn: str = Form(""),
+                        subjectName: str = Form(""),
+                        subjectNameEn: str = Form("")):
+    if not dayipaper.has_token():
+        raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
+    if _cloud_running_count() >= MAX_CLOUD:
+        raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
+                            % (_cloud_running_count(), MAX_CLOUD))
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in (".docx", ".doc"):
+        raise HTTPException(400, "云端排版只收 .docx / .doc 源文件")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "上传的文件是空的")
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, "文件超过 %d MB，请压缩图片后重试" % MAX_UPLOAD_MB)
+
+    meta = {"title": title.strip(), "authorName": authorName.strip(), "ruleId": ruleId.strip()}
+    for key, value in (("titleEn", titleEn), ("subTitle", subTitle), ("subTitleEn", subTitleEn),
+                       ("authorNameEn", authorNameEn), ("tutorName", tutorName),
+                       ("tutorNameEn", tutorNameEn), ("subjectName", subjectName),
+                       ("subjectNameEn", subjectNameEn)):
+        if (value or "").strip():
+            meta[key] = value.strip()
+    if not all(meta.get(k) for k in ("title", "authorName", "ruleId")):
+        raise HTTPException(400, "题目、作者名、规范 ID 都是必填")
+
+    job = _new_job(kind="cloud")
+    job.update({"name": meta["title"], "stage": "上传源文档", "status": None,
+                "statusLabel": "", "taskId": None, "suggestions": [],
+                "preview": None, "exported": False})
+    threading.Thread(target=_run_cloud,
+                     args=(job, data, file.filename or "source.docx", meta),
+                     daemon=True).start()
+    return {"job": job["id"], "title": meta["title"]}
+
+
+def _run_cloud(job, payload, filename, meta):
+    def log(*a):
+        job["log"].append(" ".join(str(x) for x in a))
+
+    extra = {k: v for k, v in meta.items() if k not in ("title", "authorName", "ruleId")}
+    try:
+        file_uri = dayipaper.upload_document(payload, filename)
+        log("上传完成：fileUri = %s" % file_uri)
+
+        job["stage"] = "发起排版"
+        task_id = dayipaper.request_format(file_uri, meta["ruleId"], meta["title"],
+                                          meta["authorName"], extra=extra)
+        job["taskId"] = task_id
+        log("任务已创建：taskId = %s" % task_id)
+
+        last = {"status": None}
+
+        def tick(info):
+            status = info.get("status") or ""
+            job["status"] = status
+            job["statusLabel"] = info.get("statusLabel") or dayipaper.STATUS_TEXT.get(status, "")
+            job["preview"] = info.get("pdfShareUrl") or job.get("preview")
+            if status != last["status"]:          # 只在状态变化时写日志，别把轮询刷满
+                last["status"] = status
+                log("%s %s" % (status, job["statusLabel"]))
+
+        job["stage"] = "云端排版中"
+        job["trace"] = dayipaper.wait(task_id, interval=CLOUD_POLL,
+                                      timeout=CLOUD_TIMEOUT, on_progress=tick)
+        try:
+            job["suggestions"] = dayipaper.suggestions(task_id)
+        except dayipaper.ApiError as exc:
+            log("建议提示获取失败（不影响成品）：%s" % exc)
+        if job["suggestions"]:
+            log("有 %d 条排版建议，导出前建议先看一眼" % len(job["suggestions"]))
+        job["stage"] = "排版完成（尚未导出；导出接口计费）"
+        job["state"] = "done"
+    except dayipaper.ApiError as exc:
+        job["state"] = "error"
+        job["stage"] = "失败"
+        log("接口报错：%s" % exc)
+    except BaseException:
+        job["state"] = "error"
+        job["stage"] = "失败"
+        job["log"].append(traceback.format_exc())
+
+
+@app.get("/api/dayipaper/job/{job_id}")
+def api_dp_job(job_id: str):
+    job = _cloud_job(job_id)
+    return {"id": job["id"], "state": job["state"], "stage": job.get("stage"),
+            "status": job.get("status"), "statusLabel": job.get("statusLabel"),
+            "taskId": job.get("taskId"), "log": job["log"],
+            "suggestions": job.get("suggestions") or [],
+            "preview": bool(job.get("preview")), "exported": bool(job.get("exported")),
+            "files": {k: os.path.basename(v) for k, v in job.get("files", {}).items()}}
+
+
+@app.get("/api/dayipaper/preview/{job_id}")
+def api_dp_preview(job_id: str):
+    """现取一次状态再跳转：接口给的 pdfShareUrl 只有 3 分钟有效期，存下来会点开失败。"""
+    job = _cloud_job(job_id)
+    if not job.get("taskId"):
+        raise HTTPException(409, "任务还没创建成功")
+    if not dayipaper.has_token():
+        raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
+    info = _dp_call(dayipaper.trace, job["taskId"])
+    url = info.get("pdfShareUrl")
+    if not url:
+        raise HTTPException(409, "还没有预览文件（当前状态：%s）"
+                            % (info.get("statusLabel") or info.get("status")))
+    job["preview"] = url
+    return RedirectResponse(url, status_code=303)
+
+
+@app.get("/api/dayipaper/download/{job_id}")
+def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
+                    confirm: bool = Query(False, description="导出计费，必须显式确认")):
+    job = _cloud_job(job_id)
+    if not job.get("taskId"):
+        raise HTTPException(409, "任务还没创建成功")
+    if job["state"] != "done":
+        raise HTTPException(409, "任务尚未完成（当前：%s）" % (job.get("stage") or job["state"]))
+
+    kind = dayipaper.FORMATS[fmt][0]
+    cached = job.get("files", {}).get(kind)
+    if cached and os.path.isfile(cached):        # 同一任务别重复触发导出，省一次计费风险
+        return FileResponse(cached, filename=os.path.basename(cached))
+    if not confirm:
+        raise HTTPException(400, "导出接口按次计费（同一任务最多计一次）。确认导出请带 confirm=true")
+
+    dest = Path(job["tmp"]) / ("%s-%s.%s" % (sanitize(job.get("name") or "thesis"),
+                                             job["taskId"], kind))
+    try:
+        path = dayipaper.download_to(job["taskId"], dest, fmt=fmt)
+    except dayipaper.ApiError as exc:
+        job["log"].append("导出失败：%s" % exc)
+        raise HTTPException(exc.http_status or 502, str(exc))
+    job["files"][kind] = path
+    job["exported"] = True
+    job["log"].append("已导出成品：%s" % os.path.basename(path))
+    return FileResponse(path, filename=os.path.basename(path))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="毕业论文格式流水线 Web 界面")
     ap.add_argument("--host", default="127.0.0.1")
@@ -289,6 +500,8 @@ def main(argv=None):
     print("访问口令：%s" % ("已开启（用户 %s）" % AUTH_USER if AUTH_ON
                             else "未开启，任何人都能访问"))
     print("同时编译上限：%d 个；上传上限：%d MB" % (MAX_RUNNING, MAX_UPLOAD_MB))
+    print("云端排版：%s" % ("已开启 → %s" % dayipaper.base_url() if dayipaper.has_token()
+                            else "未开启（设置 DAYIPAPER_PAT 后启用）"))
     uvicorn.run(app, host=a.host, port=a.port)
 
 
