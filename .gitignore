@@ -13,4 +13,5 @@ __pycache__/
 samples/*/*/*.sty
 samples/*/*-selftest/
 samples/*/_source/
+.test-tmp/
 .env
