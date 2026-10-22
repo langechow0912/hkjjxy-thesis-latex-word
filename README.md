@@ -16,25 +16,83 @@ python -m unittest discover -s tests -t . -q
 
 ## EC2 + Docker Compose + Caddy 部署
 
-仓库已包含 `Dockerfile`、`docker-compose.yml` 和 `Caddyfile`。镜像内带
-LibreOffice、XeLaTeX、中文字体和 Python 依赖；应用容器只加入内部网络，Caddy
-负责 80/443 和自动 HTTPS。生产 Compose 强制 Basic Auth，应用容器以 UID/GID
-10001 的非 root 用户运行，并把支付宝订单数据库放在持久卷中。
+网页和所有依赖最终都在 AWS EC2 的 Docker 容器里运行；本地电脑只负责把代码提交到 GitHub、必要时用 SSH 连接 EC2 和上传密钥。本地 Docker Desktop 可以关闭，不负责生产网站。仓库已有 `Dockerfile`、`docker-compose.yml` 和 `Caddyfile`：镜像内含 LibreOffice、XeLaTeX、中文字体和 Python 依赖；Caddy 负责 80/443 和自动 HTTPS。
 
-### 1. DNS、EC2 和 GitHub
+当前已知信息：域名是 `lunwenpaiban.dpdns.org`，EC2 当前公网 IPv4 是 `15.135.187.3`。域名的 NS 已确认由 Cloudflare 管理（`javon.ns.cloudflare.com`、`princess.ns.cloudflare.com`）；目前还没有查到该域名的 A 记录。项目代码已上传到 GitHub 私有仓库 [`langechow0912/hkjjxy-thesis-latex-word`](https://github.com/langechow0912/hkjjxy-thesis-latex-word)，默认分支为 `master`。EC2 可以按下文配置只读 Deploy key 后克隆。
 
-给 EC2 绑定弹性 IP，在 DNS 为域名添加 A 记录。安全组对公网网站开放 TCP 80/443；
-SSH 22 只允许你的固定 IP 或 EC2 Instance Connect 使用的来源。EC2 上安装 Docker
-Engine 和 Compose 插件。项目代码和依赖已放在私有仓库
-`langechow0912/hkjjxy-thesis-latex-word`；为让 EC2 拉取私有仓库，可在 EC2 生成 SSH
-密钥，并将公钥添加到仓库 Settings → Deploy keys（保持只读，不启用写权限）：
+### 1. 代码仓库（GitHub）
+
+项目代码已在私有仓库 `langechow0912/hkjjxy-thesis-latex-word` 的 `master` 分支。EC2 使用只读 Deploy key 克隆；本地电脑不需要再执行首次推送。以后修改代码并发布新版本时，才需要在本地提交并推送：
+
+```powershell
+git add -A
+git commit -m "Describe the change"
+git push
+```
+
+### 2. DNS 添加在 Cloudflare（Cloudflare 网页）
+
+不用在 AWS Route 53 添加 DNS。此域名的 NS 已确认指向 Cloudflare；AWS 负责 EC2 和网络，Cloudflare 负责 DNS。Cloudflare → 打开 `lunwenpaiban.dpdns.org` zone → **DNS → Records → Add record**，添加：Type=`A`、Name=`@`、IPv4 address=`15.135.187.3`（若 AWS 中分配了弹性 IP，则填写弹性 IP）、Proxy status=`DNS only` 灰云、TTL=`Auto`。首次让 Caddy 申请证书时先用灰云。目前还没有查到该域名的 A 记录。保存几分钟后，在本地 PowerShell 验证：
+
+```powershell
+Resolve-DnsName lunwenpaiban.dpdns.org -Type A
+```
+
+### 3. 固定 EC2 地址并开放端口（AWS Console 网页）
+
+AWS Console → **EC2 → Network & Security → Elastic IPs**。若 `15.135.187.3` 已关联为 Elastic IP，直接使用；否则 Allocate Elastic IP，再 Associate 到论文排版 EC2，并把 Cloudflare A 记录同步改成新地址。这样实例停止/启动后域名不会指向旧 IP。
+
+EC2 → **Instances → 选择实例 → Security → Security groups → Inbound rules → Edit inbound rules**。添加/保留 TCP 22，Source=`My IP`；TCP 80 和 TCP 443，Source=`0.0.0.0/0`。只有网站确实启用了 IPv6 才另加 IPv6 来源。不要开放 TCP 8000。查看实例 AMI name 确认系统和 SSH 用户：Ubuntu 通常是 `ubuntu`，Amazon Linux 通常是 `ec2-user`。镜像里的依赖会在首次构建时下载，建议根 EBS 磁盘至少 30 GB。
+
+### 4. 连接 EC2、安装 Docker 和授权 GitHub 只读访问（EC2 终端 + GitHub 网页）
+
+可在 AWS Console 的 **EC2 Instance Connect** 打开终端；也可从本地 PowerShell SSH 连接（按系统替换用户名、密钥路径和 IP）：
+
+```powershell
+ssh -i "C:\密钥实际路径\EC2登录密钥.pem" ubuntu@<弹性IP>
+```
+
+EC2 终端先运行 `cat /etc/os-release` 确认系统，再执行对应的安装命令。
+
+Ubuntu：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io git curl openssl
+sudo systemctl enable --now docker
+```
+
+Amazon Linux 2023：
+
+```bash
+sudo dnf update -y
+sudo dnf install -y docker git curl openssl
+sudo systemctl enable --now docker
+```
+
+两种系统都运行下面命令安装 Compose 插件并确认可用：
+
+```bash
+case "$(uname -m)" in
+  x86_64) COMPOSE_ARCH=x86_64 ;;
+  aarch64) COMPOSE_ARCH=aarch64 ;;
+  *) echo "不支持的 CPU 架构：$(uname -m)"; exit 1 ;;
+esac
+sudo install -d /usr/local/lib/docker/cli-plugins
+sudo curl -fSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${COMPOSE_ARCH}" -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+sudo docker --version
+sudo docker compose version
+```
+
+EC2 从私有 GitHub 拉代码需配置只读 Deploy key。输入 passphrase 时按 Enter 留空，方便以后自动拉取：
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/thesis_repo -C "ec2-thesis-readonly"
 cat ~/.ssh/thesis_repo.pub
 ```
 
-添加公钥后，在 EC2 首次部署时执行：
+只复制 `.pub` 公钥那一整行。在 GitHub 仓库 **Settings → Deploy keys → Add deploy key** 粘贴公钥，Title 填 `EC2 read-only`，不要勾选 **Allow write access**。添加后，在 EC2 首次部署时执行：
 
 ```bash
 cat >> ~/.ssh/config <<'EOF'
@@ -45,62 +103,121 @@ Host github-thesis
     IdentitiesOnly yes
 EOF
 chmod 600 ~/.ssh/config
+mkdir -p ~/apps
+cd ~/apps
 git clone git@github-thesis:langechow0912/hkjjxy-thesis-latex-word.git
 cd hkjjxy-thesis-latex-word
 ```
 
-不要把 `.secrets/`、`.env`、`deploy/secrets/` 中的运行密钥推入仓库。
+之后部署目录是 `~/apps/hkjjxy-thesis-latex-word`。`.secrets/`、`.env`、`deploy/secrets/` 中的运行密钥不要推入 GitHub。
 
-### 2. 服务器上的配置
+### 5. 配置运行参数和密钥（EC2 终端）
+
+在刚 clone 的项目目录中创建只留在 EC2 的 `.env`：
 
 ```bash
+cd ~/apps/hkjjxy-thesis-latex-word
 cp .env.example .env
-mkdir -p deploy/secrets
-openssl rand -base64 32 > deploy/secrets/thesis_auth_pass
-chmod 700 deploy/secrets && chmod 600 deploy/secrets/thesis_auth_pass
+nano .env
+```
+
+填写或修改下面几项，文件其他默认值保留。不要加引号，也不要在等号两侧加空格：
+
+```dotenv
+DOMAIN=lunwenpaiban.dpdns.org
+THESIS_ALLOWED_HOSTS=lunwenpaiban.dpdns.org
+THESIS_AUTH_USER=admin
+THESIS_MAX_JOBS=1
+ALIPAY_ENABLED=false
+```
+
+保存 nano：按 `Ctrl+O`、Enter，再按 `Ctrl+X`。网页会提示 Basic Auth；用户名是 `admin`，密码从下一条命令生成。`.env` 不提交 GitHub。
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 700 deploy/secrets
+openssl rand -base64 32 | sudo tee deploy/secrets/thesis_auth_pass
+sudo chown 10001:10001 deploy/secrets/thesis_auth_pass
+sudo chmod 600 deploy/secrets/thesis_auth_pass
 chmod 600 .env
 ```
 
-编辑 `.env`，至少填写 `DOMAIN`、`THESIS_AUTH_USER`；多个域名或 `www` 别名可在
-`THESIS_ALLOWED_HOSTS` 中用逗号列出，并保留
-`THESIS_ENV=production`、`THESIS_REQUIRE_AUTH=true`。`DOMAIN` 必须只写域名，不能
-带协议或路径。把可用的 Dayipaper PAT、独立 Tabword key、支付宝应用私钥和
-**支付宝平台公钥**分别放入 `deploy/secrets/` 的同名文件；不要把应用公钥当作
-平台公钥。支付宝的 `ALIPAY_NOTIFY_URL` 应填写
-`https://你的域名/api/alipay/notify`，并确认当面付和商户权限已开通。填好运行密钥后
-执行 `sudo chown -R 10001:10001 deploy/secrets`，并确保目录为 700、密钥文件为
-600（可用 `find deploy/secrets -type f ! -name README.md ! -name .gitignore -exec chmod 600 {} \\;`）。当前支付宝
-配置仍默认关闭；只有商户资料、验签公钥、私钥文件和回调地址都准备好后再设
-`ALIPAY_ENABLED=true`。
+命令会显示一次随机密码，同时保存进文件；把它存到自己的密码管理器。Compose 要求这个密码文件存在，缺少时应用不会启动。
 
-### 3. 启动和检查
+其他院校云端排版需要的 Dayipaper PAT 放入 `deploy/secrets/dayipaper_pat`；Tabword 服务需要独立 API Key，放入 `deploy/secrets/tabword_api_key`。海口经济学院本地模板不依赖这两个服务。本地密钥通过 PowerShell `scp` 单独传输，不进 GitHub。以下以 Ubuntu 为例，Amazon Linux 把 `ubuntu` 和 `/home/ubuntu` 分别改为 `ec2-user` 和 `/home/ec2-user`：
 
-```bash
-docker compose config
-docker compose up -d --build
-docker compose ps
-curl -fsS https://你的域名/api/health
-docker compose logs --tail=100 app caddy
+```powershell
+scp -i "C:\实际路径\EC2登录密钥.pem" "C:\实际路径\应用私钥.pem" ubuntu@<弹性IP>:/home/ubuntu/alipay_app_private_key.pem
+scp -i "C:\实际路径\EC2登录密钥.pem" "C:\实际路径\支付宝平台公钥.pem" ubuntu@<弹性IP>:/home/ubuntu/alipay_platform_public_key.pem
 ```
 
-第一次启动时 Caddy 会为域名申请证书；DNS 和 80/443 入站规则必须已经生效。TeX
-Live 和 LibreOffice 会使镜像较大；低内存 EC2 可把 `THESIS_MAX_JOBS=1`。
-应用的 `/docs`、`/redoc` 和 `/openapi.json` 在生产模式关闭。PDF 预览仍免费，
-Word 导出必须完成支付宝订单；未完成商户配置时会安全地拒绝下载，不会绕过付款。
-
-### 4. 更新和备份
+在 EC2 终端把上传文件安装到 Docker 读取的密钥目录，然后删除家目录临时副本：
 
 ```bash
+sudo install -o 10001 -g 10001 -m 600 /home/ubuntu/alipay_app_private_key.pem deploy/secrets/alipay_app_private_key.pem
+sudo install -o 10001 -g 10001 -m 600 /home/ubuntu/alipay_platform_public_key.pem deploy/secrets/alipay_platform_public_key.pem
+rm /home/ubuntu/alipay_app_private_key.pem /home/ubuntu/alipay_platform_public_key.pem
+```
+
+支付宝先保持关闭。确认当面付和商户权限已开通、网站 HTTPS 已正常，再把应用私钥和支付宝平台公钥分别作为 PEM 文件放在：
+
+```text
+deploy/secrets/alipay_app_private_key.pem
+deploy/secrets/alipay_platform_public_key.pem
+```
+
+验签使用支付宝平台公钥，不是应用公钥。运行密钥文件权限设为仅容器用户可读：
+
+```bash
+sudo chown -R 10001:10001 deploy/secrets
+sudo chmod 700 deploy/secrets
+sudo find deploy/secrets -type f ! -name README.md ! -name .gitignore -exec chmod 600 {} \;
+```
+
+### 6. 构建、启动和检查（EC2 终端 + 浏览器）
+
+```bash
+sudo docker compose config -q
+sudo docker compose up -d --build
+sudo docker compose ps
+sudo docker compose logs --tail=100 app caddy
+curl -fsS https://lunwenpaiban.dpdns.org/api/health
+```
+
+首次 build 会下载 Python 依赖、LibreOffice、XeLaTeX 和中文字体，可能需要一段时间。等待 `app` 状态显示 `healthy`、`caddy` 显示运行中，再用浏览器打开 [https://lunwenpaiban.dpdns.org](https://lunwenpaiban.dpdns.org)。浏览器会要求 Basic Auth，输入 `.env` 中的用户名和刚生成的密码。Caddy 会自动申请 HTTPS 证书；若失败，检查 Cloudflare A 记录是否指向弹性 IP，以及安全组是否允许 TCP 80/443。
+
+PDF 预览仍免费。Word 下载在支付宝配置完整并收到匹配的支付通知前会被拒绝。确认当面付权限、商户号及密钥等条件后，才在 EC2 的 `.env` 设置：
+
+```dotenv
+ALIPAY_ENABLED=true
+ALIPAY_APP_ID=2021007108658866
+ALIPAY_SELLER_ID=<支付宝商户PID>
+ALIPAY_NOTIFY_URL=https://lunwenpaiban.dpdns.org/api/alipay/notify
+ALIPAY_MODE=production
+THESIS_FORMAT_PRICE_CENTS=2999
+```
+
+保存后在 EC2 项目目录执行 `sudo docker compose up -d` 使配置生效。若当面付尚未开通或商户 ID、密钥不匹配，支付宝无法创建正式订单；代码不会绕过付款。
+
+### 7. 后续更新（本地电脑，再到 EC2）
+
+本地改好代码后提交推送：
+
+```powershell
+git add -A
+git commit -m "Describe the change"
+git push
+```
+
+然后在 EC2 终端更新并重建镜像：
+
+```bash
+cd ~/apps/<仓库名>
 git pull --ff-only
-docker compose up -d --build
-docker compose exec app python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/health').read().decode())"
+sudo docker compose up -d --build
+sudo docker compose ps
 ```
 
-订单数据库位于 `thesis_data` 卷。排版任务本身仍是进程内存状态，容器重启会丢失
-未完成任务；正式使用前应避免在任务运行期间更新，并按 EC2 磁盘快照策略备份
-`thesis_data`。不要直接把应用容器端口暴露到公网。
-
-启动时读取 `.secrets/dayipaper.pat`，支持原始令牌或 `PAT=令牌` 单行文件；`DAYIPAPER_PAT` 环境变量优先（环境变量应直接填写令牌值）。凭证仅在后端使用，已从 Git/Docker 上下文排除。修改凭证后重启服务。
+订单数据库和 Caddy 证书放在 Docker 持久卷里；排版任务状态保存在应用内存，容器重启会清掉正在进行的任务。更新前等当前任务完成。应用端口 8000 不应暴露到公网。
 
 ## 统一接口与扩展
 
