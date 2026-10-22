@@ -1,0 +1,210 @@
+
+文档异步改写进度查询
+GET
+/api/v2/document/task/{task_id}
+调试
+Header参数（二选一即可）
+参数名	类型	是否必填	说明
+Authorization	String	否	API 密钥
+X-API-Key	String	否	API 密钥
+Path参数
+参数名	类型	是否必填	说明
+task_id	String	是	异步任务ID，从POST /api/v2/document/paraphrase/async接口获取
+请求参数
+Path 参数
+生成代码
+task_id
+string 
+必需
+示例:
+xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+Header 参数
+生成代码
+authorization
+Authorization
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+X-API-Key
+X-Api-Key
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+application/json
+Successful Response
+Bodyapplication/json
+生成代码
+success
+boolean 
+Success
+必需
+task_id
+string 
+Task Id
+必需
+status
+string 
+Status
+必需
+file_name
+File Name
+可选
+Any of:
+string
+null
+preset_zh
+Preset Zh
+可选
+Any of:
+string
+null
+preset_en
+Preset En
+可选
+Any of:
+string
+null
+estimated_cost
+Estimated Cost
+可选
+Any of:
+number
+null
+actual_cost
+Actual Cost
+可选
+Any of:
+number
+null
+original_url
+Original Url
+可选
+Any of:
+string
+null
+result_url
+Result Url
+可选
+Any of:
+string
+null
+diff_url
+Diff Url
+可选
+Any of:
+string
+null
+character_count
+Character Count
+可选
+Any of:
+integer
+null
+original_ai_rate
+Original Ai Rate
+可选
+Any of:
+number
+null
+rewritten_ai_rate
+Rewritten Ai Rate
+可选
+Any of:
+number
+null
+reduction
+Reduction
+可选
+Any of:
+number
+null
+ai_detection_success
+Ai Detection Success
+可选
+Any of:
+boolean
+null
+error_message
+Error Message
+可选
+Any of:
+string
+null
+created_at
+Created At
+可选
+Any of:
+string
+<date-time>
+null
+started_at
+Started At
+可选
+Any of:
+string
+<date-time>
+null
+completed_at
+Completed At
+可选
+Any of:
+string
+<date-time>
+null
+示例
+{
+    "success": true,
+    "task_id": "string",
+    "status": "string",
+    "file_name": "string",
+    "preset_zh": "string",
+    "preset_en": "string",
+    "estimated_cost": 0,
+    "actual_cost": 0,
+    "original_url": "string",
+    "result_url": "string",
+    "diff_url": "string",
+    "character_count": 0,
+    "original_ai_rate": 0,
+    "rewritten_ai_rate": 0,
+    "reduction": 0,
+    "ai_detection_success": true,
+    "error_message": "string",
+    "created_at": "2019-08-24T14:15:22.123Z",
+    "started_at": "2019-08-24T14:15:22.123Z",
+    "completed_at": "2019-08-24T14:15:22.123Z"
+}
+🟠422
+修改于 3 个月前
+上一页
+文档异步改写
+下一页
+获取AI检测平台列表
+LLMs.txt
+克隆
+导出
+Built with

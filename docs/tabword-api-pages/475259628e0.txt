@@ -1,0 +1,99 @@
+
+文件AI率检测
+POST
+/api/v2/detection/check-file
+调试
+Header参数（二选一即可）
+参数名	类型	是否必填	说明
+Authorization	String	否	API 密钥
+X-API-Key	String	否	API 密钥
+Body参数
+参数	必填	类型	作用
+file	必填	文件	要检测的文档。仅支持 .doc/.docx/.txt, 不能为空，≤20MB, 字数 0~50000
+task_platform	必填	字符串	改写预设 可以从GET /api/v2/detection/options 接口获取
+mode	选填	字符串	检测粒度，只能是 sentence (按句) 或 paragraph (按段); 传别的值报 400; 不传则不限定
+title	选填	字符串	文档标题，透传给检测服务
+author	选填	字符串	作者，透传给检测服务
+brand_title	选填	字符串	品牌主标题 (报告页眉 / 水印类的展示用), 透传
+brand_subtitle	选填	字符串	品牌副标题，透传
+请求参数
+Header 参数
+生成代码
+authorization
+Authorization
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+X-API-Key
+X-Api-Key
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+Body 参数multipart/form-data必填
+生成代码
+file
+file 
+必需
+示例:
+file:///Users/jelee/Downloads/test.docx
+title
+string 
+可选
+author
+string 
+可选
+brand_title
+string 
+可选
+brand_subtitle
+string 
+可选
+task_platform
+string 
+必需
+示例:
+知网_zh
+mode
+string 
+可选
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+application/json
+Successful Response
+Bodyapplication/json
+生成代码
+No schema defined
+示例
+null
+🟠422
+修改于 大约 2 个月前
+上一页
+文本AI率检测
+下一页
+查询用户余额
+LLMs.txt
+克隆
+导出
+Built with

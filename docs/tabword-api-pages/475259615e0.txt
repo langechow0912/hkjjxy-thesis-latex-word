@@ -1,0 +1,143 @@
+
+段落改写 同步
+POST
+/api/v2/paraphrase
+调试
+Header参数（二选一即可）
+参数名	类型	是否必填	说明
+Authorization	String	否	API 密钥
+X-API-Key	String	否	API 密钥
+Body参数
+参数名	类型	是否必填	说明
+preset	String	是	改写预设 可以从GET /api/v2/presets 接口获取
+text	String	是	待改写的字段
+请求参数
+Header 参数
+生成代码
+authorization
+Authorization
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+X-API-Key
+X-Api-Key
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+Body 参数
+application/json
+必填
+生成代码
+text
+string 
+Text
+必需
+>= 1 字符
+<= 50000 字符
+preset
+string 
+Preset
+必需
+>= 1 字符
+<= 100 字符
+示例
+{
+    "text": "随着深度学习和神经网络技术的发展，AI系统的能力已经超出了许多人的预期。大型语言模型可以生成高质量的文本内容，协助人们完成各种写作任务，从简单的邮件撰写到复杂的学术论文草稿。",
+    "preset": "aigcmove_tp_s_1"
+}
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+application/json
+Successful Response
+Bodyapplication/json
+生成代码
+success
+boolean 
+Success
+必需
+original_text
+string 
+Original Text
+必需
+paraphrased_text
+string 
+Paraphrased Text
+必需
+preset_used
+string 
+Preset Used
+必需
+preset_name
+string 
+Preset Name
+必需
+characters_count
+integer 
+Characters Count
+必需
+cost
+number 
+Cost
+必需
+remaining_balance
+number 
+Remaining Balance
+必需
+language_detected
+string 
+Language Detected
+必需
+processing_time
+number 
+Processing Time
+必需
+request_id
+string 
+Request Id
+必需
+示例
+{
+    "success": true,
+    "original_text": "string",
+    "paraphrased_text": "string",
+    "preset_used": "string",
+    "preset_name": "string",
+    "characters_count": 0,
+    "cost": 0,
+    "remaining_balance": 0,
+    "language_detected": "string",
+    "processing_time": 0,
+    "request_id": "string"
+}
+🟠422
+修改于 4 个月前
+上一页
+获取API Key
+下一页
+段落改写 流式
+LLMs.txt
+克隆
+导出
+Built with

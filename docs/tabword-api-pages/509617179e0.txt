@@ -1,0 +1,119 @@
+
+查询并获取异步格式调整结果
+开发中
+GET
+/api/public/format/jobs/{job_id}/result
+调试
+鉴权
+所有接口均支持以下任意一种鉴权方式：
+Authorization: Bearer <API_KEY>
+或：
+X-API-Key: <API_KEY>
+根据异步格式调整提交接口返回的 jobId 查询任务进度和排版结果。
+请求
+GET /api/public/format/jobs/{job_id}/result?wait_seconds=3
+参数
+参数	位置	类型	必填	默认值	说明
+job_id	Path	string	是	-	提交接口返回的 jobId
+wait_seconds	Query	integer	否	3	长轮询等待秒数，范围 0–120；传 0 立即返回
+请求示例
+curl \
+  'https://apihub.ycjg.top/api/public/format/jobs/format-job-id/result?wait_seconds=3' \
+  -H 'Authorization: Bearer <API_KEY>'
+处理中响应
+状态码：200 OK
+{
+  "jobId": "format-job-id",
+  "status": "RUNNING",
+  "stage": "模板排版：正在生成文档",
+  "percent": 75
+}
+成功响应
+首次查询到 SUCCEEDED 时，APIHub 完成扣费并在响应中增加 billing：
+{
+  "jobId": "format-job-id",
+  "status": "SUCCEEDED",
+  "templateId": "_default_arts",
+  "templateName": "默认模板（文科）",
+  "docxFileId": "gen.docx",
+  "docxFilename": "paper.docx",
+  "docxUrl": "https://example.com/result.docx",
+  "beforeFileId": "before.docx",
+  "workbenchUrl": "https://apihub.ycjg.top/format-workbench?...",
+  "message": "格式调整完成，可下载结果文档或打开对照预览",
+  "billing": {
+    "success": true,
+    "cost": 3.0,
+    "remaining_balance": 97.0,
+    "usage_count": 1
+  }
+}
+重复查询已经成功的任务会返回相同计费信息，不会重复扣费。
+失败响应
+{
+  "jobId": "format-job-id",
+  "status": "FAILED",
+  "error": {
+    "message": "格式调整失败"
+  }
+}
+任务归属与错误响应
+状态码	说明
+401	API Key 缺失或无效
+403	当前 APIHub 用户无权查看该任务
+404	任务不存在，或 APIHub 本地任务记录已过期
+409	任务正在结算，或提交任务的 API Key 已不存在
+422	wait_seconds 不在 0–120 范围内
+502	查询上游任务失败
+503	APIHub Redis 异步任务状态服务不可用
+APIHub 默认保存异步任务的用户归属和计费状态 24 小时。
+请求参数
+Path 参数
+生成代码
+job_id
+string 
+必需
+Query 参数
+生成代码
+wait_seconds
+string 
+可选
+Header 参数
+生成代码
+Authorization
+string 
+可选
+默认值:
+sk-xx
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+成功
+application/json
+生成代码
+object
+ 
+示例
+{}
+修改于 大约 2 个月前
+上一页
+异步提交格式调整排版
+LLMs.txt
+克隆
+导出
+Built with

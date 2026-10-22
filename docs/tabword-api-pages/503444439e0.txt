@@ -1,0 +1,91 @@
+
+格式调整排版
+开发中
+POST
+/api/public/format/stream
+调试
+费用：5块一次
+鉴权
+所有接口均支持以下任意一种鉴权方式：
+Authorization: Bearer <API_KEY>
+或：
+X-API-Key: <API_KEY>
+上传论文 DOCX 或 PDF，并指定模板。上游串行完成 AI 内容提取和模板排版，通过 SSE 实时返回进度。
+请求
+POST /api/public/format/stream
+Content-Type: multipart/form-data
+Form 参数
+参数	类型	必填	说明
+file	file	是	待排版论文，支持 DOCX、PDF
+template_id	string	是	模板列表返回的 templateId，也支持内置默认模板
+请求示例
+curl -N -X POST 'https://apihub.ycjg.top/api/public/format/stream' \
+  -H 'Authorization: Bearer <API_KEY>' \
+  -F 'file=@paper.docx' \
+  -F 'template_id=_default_arts' \
+  -F 'owner_id=school-123'
+progress 事件
+stage 通常以“提取内容：”或“模板排版：”开头。
+event: progress
+data: {"stage":"提取内容：正在识别论文结构","percent":30}
+complete 事件
+event: complete
+data: {"status":"SUCCEEDED","templateId":"_default_arts","templateName":"默认模板（文科）","docxFileId":"gen.docx","docxFilename":"paper.docx","docxUrl":"https://example.com/result.docx","beforeFileId":"before.docx","workbenchUrl":"https://apihub.ycjg.top/format-workbench?before=before.docx&after=gen.docx&template=_default_arts&name=paper.docx","message":"格式调整完成，可下载结果文档或打开对照预览"}
+字段说明：
+字段	说明
+docxFileId	排版后文档的文件 ID
+docxFilename	下载文件名
+docxUrl	排版后 DOCX 的签名下载地址
+beforeFileId	调整前的对照产物 ID
+workbenchUrl	调整前后对照工作台链接；上传 PDF 时为空
+成功后 APIHub 追加 billing 事件。上游 error 或客户端中断时不扣费。
+请求参数
+Header 参数
+生成代码
+Authorization
+string 
+可选
+默认值:
+sk-xx
+Body 参数multipart/form-data必填
+生成代码
+file
+file 
+可选
+template_id
+string 
+可选
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+成功
+application/json
+生成代码
+object
+ 
+示例
+{}
+修改于 大约 1 个月前
+上一页
+说明类创建模版
+下一页
+异步提交格式调整排版
+LLMs.txt
+克隆
+导出
+Built with

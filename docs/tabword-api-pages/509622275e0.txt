@@ -1,0 +1,107 @@
+
+查询异步格式检测报告结果
+开发中
+GET
+/api/public/format-check/jobs/{job_id}/result
+调试
+鉴权
+所有接口均支持以下任意一种鉴权方式：
+Authorization: Bearer <API_KEY>
+或：
+X-API-Key: <API_KEY>
+根据异步格式检查提交接口返回的 jobId 查询任务进度或完整检查报告。
+请求
+GET /api/public/format-check/jobs/{job_id}/result?wait_seconds=3
+参数
+参数	位置	类型	必填	默认值	说明
+job_id	Path	string	是	-	提交接口返回的 jobId
+wait_seconds	Query	integer	否	3	长轮询等待秒数，范围 0–120；传 0 立即返回
+请求示例
+curl \
+  'https://apihub.ycjg.top/api/public/format-check/jobs/format-check-job-id/result?wait_seconds=3' \
+  -H 'Authorization: Bearer <API_KEY>'
+处理中响应
+状态码：200 OK
+{
+  "jobId": "format-check-job-id",
+  "status": "RUNNING",
+  "stage": "正在生成检查报告",
+  "percent": 60
+}
+成功响应
+状态码：200 OK
+{
+  "jobId": "format-check-job-id",
+  "status": "SUCCEEDED",
+  "summary": {},
+  "violations": [],
+  "fileId": "report.html",
+  "previewUrl": "https://example.com/report/preview",
+  "downloadUrl": "https://example.com/report/download",
+  "stats": {}
+}
+失败响应
+{
+  "jobId": "format-check-job-id",
+  "status": "FAILED",
+  "error": {
+    "message": "格式检查失败"
+  }
+}
+任务归属
+任务只能由提交任务的 APIHub 用户查询。
+同一个 APIHub 用户可以使用自己的其他 API Key 查询。
+其他用户查询返回 403。
+APIHub 默认保存任务归属信息 24 小时；记录不存在或已过期返回 404。
+请求参数
+Path 参数
+生成代码
+job_id
+string 
+必需
+Query 参数
+生成代码
+wait_seconds
+string 
+可选
+Header 参数
+生成代码
+Authorization
+string 
+可选
+默认值:
+sk-xx
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+成功
+application/json
+生成代码
+object
+ 
+示例
+{}
+修改于 大约 2 个月前
+上一页
+提交异步格式检测报告任务
+下一页
+范文类创建模板
+LLMs.txt
+克隆
+导出
+Built with

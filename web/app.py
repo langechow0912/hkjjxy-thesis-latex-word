@@ -7,7 +7,7 @@
     python -m uvicorn web.app:app --port 8000
 
 公网暴露前建议设置（不设置则保持本地免密）：
-    THESIS_AUTH_USER / THESIS_AUTH_PASS     开启 HTTP Basic 访问口令
+    THESIS_AUTH_USER / THESIS_AUTH_PASS(_FILE) 开启 HTTP Basic 访问口令
     THESIS_MAX_JOBS                         同时编译的任务上限（默认 2）
     THESIS_MAX_UPLOAD_MB                    上传 docx 大小上限（默认 20）
     THESIS_KEEP_JOBS                        内存中保留的任务数（默认 50）
@@ -43,21 +43,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import build as corebuild          # noqa: E402
-from core import dayipaper                   # noqa: E402
+from core import alipay, build as corebuild   # noqa: E402
+from core import dayipaper, schoolformat      # noqa: E402
+from core.localconfig import load_pat
+load_pat(ROOT)
 from core import docx2tex, profile as P      # noqa: E402
 
 try:
-    from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+    from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
     from pydantic import BaseModel
     from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
     from starlette.responses import Response
 except ImportError:                                       # pragma: no cover
     sys.stderr.write("缺少依赖，请先执行：pip install -r requirements.txt\n")
     raise
 
-app = FastAPI(title="毕业论文格式流水线")
+PRODUCTION = os.environ.get("THESIS_ENV", "").lower() == "production"
+app = FastAPI(title="毕业论文格式流水线",
+              docs_url=None if PRODUCTION else "/docs",
+              redoc_url=None if PRODUCTION else "/redoc",
+              openapi_url=None if PRODUCTION else "/openapi.json")
+from web.tabword_routes import router as tabword_router
+app.include_router(tabword_router)
 STATIC = Path(__file__).resolve().parent / "static"
 
 JOBS = {}
@@ -68,8 +77,32 @@ _BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 # ---- 公网暴露时的保护措施（全部可关，默认本地免密）----
 # 设置这两个环境变量即开启 HTTP Basic 口令；留空则任何人可访问。
 AUTH_USER = os.environ.get("THESIS_AUTH_USER", "").strip()
-AUTH_PASS = os.environ.get("THESIS_AUTH_PASS", "").strip()
+
+
+def _secret_value(name):
+    value = os.environ.get(name, "").strip()
+    file_path = os.environ.get(name + "_FILE", "").strip()
+    if value and file_path:
+        raise RuntimeError("Set either %s or %s_FILE, not both" % (name, name))
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError as exc:
+            raise RuntimeError("Cannot read configured secret file for %s" % name) from exc
+    return value
+
+
+AUTH_PASS = _secret_value("THESIS_AUTH_PASS")
 AUTH_ON = bool(AUTH_USER and AUTH_PASS)
+AUTH_REQUIRED = os.environ.get("THESIS_REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+if AUTH_REQUIRED and not AUTH_ON:
+    raise RuntimeError("THESIS_REQUIRE_AUTH is enabled but the Basic Auth credentials are unavailable")
+ALLOWED_HOSTS = [host.strip() for host in
+                 os.environ.get("THESIS_ALLOWED_HOSTS", "*").split(",") if host.strip()]
+if not ALLOWED_HOSTS:
+    raise RuntimeError("THESIS_ALLOWED_HOSTS must contain at least one host")
+if "*" not in ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 # 同时编译的任务数上限：一次构建要跑 3 遍 XeLaTeX + LibreOffice，很吃 CPU。
 MAX_RUNNING = int(os.environ.get("THESIS_MAX_JOBS", "2") or 2)
 MAX_UPLOAD_MB = int(os.environ.get("THESIS_MAX_UPLOAD_MB", "20") or 20)
@@ -93,7 +126,7 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         )
 
     async def dispatch(self, request, call_next):
-        if not AUTH_ON or request.url.path == "/api/health":
+        if not AUTH_ON or request.url.path in ("/api/health", "/api/alipay/notify"):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         ok = False
@@ -156,7 +189,7 @@ def _reap_jobs():
     """只保留最近 KEEP_JOBS 个任务，顺手清掉临时目录，避免长时间在线后堆满磁盘。"""
     if len(JOBS) <= KEEP_JOBS:
         return
-    oldest = sorted(JOBS.values(), key=lambda j: j.get("t", 0))[:len(JOBS) - KEEP_JOBS]
+    oldest = sorted((j for j in JOBS.values() if j["state"] != "running"), key=lambda j: j.get("t", 0))[:len(JOBS) - KEEP_JOBS]
     for job in oldest:
         JOBS.pop(job["id"], None)
         shutil.rmtree(job.get("tmp", ""), ignore_errors=True)
@@ -178,7 +211,7 @@ class BuildReq(BaseModel):
 
 def _new_job(kind="build"):
     with _LOCK:
-        jid = "j%03d" % (len(JOBS) + 1)
+        jid = "j" + secrets.token_hex(16)
         job = {"id": jid, "kind": kind, "state": "running", "log": [], "files": {},
                "tmp": tempfile.mkdtemp(prefix="thesis-web-"), "t": time.time()}
         JOBS[jid] = job
@@ -189,6 +222,11 @@ def _new_job(kind="build"):
 @app.get("/", response_class=HTMLResponse)
 def index():
     return (STATIC / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/app.js")
+def frontend_script():
+    return FileResponse(STATIC / "app.js", media_type="application/javascript")
 
 
 @app.get("/api/schools")
@@ -312,12 +350,19 @@ def _dp_call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except dayipaper.ApiError as exc:
         status = exc.http_status if exc.http_status in (400, 401, 403, 413, 429) else 502
-        raise HTTPException(status, str(exc))
+        raise HTTPException(status, "排版服务请求失败，请检查配置或稍后重试")
+
+
+def _format_job(job_id):
+    job = JOBS.get(job_id)
+    if not job or job.get("kind") not in ("school", "cloud"):
+        raise HTTPException(404, "排版任务不存在")
+    return job
 
 
 def _cloud_job(job_id):
-    job = JOBS.get(job_id)
-    if not job or job.get("kind") != "cloud":
+    job = _format_job(job_id)
+    if job.get("kind") != "cloud":
         raise HTTPException(404, "云端排版任务不存在")
     return job
 
@@ -329,6 +374,55 @@ def api_dp_info():
             "timeout": CLOUD_TIMEOUT, "running": _cloud_running_count()}
 
 
+@app.get("/api/alipay")
+def api_alipay_info():
+    return alipay.public_status()
+
+
+@app.post("/api/format/jobs/{job_id}/payment")
+def api_create_payment(job_id: str):
+    job = _format_job(job_id)
+    if job.get("state") != "done" or (job.get("kind") == "cloud" and not job.get("taskId")):
+        raise HTTPException(409, "排版任务尚未完成")
+    try:
+        order = alipay.create_order(job_id, job.get("name") or "论文")
+    except alipay.AlipayError as exc:
+        raise HTTPException(503, str(exc)) from None
+    return {"order_id": order["out_trade_no"], "status": order["status"],
+            "amount_cents": order["amount_cents"],
+            "qr_image": f"/api/format/jobs/{job_id}/payment/{order['out_trade_no']}/qr.png"}
+
+
+@app.get("/api/format/jobs/{job_id}/payment/{order_id}")
+def api_payment_status(job_id: str, order_id: str):
+    _format_job(job_id)
+    order = alipay.get_order(order_id, job_id)
+    if not order:
+        raise HTTPException(404, "支付订单不存在")
+    return {"order_id": order["out_trade_no"], "status": order["status"],
+            "paid": order["status"] == "TRADE_SUCCESS"}
+
+
+@app.get("/api/format/jobs/{job_id}/payment/{order_id}/qr.png")
+def api_payment_qr(job_id: str, order_id: str):
+    _format_job(job_id)
+    try:
+        image = alipay.qr_png(order_id, job_id)
+    except ImportError:
+        raise HTTPException(503, "二维码组件未安装") from None
+    if image is None:
+        raise HTTPException(404, "支付订单不存在")
+    return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/alipay/notify")
+async def api_alipay_notify(request: Request):
+    form = await request.form()
+    params = {key: str(value) for key, value in form.items()}
+    return Response("success" if alipay.apply_notification(params) else "failure",
+                    media_type="text/plain; charset=utf-8")
+
+
 @app.get("/api/dayipaper/rules")
 def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关键词"),
                  size: int = Query(5, ge=1, le=20)):
@@ -337,6 +431,20 @@ def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关�
     return _dp_call(dayipaper.search_rules, q, page_size=size)
 
 
+@app.get('/api/format/rules')
+def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=1, le=20)):
+    local = [dict(id='school:' + s['id'], name=s['name'] + '本科毕业论文规范',
+                  targetSchoolName=s['name'], targetSubjectLevel='本科', provider='school')
+             for s in schools() if q.strip() in s['name'] or q.strip() == s['id']]
+    if local:
+        return {'items': local[:size], 'total': len(local)}
+    result = api_dp_rules(q, size)
+    # Namespace provider rules so later adapters can be added without ID collisions.
+    return {**result, 'items': [{**r, 'id': 'dayipaper:' + str(r['id']),
+                                'provider': 'dayipaper'} for r in result.get('items', [])]}
+
+
+@app.post("/api/format")
 @app.post("/api/dayipaper/format")
 async def api_dp_format(file: UploadFile = File(...),
                         ruleId: str = Form(...),
@@ -350,15 +458,22 @@ async def api_dp_format(file: UploadFile = File(...),
                         tutorNameEn: str = Form(""),
                         subjectName: str = Form(""),
                         subjectNameEn: str = Form("")):
-    if not dayipaper.has_token():
+    local_school = ruleId[7:] if ruleId.startswith('school:') else None
+    if local_school and local_school not in {s['id'] for s in schools()}:
+        raise HTTPException(400, '未知院校规范')
+    if not local_school and not dayipaper.has_token():
         raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
-    if _cloud_running_count() >= MAX_CLOUD:
+    if local_school and _running_count() >= MAX_RUNNING:
+        raise HTTPException(503, '学校排版任务繁忙，请稍后重试')
+    if not local_school and _cloud_running_count() >= MAX_CLOUD:
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
                             % (_cloud_running_count(), MAX_CLOUD))
 
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in (".docx", ".doc"):
         raise HTTPException(400, "云端排版只收 .docx / .doc 源文件")
+    if local_school and suffix != '.docx':
+        raise HTTPException(400, '该院校请上传 .docx，请先在 Word 中另存为此格式')
     data = await file.read()
     if not data:
         raise HTTPException(400, "上传的文件是空的")
@@ -374,6 +489,21 @@ async def api_dp_format(file: UploadFile = File(...),
             meta[key] = value.strip()
     if not all(meta.get(k) for k in ("title", "authorName", "ruleId")):
         raise HTTPException(400, "题目、作者名、规范 ID 都是必填")
+
+    if local_school:
+        try:
+            cfg = schoolformat.validate(local_school)
+        except (Exception, SystemExit):
+            raise HTTPException(503, '学校排版模板或工具尚未配置完成')
+        job = _new_job(kind='school')
+        job.update(name=meta['title'], stage='准备稿件', suggestions=[])
+        threading.Thread(target=schoolformat.run, args=(job, data, cfg, meta), daemon=True).start()
+        return {'job': job['id'], 'title': meta['title']}
+
+    if meta['ruleId'].startswith('dayipaper:'):
+        meta['ruleId'] = meta['ruleId'].split(':', 1)[1]
+    elif ':' in meta['ruleId']:
+        raise HTTPException(400, '未注册的排版服务')
 
     job = _new_job(kind="cloud")
     job.update({"name": meta["title"], "stage": "上传源文档", "status": None,
@@ -443,9 +573,15 @@ def api_dp_job(job_id: str):
             "files": {k: os.path.basename(v) for k, v in job.get("files", {}).items()}}
 
 
+@app.get("/api/format/jobs/{job_id}/preview")
 @app.get("/api/dayipaper/preview/{job_id}")
 def api_dp_preview(job_id: str):
     """现取一次状态再跳转：接口给的 pdfShareUrl 只有 3 分钟有效期，存下来会点开失败。"""
+    local = JOBS.get(job_id)
+    if local and local.get('kind') == 'school':
+        if 'pdf' not in local['files']:
+            raise HTTPException(409, '预览尚未生成')
+        return FileResponse(local['files']['pdf'], media_type='application/pdf')
     job = _cloud_job(job_id)
     if not job.get("taskId"):
         raise HTTPException(409, "任务还没创建成功")
@@ -460,10 +596,40 @@ def api_dp_preview(job_id: str):
     return RedirectResponse(url, status_code=303)
 
 
+@app.get("/api/format/jobs/{job_id}/download")
 @app.get("/api/dayipaper/download/{job_id}")
 def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
-                    confirm: bool = Query(False, description="导出计费，必须显式确认")):
+                    confirm: bool = Query(False, description="导出计费，必须显式确认"),
+                    payment_order: str | None = Query(None)):
+    local = JOBS.get(job_id)
+    if local and local.get('kind') == 'school':
+        if fmt == 2:
+            if 'pdf' not in local['files']:
+                raise HTTPException(409, 'PDF 预览尚未生成')
+            return FileResponse(local['files']['pdf'], media_type='application/pdf',
+                                filename=sanitize(local['name']) + '.pdf')
+        if fmt != 1 or 'docx' not in local['files']:
+            raise HTTPException(409, 'Word 尚未生成或格式不支持')
+        if not alipay.public_status()["enabled"]:
+            raise HTTPException(503, "支付宝扫码支付尚未配置完成，暂不能下载 Word")
+        order = alipay.get_order(payment_order, job_id)
+        if not order or order["status"] != "TRADE_SUCCESS":
+            raise HTTPException(402, "请先完成支付宝扫码支付")
+        return FileResponse(local['files']['docx'], filename=sanitize(local['name']) + '.docx')
     job = _cloud_job(job_id)
+    with _LOCK:
+        export_lock = job.setdefault("exportLock", threading.Lock())
+    with export_lock:
+        if not alipay.public_status()["enabled"]:
+            raise HTTPException(503, "支付宝扫码支付尚未配置完成，暂不能下载 Word")
+        order = alipay.get_order(payment_order, job_id)
+        if not order or order["status"] != "TRADE_SUCCESS":
+            raise HTTPException(402, "请先完成支付宝扫码支付")
+        confirm = True
+        return _export_job(job, fmt, confirm)
+
+
+def _export_job(job, fmt, confirm):
     if not job.get("taskId"):
         raise HTTPException(409, "任务还没创建成功")
     if job["state"] != "done":
@@ -482,11 +648,26 @@ def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
         path = dayipaper.download_to(job["taskId"], dest, fmt=fmt)
     except dayipaper.ApiError as exc:
         job["log"].append("导出失败：%s" % exc)
-        raise HTTPException(exc.http_status or 502, str(exc))
+        raise HTTPException(502, "导出失败，请稍后重试")
     job["files"][kind] = path
     job["exported"] = True
     job["log"].append("已导出成品：%s" % os.path.basename(path))
     return FileResponse(path, filename=os.path.basename(path))
+
+
+@app.get("/api/format/jobs/{job_id}")
+def api_format_job(job_id: str):
+    job = JOBS.get(job_id)
+    if not job or job.get('kind') not in ('school', 'cloud'):
+        raise HTTPException(404, '排版任务不存在')
+    return {"id": job["id"], "state": job["state"],
+            "stage": job.get("stage"), "statusLabel": job.get("statusLabel"),
+            "preview": bool(job.get("preview") or job.get('files', {}).get('pdf')),
+            "billedExport": job.get('kind') == 'cloud',
+            "paymentRequired": True,
+            "freePdfDownload": job.get('kind') == 'school' and bool(job.get('files', {}).get('pdf')),
+            "suggestions": job.get("suggestions") or [],
+            "exported": bool(job.get("exported"))}
 
 
 def main(argv=None):

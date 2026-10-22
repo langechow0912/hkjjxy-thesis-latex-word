@@ -342,7 +342,8 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
 
     out += ["", r"\newpage", r"\vspace*{3\baselineskip}",
             r"\unnumsec{参考文献}", "", r"\begin{thesref}"]
-    out += ["  " + r"\item " + _superscripts(E(r)) for r in refs]
+    # The bibliography environment supplies numbering; source labels are not citations.
+    out += ["  " + r"\item " + E(re.sub(r"^\s*\[\d+\]\s*", "", r)) for r in refs]
     out += [r"\end{thesref}", ""]
 
     if ack:

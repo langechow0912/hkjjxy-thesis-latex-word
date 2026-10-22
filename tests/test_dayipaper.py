@@ -16,6 +16,7 @@ import time
 import unittest
 import urllib.parse
 import uuid
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -24,8 +25,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # 临时目录收进工作区：Web 层的 job 临时目录走 tempfile，落到系统 Temp 可能没有写权限
-_TMP_ROOT = ROOT / ".test-tmp"
-_TMP_ROOT.mkdir(exist_ok=True)
+_ORIGINAL_TEMPDIR = tempfile.tempdir
+_TEST_PARENT = ROOT / '.test-tmp'
+_TEST_PARENT.mkdir(exist_ok=True)
+_TMP_ROOT = Path(tempfile.mkdtemp(prefix='offline-', dir=_TEST_PARENT))
 tempfile.tempdir = str(_TMP_ROOT)
 
 from core import dayipaper                                    # noqa: E402
@@ -376,19 +379,23 @@ class TestWebLayer(Base):
             self.assertEqual(resp.status_code, 303)
             self.assertIn("/oss/preview.pdf", resp.headers["location"])
 
-            # 不给 confirm 不导出
-            resp = self.client.get("/api/dayipaper/download/" + job_id)
-            self.assertEqual(resp.status_code, 400)
-            self.assertIn("计费", resp.json()["detail"])
+            # Word export requires an enabled, paid Alipay order.
+            with patch.object(self.webapp.alipay, "public_status", return_value={"enabled": False}):
+                resp = self.client.get("/api/dayipaper/download/" + job_id)
+            self.assertEqual(resp.status_code, 503)
             self.assertEqual(api.store["exports"], 0)
 
-            # 给了 confirm 才导出，第二次命中缓存不再打导出接口
-            resp = self.client.get("/api/dayipaper/download/%s?confirm=true" % job_id)
+            # A paid order unlocks export, and the generated file remains cached.
+            with patch.object(self.webapp.alipay, "public_status", return_value={"enabled": True}), patch.object(
+                    self.webapp.alipay, "get_order", return_value={"status": "TRADE_SUCCESS"}):
+                resp = self.client.get("/api/dayipaper/download/%s?confirm=true&payment_order=test-order" % job_id)
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.content, DOCX)
             self.assertEqual(api.store["exports"], 1)
 
-            resp = self.client.get("/api/dayipaper/download/%s?confirm=true" % job_id)
+            with patch.object(self.webapp.alipay, "public_status", return_value={"enabled": True}), patch.object(
+                    self.webapp.alipay, "get_order", return_value={"status": "TRADE_SUCCESS"}):
+                resp = self.client.get("/api/dayipaper/download/%s?confirm=true&payment_order=test-order" % job_id)
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(api.store["exports"], 1)
             self.assertEqual(self.client.get("/api/dayipaper/job/" + job_id).json()["exported"], True)
@@ -422,6 +429,7 @@ class TestWebLayer(Base):
 def tearDownModule():
     """跑完清掉工作区里的临时目录。"""
     shutil.rmtree(_TMP_ROOT, ignore_errors=True)
+    tempfile.tempdir = _ORIGINAL_TEMPDIR
 
 
 if __name__ == "__main__":

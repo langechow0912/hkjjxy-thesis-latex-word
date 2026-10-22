@@ -46,8 +46,8 @@ def convert_pdf(cfg, src, outdir, log=print):
         cmd = [soffice,
                "-env:UserInstallation=file:///" + prof.replace("\\", "/"),
                "--headless", "--convert-to", "pdf", "--outdir", outdir, src]
-        subprocess.run(cmd, capture_output=True, timeout=300)
-        if os.path.isfile(expect):
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode == 0 and os.path.isfile(expect) and os.path.getsize(expect) > 0:
             return expect
         log("  LibreOffice 未产出，重试 %d/3" % attempt)
     raise RuntimeError("LibreOffice 转换失败：%s" % src)
@@ -78,5 +78,10 @@ def compile_pdf(cfg, work_dir, tex_name="main.tex", times=3, log=print):
             cwd=work_dir, capture_output=True)
         if r.returncode != 0:
             log("  XeLaTeX 第 %d 遍返回 %d" % (i + 1, r.returncode))
+            detail = (r.stdout + b"\n" + r.stderr).decode("utf-8", "replace")[-3000:]
+            raise RuntimeError("XeLaTeX 编译失败（第 %d 遍）：%s" % (i + 1, detail))
+    pdf = os.path.join(work_dir, tex_name[:-4] + ".pdf")
+    if not os.path.isfile(pdf) or os.path.getsize(pdf) == 0:
+        raise RuntimeError("XeLaTeX 未生成有效 PDF")
     log("  XeLaTeX 编译 %d 遍完成" % times)
-    return os.path.join(work_dir, tex_name[:-4] + ".pdf")
+    return pdf

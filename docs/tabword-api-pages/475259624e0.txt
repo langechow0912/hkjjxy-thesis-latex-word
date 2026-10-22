@@ -1,0 +1,131 @@
+
+文档异步改写
+POST
+/api/v2/document/paraphrase/async
+调试
+Header参数（二选一即可）
+参数名	类型	是否必填	说明
+Authorization	String	否	API 密钥
+X-API-Key	String	否	API 密钥
+Body参数
+参数名	类型	是否必填	说明
+file	file	是	待改写的word文档
+preset_zh	String	是	中文改写模型
+preset_en	String	是	英文改写模型
+callback_url	String	否	回调地址，文档处理完成后会对这个url发送处理好的数据
+generate_diff	boolean	是	是否生成对比文档
+generate_diff
+如果为true的话则返回的字段里面的diff_url不会为null，而是为一个下载链接，下载的word文档为改写后的word文档，且将改写的具体文本标注为红色
+参数名	说明
+original_ai_rate	原始AI率
+rewritten_ai_rate	改写后AI率
+reduction	减少了多少
+ai_detection_success	AI率检测是否成功
+请求参数
+Header 参数
+生成代码
+authorization
+Authorization
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+X-API-Key
+X-Api-Key
+可选
+Any of:
+string
+null
+示例:
+sk-xx
+Body 参数multipart/form-data必填
+生成代码
+file
+file 
+必需
+示例:
+file:///Users/jelee/Downloads/test.docx
+preset_zh
+string 
+Preset Zh
+可选
+默认值:
+aigcmove_tp_s_2
+示例:
+aigcmove_tp_s_2
+preset_en
+string 
+Preset En
+可选
+默认值:
+5.09en
+示例:
+5.09en
+generate_diff
+string 
+Generate Diff
+可选
+默认值:
+false
+示例:
+false
+callback_url
+string 
+可选
+请求示例代码
+Shell
+JavaScript
+Java
+Swift
+Go
+PHP
+Python
+HTTP
+C
+C#
+Objective-C
+Ruby
+OCaml
+Dart
+R
+返回响应
+🟢200
+application/json
+Successful Response
+Bodyapplication/json
+生成代码
+success
+boolean 
+Success
+必需
+task_id
+string 
+Task Id
+必需
+estimated_cost
+number 
+Estimated Cost
+必需
+message
+string 
+Message
+必需
+示例
+{
+    "success": true,
+    "task_id": "string",
+    "estimated_cost": 0,
+    "message": "string"
+}
+🟠422
+修改于 3 个月前
+上一页
+费用估算
+下一页
+文档异步改写进度查询
+LLMs.txt
+克隆
+导出
+Built with
