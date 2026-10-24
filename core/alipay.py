@@ -75,6 +75,9 @@ def _connect():
         status TEXT NOT NULL, qr_code TEXT NOT NULL, trade_no TEXT,
         created_at INTEGER NOT NULL, paid_at INTEGER
     )""")
+    from core import affiliates
+    with closing(affiliates._connect()):
+        pass
     return conn
 
 
@@ -134,34 +137,68 @@ def _request(method, biz_content, cfg=None):
     return result
 
 
-def create_order(job_id, title):
+def create_order(job_id, title, affiliate_code=None, affiliate_campaign="",
+                coupon_code=None, school_key=""):
     cfg = config()
     if not cfg["enabled"]:
         raise AlipayError("支付宝扫码支付未启用或配置不完整")
+    from core import affiliates
+    with closing(affiliates._connect()):
+        pass
+    referral = affiliates.snapshot_for_order(affiliate_code, affiliate_campaign)
+    requested_coupon = (coupon_code or "").strip().upper() or None
     with closing(_connect()) as conn, conn:
         existing = conn.execute("""SELECT * FROM payment_orders WHERE job_id=?
             AND status IN ('WAIT_BUYER_PAY','TRADE_SUCCESS')
             ORDER BY CASE WHEN status='TRADE_SUCCESS' THEN 0 ELSE 1 END, created_at DESC LIMIT 1""",
                                 (job_id,)).fetchone()
-        if existing and (existing["status"] == "TRADE_SUCCESS"
-                         or time.time() - existing["created_at"] < 16 * 60):
+        if existing and existing["status"] == "TRADE_SUCCESS":
             return dict(existing)
+        if existing and time.time() - existing["created_at"] < 16 * 60:
+            if existing["coupon_code"] != requested_coupon:
+                raise AlipayError("该任务已有待支付订单，请完成或等待订单过期后再更换优惠码")
+            return dict(existing)
+        if existing:
+            affiliates.release_coupon(existing["out_trade_no"])
     order_no = "LP" + datetime.now().strftime("%y%m%d%H%M%S") + os.urandom(5).hex().upper()
-    response = _request("alipay.trade.precreate", {
-        "out_trade_no": order_no,
-        "total_amount": f"{Decimal(cfg['amount_cents']) / 100:.2f}",
-        "subject": ("论文排版成品导出：" + title)[:128],
-        "timeout_express": "15m",
-    }, cfg)
+    try:
+        quote = affiliates.reserve_coupon(requested_coupon, school_key, cfg["amount_cents"], order_no)
+    except ValueError:
+        raise
+    try:
+        response = _request("alipay.trade.precreate", {
+            "out_trade_no": order_no,
+            "total_amount": f"{Decimal(quote['amount_cents']) / 100:.2f}",
+            "subject": ("论文排版成品导出：" + title)[:128],
+            "timeout_express": "15m",
+        }, cfg)
+    except Exception:
+        affiliates.release_coupon(order_no)
+        raise
     qr_code = response.get("qr_code")
     if not isinstance(qr_code, str) or not qr_code.startswith("https://"):
+        affiliates.release_coupon(order_no)
         raise AlipayError("支付宝没有返回有效二维码")
     order = {"out_trade_no": order_no, "job_id": job_id,
-             "amount_cents": cfg["amount_cents"], "status": "WAIT_BUYER_PAY",
-             "qr_code": qr_code, "trade_no": None, "created_at": int(time.time()), "paid_at": None}
+             "amount_cents": quote["amount_cents"], "list_price_cents": cfg["amount_cents"],
+             "discount_cents": quote["discount_cents"], "coupon_id": quote["coupon_id"],
+             "coupon_code": quote["coupon_code"], "school_key": school_key,
+             "status": "WAIT_BUYER_PAY",
+             "qr_code": qr_code, "trade_no": None, "created_at": int(time.time()), "paid_at": None,
+             "affiliate_id": referral["id"] if referral else None,
+             "affiliate_code": referral["code"] if referral else None,
+             "affiliate_campaign": referral["campaign"] if referral else "",
+             "affiliate_bps": referral["commission_bps"] if referral else None}
     with closing(_connect()) as conn, conn:
-        conn.execute("INSERT INTO payment_orders VALUES(?,?,?,?,?,?,?,?)",
-                     tuple(order[key] for key in ("out_trade_no", "job_id", "amount_cents", "status", "qr_code", "trade_no", "created_at", "paid_at")))
+        conn.execute("""INSERT INTO payment_orders
+            (out_trade_no,job_id,amount_cents,status,qr_code,trade_no,created_at,paid_at,
+             affiliate_id,affiliate_code,affiliate_campaign,affiliate_bps,
+             list_price_cents,coupon_id,coupon_code,discount_cents,school_key)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            tuple(order[key] for key in ("out_trade_no", "job_id", "amount_cents", "status",
+                  "qr_code", "trade_no", "created_at", "paid_at", "affiliate_id",
+                  "affiliate_code", "affiliate_campaign", "affiliate_bps", "list_price_cents",
+                  "coupon_id", "coupon_code", "discount_cents", "school_key")))
     return order
 
 
@@ -192,6 +229,11 @@ def apply_notification(params):
     with closing(_connect()) as conn, conn:
         conn.execute("UPDATE payment_orders SET status='TRADE_SUCCESS', trade_no=?, paid_at=? WHERE out_trade_no=? AND status!='TRADE_SUCCESS'",
                      (params.get("trade_no"), int(time.time()), order["out_trade_no"]))
+        from core import affiliates
+        paid_order = conn.execute("SELECT * FROM payment_orders WHERE out_trade_no=?",
+                                  (order["out_trade_no"],)).fetchone()
+        affiliates.redeem_coupon(conn, order["out_trade_no"])
+        affiliates.settle_paid_order(conn, paid_order)
     return True
 
 

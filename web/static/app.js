@@ -113,6 +113,7 @@ async function setupPayment(id) {
   clearTimeout(paymentTimer); paymentJob = id; paymentOrder = null;
   $('paymentPanel').hidden = false; $('paymentQr').style.display = 'none';
   $('paidDownload').hidden = true; $('createPayment').hidden = true;
+  $('couponControls').hidden = true; $('couponInfo').textContent = ''; $('couponCode').value = '';
   try {
     const config = await request('/api/alipay');
     if (paymentJob !== id) return;
@@ -121,6 +122,7 @@ async function setupPayment(id) {
       return;
     }
     $('paymentInfo').textContent = `扫码支付 ¥${(config.amount_cents / 100).toFixed(2)} 后导出成品`;
+    $('couponControls').hidden = false;
     $('createPayment').hidden = false;
     const saved = sessionStorage.getItem('thesisPaymentOrder');
     if (saved) {
@@ -142,14 +144,21 @@ async function createPayment() {
   const id = paymentJob, button = $('createPayment'); button.disabled = true;
   $('paymentInfo').textContent = '正在创建支付宝订单…';
   try {
-    const result = await request(`/api/format/jobs/${encodeURIComponent(id)}/payment`, {method:'POST'});
+    const result = await request(`/api/format/jobs/${encodeURIComponent(id)}/payment`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({coupon_code:$('couponCode').value.trim()}),
+    });
     if (paymentJob !== id) return;
     paymentOrder = result.order_id;
     sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:id,orderId:paymentOrder,qrImage:result.qr_image}));
     button.hidden = true;
     $('paymentQr').src = result.qr_image;
     $('paymentQr').style.display = 'block';
-    $('paymentInfo').textContent = `请使用支付宝扫描二维码支付 ¥${(result.amount_cents / 100).toFixed(2)}。`;
+    const priceText = result.discount_cents
+      ? `原价 ¥${(result.list_price_cents / 100).toFixed(2)}，优惠 -¥${(result.discount_cents / 100).toFixed(2)}，应付 ¥${(result.amount_cents / 100).toFixed(2)}`
+      : `应付 ¥${(result.amount_cents / 100).toFixed(2)}`;
+    $('paymentInfo').textContent = `请使用支付宝扫描二维码支付。${priceText}`;
+    if (result.coupon_code) $('couponInfo').textContent = `已使用优惠码 ${result.coupon_code}`;
     checkPayment(id, paymentOrder);
   } catch (error) { $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
@@ -177,6 +186,20 @@ async function downloadPaid() {
     const link = document.createElement('a'); link.href = objectUrl; link.download = '排版论文.docx'; link.click();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
   } catch (error) { $('paymentInfo').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+async function applyCoupon() {
+  if (!paymentJob || !$('couponCode').value.trim()) {
+    $('couponInfo').textContent = '请先输入优惠码。'; return;
+  }
+  const button = $('applyCoupon'); button.disabled = true;
+  try {
+    const quote = await request(`/api/format/jobs/${encodeURIComponent(paymentJob)}/coupon`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code:$('couponCode').value.trim()}),
+    });
+    $('couponInfo').textContent = `${quote.coupon_code} 已应用：优惠 ¥${(quote.discount_cents / 100).toFixed(2)}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。`;
+  } catch (error) { $('couponInfo').textContent = error.message; }
   finally { button.disabled = false; }
 }
 async function poll() {
@@ -238,6 +261,8 @@ $('drop').addEventListener('drop', e => { if (e.dataTransfer.files[0]) selectFil
 $('go').onclick = submit;
 $('createPayment').onclick = createPayment;
 $('paidDownload').onclick = downloadPaid;
+$('applyCoupon').onclick = applyCoupon;
+$('couponCode').addEventListener('input', () => { $('couponInfo').textContent = ''; });
 $('resume').onclick = () => { $('resume').hidden = true; controls(); poll(); };
 job = sessionStorage.getItem('thesisJob');
 if (job) {
@@ -532,3 +557,4 @@ for (const link of document.querySelectorAll('.flow-step')) link.addEventListene
 });
 twSetMode('reduce_ai');
 showWorkspace('format');
+

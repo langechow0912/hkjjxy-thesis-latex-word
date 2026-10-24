@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>良品论文 - 扫码支付</title>
+<style>
+:root{font-family:system-ui,"Microsoft YaHei",sans-serif;color:#282333;background:#f5f2f8}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:32px}
+.shell{width:min(920px,100%);background:#fff;border:1px solid #e6e0ed;box-shadow:0 18px 50px #35204d16;border-radius:16px;overflow:hidden}
+header{padding:22px 34px;border-bottom:1px solid #eee9f2;display:flex;justify-content:space-between;align-items:center}
+.brand{font-weight:800;font-size:22px;color:#7656a4}.secure{font-size:13px;color:#777080}
+.body{display:grid;grid-template-columns:1fr 1.05fr;gap:42px;padding:42px 52px 48px}.eyebrow{font-size:13px;color:#7656a4;font-weight:700;letter-spacing:.08em}.title{font-size:31px;margin:10px 0 12px}.desc{color:#686171;line-height:1.8;margin:0 0 30px}.summary{border-top:1px solid #eee9f2;padding-top:18px}.row{display:flex;justify-content:space-between;padding:9px 0;color:#625d69}.total{font-size:23px;font-weight:800;color:#2c2436}.pay{border:1px solid #e4ddec;border-radius:12px;padding:25px;text-align:center;background:#fcfbfd}.pay h2{font-size:19px;margin:0 0 4px}.pay p{font-size:13px;color:#777080;margin:0 0 16px}.qr{width:205px;height:205px;margin:0 auto 18px;padding:12px;background:#fff;border:1px solid #e2dce8;display:grid;grid-template-columns:repeat(15,1fr);gap:3px}.qr i{background:#2f2736}.qr i:nth-child(3n+1){background:#7656a4}.note{font-size:12px;color:#817989;line-height:1.7}.foot{padding:14px 34px;border-top:1px solid #eee9f2;font-size:12px;color:#88818f;text-align:center}@media(max-width:700px){.body{grid-template-columns:1fr;padding:30px 24px;gap:26px}.title{font-size:26px}header{padding:18px 22px}}
+</style>
+</head>
+<body><main class="shell"><header><div class="brand">良品论文</div><div class="secure">安全支付 · HTTPS 加密</div></header><section class="body"><div><div class="eyebrow">论文排版服务</div><h1 class="title">Word 排版文件导出</h1><p class="desc">完成排版后下载可编辑 Word 文件。PDF 预览免费，Word 导出需完成一次性支付。</p><div class="summary"><div class="row"><span>服务内容</span><strong>论文排版 Word 导出</strong></div><div class="row"><span>订单编号</span><span>LP202610220001</span></div><div class="row"><span>应付金额</span><span class="total">¥29.99</span></div></div></div><div class="pay"><h2>支付宝扫码支付</h2><p>请使用支付宝扫一扫完成支付</p><div class="qr" id="qr"></div><div class="note">支付成功后，页面将自动解锁 Word 下载<br>订单仅用于本次论文排版导出</div></div></section><div class="foot">良品论文 · 论文排版服务　|　客服：support@lunwenpaiban.dpdns.org</div></main><script>const q=document.querySelector('#qr');for(let i=0;i<225;i++){const e=document.createElement('i');e.style.opacity=((i*17+7)%11)/10;q.appendChild(e)}</script></body></html>

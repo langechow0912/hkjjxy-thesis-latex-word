@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>分销管理 · 良品论文</title>
+  <style>
+    :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#24212a;background:#f7f6f8;--line:#e6e2e9;--muted:#776f7e;--accent:#7656a4;--green:#28745a;--red:#a74343}
+    *{box-sizing:border-box}body{margin:0}header{background:#fff;border-bottom:1px solid var(--line)}.bar,main{width:min(1200px,calc(100% - 40px));margin:auto}.bar{min-height:64px;display:flex;align-items:center;justify-content:space-between;gap:18px}.brand{font-size:17px;font-weight:700}.bar a{color:var(--accent);text-decoration:none;font-size:13px}main{padding:28px 0 50px}h1{font-size:25px;margin:0}h2{font-size:16px;margin:0}p{color:var(--muted);font-size:13px}.intro{margin:6px 0 24px}.section{background:#fff;border:1px solid var(--line);border-radius:7px;margin:16px 0;padding:20px;overflow:hidden}.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.form{display:grid;grid-template-columns:1.2fr 1.2fr 1fr 1fr auto;gap:12px;align-items:end}.field label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}.field input{height:40px;width:100%;border:1px solid var(--line);border-radius:5px;padding:8px 10px;background:#fff}.btn{min-height:38px;border:1px solid var(--line);border-radius:5px;background:#fff;padding:8px 12px;cursor:pointer;font:inherit;font-size:12px}.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.btn:hover{border-color:var(--accent)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line)}th{font-size:11px;color:var(--muted);font-weight:600}td a{color:var(--accent)}td input{width:74px;height:32px;border:1px solid var(--line);border-radius:4px;padding:4px 6px}td input[aria-label="活动名称"]{width:140px;margin-top:7px}.badge{display:inline-block;padding:3px 7px;border-radius:4px;background:#f1edf5;color:var(--accent);font-size:11px}.badge.pending{background:#fff3dc;color:#8a5a00}.badge.paid{background:#e7f3ee;color:var(--green)}.badge.reversed{background:#faeaea;color:var(--red)}.empty{padding:18px 10px;color:var(--muted);font-size:13px}.message{min-height:18px;color:var(--muted);font-size:12px}.message.error{color:var(--red)}.filters{display:flex;gap:5px}.filters button[aria-pressed=true]{background:#eee9f4;color:var(--accent);border-color:#d8cbe5}.auth-panel{max-width:480px;margin:34px auto;background:#fff;border:1px solid var(--line);border-radius:7px;padding:24px}.auth-panel input{height:42px;width:100%;border:1px solid var(--line);border-radius:5px;padding:8px 10px}.auth-actions{display:flex;gap:8px;margin-top:12px}.token-output{padding:12px;background:#f5f2f8;overflow-wrap:anywhere}.admin-content[hidden],.auth-panel[hidden]{display:none!important}@media(max-width:760px){.bar,main{width:calc(100% - 28px)}.section{padding:15px}.form{grid-template-columns:1fr 1fr}.form .btn{grid-column:1/-1}.head{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header><div class="bar"><span class="brand">良品论文 · 分销管理</span><a href="/affiliate">推广员入口</a><a href="/">返回排版网站</a></div></header>
+  <main>
+    <section class="auth-panel" id="adminAuth" hidden>
+      <h1>营销后台登录</h1>
+      <p id="authIntro">请输入管理员访问令牌。</p>
+      <form id="adminLoginForm"><div class="field"><label for="adminToken">访问令牌</label><input id="adminToken" type="password" autocomplete="current-password"></div><button class="btn primary" type="submit">登录后台</button></form>
+      <form id="adminRegisterForm" hidden><div class="field"><label for="adminName">管理员名称</label><input id="adminName" maxlength="80" value="管理员" required></div><button class="btn primary" type="submit">注册管理员并生成令牌</button></form>
+      <p class="message" id="authMessage" role="status"></p>
+      <div id="newToken" hidden><p>管理员令牌只显示这一次，请妥善保存。</p><p class="token-output" id="newTokenValue"></p><button class="btn" id="continueAdmin" type="button">进入后台</button></div>
+    </section>
+    <div class="admin-content" id="adminContent" hidden>
+    <h1>推广员与佣金</h1>
+    <p class="intro">推广归因有效期 30 天；佣金在支付宝确认付款后生成。结算由管理员线下完成并记录流水号。</p>
+    <section class="section">
+      <div class="head"><h2>新增推广员</h2></div>
+      <form class="form" id="affiliateForm">
+        <div class="field"><label for="name">姓名 / 名称</label><input id="name" maxlength="100" required></div>
+        <div class="field"><label for="email">联系邮箱</label><input id="email" type="email" maxlength="254"></div>
+        <div class="field"><label for="code">自定义推广码（可留空）</label><input id="code" maxlength="32" placeholder="自动生成"></div>
+        <div class="field"><label for="rate">佣金比例 (%)</label><input id="rate" type="number" min="0" max="100" step="0.01" value="10" required></div>
+        <button class="btn primary" type="submit">创建推广员</button>
+      </form>
+      <p class="message" id="affiliateMessage" role="status"></p>
+    </section>
+    <section class="section">
+      <div class="head"><h2>推广员</h2><button class="btn" id="refreshAffiliates" type="button">刷新</button></div>
+      <div class="table-wrap"><table><thead><tr><th>推广员</th><th>推广链接 / 活动</th><th>佣金</th><th>点击</th><th>佣金记录</th><th>累计佣金</th><th>状态</th><th></th></tr></thead><tbody id="affiliateRows"></tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="head"><h2>优惠券</h2></div>
+      <form class="form" id="couponForm">
+        <div class="field"><label for="couponAdminCode">兑换码</label><input id="couponAdminCode" maxlength="32" required></div>
+        <div class="field"><label for="couponKind">优惠方式</label><select id="couponKind"><option value="percent">折扣比例</option><option value="fixed">减免金额（元）</option></select></div>
+        <div class="field"><label for="couponValue">折扣百分比 / 减免金额</label><input id="couponValue" type="number" min="0.01" step="0.01" required></div>
+        <div class="field"><label for="couponSchool">适用范围</label><input id="couponSchool" list="schoolKeys" maxlength="200" placeholder="留空=全平台；云端填写 dayipaper:规则ID"><datalist id="schoolKeys"></datalist></div>
+        <div class="field"><label for="couponMaxUses">总使用次数上限</label><input id="couponMaxUses" type="number" min="1" step="1" placeholder="不限"></div>
+        <button class="btn primary" type="submit">创建优惠券</button>
+      </form>
+      <p class="hint">学校范围键：本地规范使用 `school:院校ID`，云端规范使用 `dayipaper:规则ID`；留空适用于所有学校。</p>
+      <p class="message" id="couponMessage" role="status"></p>
+      <div class="table-wrap"><table><thead><tr><th>兑换码</th><th>优惠</th><th>适用范围</th><th>使用 / 上限</th><th>状态</th><th></th></tr></thead><tbody id="couponRows"></tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="head"><h2>佣金审核与结算</h2><div class="filters" id="commissionFilters"><button class="btn" data-status="" aria-pressed="true">全部</button><button class="btn" data-status="pending" aria-pressed="false">待审核</button><button class="btn" data-status="approved" aria-pressed="false">已审核</button><button class="btn" data-status="paid" aria-pressed="false">已结算</button><button class="btn" data-status="reversed" aria-pressed="false">已撤销</button></div></div>
+      <div class="table-wrap"><table><thead><tr><th>订单号</th><th>推广员</th><th>活动</th><th>订单金额</th><th>比例</th><th>佣金</th><th>状态</th><th>结算凭证</th><th></th></tr></thead><tbody id="commissionRows"></tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="head"><h2>提现申请与手动转账</h2><button class="btn" id="refreshWithdrawals" type="button">刷新</button></div>
+      <div class="table-wrap"><table><thead><tr><th>推广员</th><th>金额</th><th>收款信息</th><th>申请时间</th><th>状态</th><th>转账流水</th><th>凭证</th><th>处理</th></tr></thead><tbody id="withdrawalRows"></tbody></table></div>
+    </section>
+    </div>
+  </main>
+  <script src="/affiliates.js" defer></script>
+</body>
+</html>

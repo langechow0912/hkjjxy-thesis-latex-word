@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>推广员中心 · 良品论文</title>
+  <style>
+    :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#24212a;background:#f7f6f8;--line:#e6e2e9;--muted:#776f7e;--accent:#7656a4;--green:#28745a}
+    *{box-sizing:border-box}body{margin:0}header{background:#fff;border-bottom:1px solid var(--line)}.bar,main{width:min(920px,calc(100% - 32px));margin:auto}.bar{height:62px;display:flex;align-items:center;justify-content:space-between}.brand{font-size:16px;font-weight:700}a{color:var(--accent);text-decoration:none;font-size:13px}main{padding:32px 0 55px}h1{font-size:24px;margin:0}h2{font-size:16px;margin:0}.muted{color:var(--muted);font-size:13px}.panel{background:#fff;border:1px solid var(--line);border-radius:7px;padding:20px;margin-top:18px}.login{max-width:460px}.field label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}.field input,.field textarea{width:100%;min-height:42px;padding:9px 11px;border:1px solid var(--line);border-radius:5px;font:inherit}.field textarea{min-height:84px;resize:vertical}.field{margin:13px 0}.btn{border:1px solid var(--line);border-radius:5px;background:#fff;padding:10px 14px;min-height:40px;font:inherit;font-size:13px;cursor:pointer}.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn:disabled{opacity:.5}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.stat{border:1px solid var(--line);padding:15px}.stat span{display:block;color:var(--muted);font-size:12px}.stat strong{display:block;margin-top:7px;font-size:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.table-wrap{overflow:auto;margin-top:14px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line)}th{font-size:11px;color:var(--muted)}.message{min-height:18px;color:var(--muted);font-size:12px}.message.error{color:#a74343}[hidden]{display:none!important}@media(max-width:560px){.panel{padding:15px}.stats{grid-template-columns:1fr}.stat{display:flex;align-items:center;justify-content:space-between}.stat strong{margin:0}.section-head{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header><div class="bar"><span class="brand">良品论文 · 推广员中心</span><a href="/">返回网站</a></div></header>
+  <main>
+    <h1>佣金与提现</h1>
+    <p class="muted" id="affiliateName"></p>
+    <section class="panel login" id="loginPanel">
+      <h2>推广员登录</h2>
+      <form id="loginForm">
+        <div class="field"><label for="portalToken">访问令牌</label><input id="portalToken" type="password" autocomplete="current-password" required></div>
+        <button class="btn primary" type="submit">登录</button>
+      </form>
+      <p class="message" id="loginMessage" role="status"></p>
+    </section>
+    <div id="dashboard" hidden>
+      <section class="stats panel">
+        <div class="stat"><span>待审核佣金</span><strong id="pendingTotal">¥0.00</strong></div>
+        <div class="stat"><span>可申请提现</span><strong id="availableTotal">¥0.00</strong></div>
+        <div class="stat"><span>已结算佣金</span><strong id="paidTotal">¥0.00</strong></div>
+      </section>
+      <section class="panel">
+        <div class="section-head"><h2>申请提现</h2></div>
+        <p class="muted">申请将锁定当前全部已审核可提现佣金。管理员审核后手动转账，并登记转账凭证。</p>
+        <form id="withdrawForm">
+          <div class="field"><label for="payoutInfo">收款方式与账号</label><textarea id="payoutInfo" maxlength="300" placeholder="例如：支付宝账号 / 银行卡开户名、账号及开户行" required></textarea></div>
+          <button class="btn primary" id="withdrawButton" type="submit">申请提现</button>
+        </form>
+        <p class="message" id="withdrawMessage" role="status"></p>
+      </section>
+      <section class="panel">
+        <div class="section-head"><h2>提现记录</h2><button class="btn" id="logoutButton" type="button">退出</button></div>
+        <div class="table-wrap"><table><thead><tr><th>申请时间</th><th>金额</th><th>状态</th><th>转账流水</th></tr></thead><tbody id="withdrawalRows"></tbody></table></div>
+      </section>
+    </div>
+  </main>
+  <script src="/affiliate.js" defer></script>
+</body>
+</html>

@@ -126,22 +126,21 @@ nano .env
 ```dotenv
 DOMAIN=lunwenpaiban.dpdns.org
 THESIS_ALLOWED_HOSTS=lunwenpaiban.dpdns.org
-THESIS_AUTH_USER=admin
+THESIS_AUTH_USER=
 THESIS_MAX_JOBS=1
 ALIPAY_ENABLED=false
 ```
 
-保存 nano：按 `Ctrl+O`、Enter，再按 `Ctrl+X`。网页会提示 Basic Auth；用户名是 `admin`，密码从下一条命令生成。`.env` 不提交 GitHub。
+保存 nano：按 `Ctrl+O`、Enter，再按 `Ctrl+X`。默认不启用网页口令，任何人都可以访问。`.env` 不提交 GitHub。
 
 ```bash
 sudo install -d -o 10001 -g 10001 -m 700 deploy/secrets
-openssl rand -base64 32 | sudo tee deploy/secrets/thesis_auth_pass
-sudo chown 10001:10001 deploy/secrets/thesis_auth_pass
-sudo chmod 600 deploy/secrets/thesis_auth_pass
 chmod 600 .env
 ```
 
-命令会显示一次随机密码，同时保存进文件；把它存到自己的密码管理器。Compose 要求这个密码文件存在，缺少时应用不会启动。
+如果之后需要重新启用访问口令，再生成 `deploy/secrets/thesis_auth_pass`，并在 `.env` 设置 `THESIS_AUTH_USER=admin`、`THESIS_AUTH_PASS_FILE=/run/secrets/thesis_auth_pass`、`THESIS_REQUIRE_AUTH=true`。不要把密码提交到 GitHub。
+
+分销管理后台使用独立认证，不需要给公众网站整体加 Basic Auth。未配置 `AFFILIATE_ADMIN_USER` / `AFFILIATE_ADMIN_PASS_FILE` 时，首次管理员注册仅允许从服务器本机访问 `/admin/affiliates`；系统生成一次性访问令牌，数据库只保存哈希。令牌丢失后需由服务器维护者按部署流程处理，不开放公网自助重置。已配置 Basic Auth 的部署继续使用 `AFFILIATE_ADMIN_USER=admin`、`AFFILIATE_ADMIN_PASS_FILE=/run/secrets/affiliate_admin_pass`。不要把任何令牌或口令提交到 GitHub。后台可创建全平台优惠券，或按 `school:<院校ID>` / `dayipaper:<规则ID>` 限定学校；支付下单时会在服务端校验并冻结优惠金额。推广员入口为 `/affiliate`，新增推广员时显示一次性访问令牌；推广员可申请提现，管理员审核后手动转账，登记流水号并上传 PNG/JPG/PDF 凭证。凭证保存在持久化 `/data` 卷中。
 
 其他院校云端排版需要的 Dayipaper PAT 放入 `deploy/secrets/dayipaper_pat`；Tabword 服务需要独立 API Key，放入 `deploy/secrets/tabword_api_key`。海口经济学院本地模板不依赖这两个服务。本地密钥通过 PowerShell `scp` 单独传输，不进 GitHub。以下以 Ubuntu 为例，Amazon Linux 把 `ubuntu` 和 `/home/ubuntu` 分别改为 `ec2-user` 和 `/home/ec2-user`：
 
@@ -183,7 +182,7 @@ sudo docker compose logs --tail=100 app caddy
 curl -fsS https://lunwenpaiban.dpdns.org/api/health
 ```
 
-首次 build 会下载 Python 依赖、LibreOffice、XeLaTeX 和中文字体，可能需要一段时间。等待 `app` 状态显示 `healthy`、`caddy` 显示运行中，再用浏览器打开 [https://lunwenpaiban.dpdns.org](https://lunwenpaiban.dpdns.org)。浏览器会要求 Basic Auth，输入 `.env` 中的用户名和刚生成的密码。Caddy 会自动申请 HTTPS 证书；若失败，检查 Cloudflare A 记录是否指向弹性 IP，以及安全组是否允许 TCP 80/443。
+首次 build 会下载 Python 依赖、LibreOffice、XeLaTeX 和中文字体，可能需要一段时间。等待 `app` 状态显示 `healthy`、`caddy` 显示运行中，再用浏览器打开 [https://lunwenpaiban.dpdns.org](https://lunwenpaiban.dpdns.org)。默认公开访问，不会要求 Basic Auth。Caddy 会自动申请 HTTPS 证书；若无法连接，检查 Cloudflare A 记录是否指向弹性 IP，以及安全组是否允许 TCP 80/443。
 
 PDF 预览仍免费。Word 下载在支付宝配置完整并收到匹配的支付通知前会被拒绝。确认当面付权限、商户号及密钥等条件后，才在 EC2 的 `.env` 设置：
 

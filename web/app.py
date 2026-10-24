@@ -29,10 +29,12 @@
 """
 import argparse
 import base64
+import ipaddress
 import os
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -43,7 +45,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import alipay, build as corebuild   # noqa: E402
+from core import affiliates, alipay, build as corebuild   # noqa: E402
 from core import dayipaper, schoolformat      # noqa: E402
 from core.localconfig import load_pat
 load_pat(ROOT)
@@ -94,6 +96,9 @@ def _secret_value(name):
 
 AUTH_PASS = _secret_value("THESIS_AUTH_PASS")
 AUTH_ON = bool(AUTH_USER and AUTH_PASS)
+AFFILIATE_ADMIN_USER = os.environ.get("AFFILIATE_ADMIN_USER", "").strip()
+AFFILIATE_ADMIN_PASS = _secret_value("AFFILIATE_ADMIN_PASS")
+AFFILIATE_ADMIN_ON = bool(AFFILIATE_ADMIN_USER and AFFILIATE_ADMIN_PASS)
 AUTH_REQUIRED = os.environ.get("THESIS_REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
 if AUTH_REQUIRED and not AUTH_ON:
     raise RuntimeError("THESIS_REQUIRE_AUTH is enabled but the Basic Auth credentials are unavailable")
@@ -126,7 +131,8 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         )
 
     async def dispatch(self, request, call_next):
-        if not AUTH_ON or request.url.path in ("/api/health", "/api/alipay/notify"):
+        if (not AUTH_ON or request.url.path in ("/api/health", "/api/alipay/notify")
+                or AffiliateAdminAuthMiddleware._is_admin_path(request.url.path)):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         ok = False
@@ -143,7 +149,45 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class AffiliateAdminAuthMiddleware(BaseHTTPMiddleware):
+    @staticmethod
+    def _is_public_auth_path(path):
+        return path in ("/api/admin/auth/status", "/api/admin/auth/register", "/api/admin/auth/verify")
+
+    @staticmethod
+    def _is_admin_path(path):
+        return (path in ("/admin/affiliates", "/affiliates.js")
+                or path.startswith("/api/admin/"))
+
+    async def dispatch(self, request, call_next):
+        if not self._is_admin_path(request.url.path):
+            return await call_next(request)
+        if self._is_public_auth_path(request.url.path):
+            return await call_next(request)
+        if request.url.path in ("/admin/affiliates", "/affiliates.js") and not AFFILIATE_ADMIN_ON:
+            return await call_next(request)
+        header = request.headers.get("authorization", "")
+        ok = False
+        if AFFILIATE_ADMIN_ON and header[:6].lower() == "basic ":
+            try:
+                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
+                user, _, pwd = raw.partition(":")
+                ok = (secrets.compare_digest(user, AFFILIATE_ADMIN_USER)
+                      and secrets.compare_digest(pwd, AFFILIATE_ADMIN_PASS))
+            except Exception:
+                ok = False
+        elif header[:7].lower() == "bearer " and not AFFILIATE_ADMIN_ON:
+            ok = affiliates.authenticate_admin_token(header[7:].strip())
+        if not ok:
+            headers = ({"WWW-Authenticate": 'Basic realm="affiliate-admin", charset="UTF-8"'}
+                       if AFFILIATE_ADMIN_ON else {})
+            return Response(content="需要管理员登录", status_code=401,
+                            media_type="text/plain; charset=utf-8", headers=headers)
+        return await call_next(request)
+
+
 app.add_middleware(BasicAuthMiddleware)
+app.add_middleware(AffiliateAdminAuthMiddleware)
 
 
 @app.get("/api/health")
@@ -209,6 +253,51 @@ class BuildReq(BaseModel):
     docx: bool = True
 
 
+class AffiliateCreateReq(BaseModel):
+    name: str
+    email: str = ""
+    code: str | None = None
+    commission_rate: float = 10.0
+
+
+class AffiliateUpdateReq(BaseModel):
+    active: bool | None = None
+    commission_rate: float | None = None
+
+
+class CommissionUpdateReq(BaseModel):
+    status: str
+    payout_ref: str = ""
+
+
+class PaymentCreateReq(BaseModel):
+    coupon_code: str = ""
+
+
+class CouponPreviewReq(BaseModel):
+    code: str
+
+
+class CouponCreateReq(BaseModel):
+    code: str
+    discount_kind: str
+    discount_value: float
+    school_key: str | None = None
+    max_uses: int | None = None
+
+
+class CouponUpdateReq(BaseModel):
+    active: bool
+
+
+class PortalWithdrawalReq(BaseModel):
+    payout_info: str
+
+
+class WithdrawalUpdateReq(BaseModel):
+    status: str
+
+
 def _new_job(kind="build"):
     with _LOCK:
         jid = "j" + secrets.token_hex(16)
@@ -227,6 +316,257 @@ def index():
 @app.get("/app.js")
 def frontend_script():
     return FileResponse(STATIC / "app.js", media_type="application/javascript")
+
+
+def _require_affiliate_admin():
+    # Authentication is enforced by AffiliateAdminAuthMiddleware.
+    return None
+
+
+@app.get("/admin/affiliates", response_class=HTMLResponse)
+def affiliate_admin_page():
+    _require_affiliate_admin()
+    return (STATIC / "affiliates.html").read_text(encoding="utf-8")
+
+
+@app.get("/affiliates.js")
+def affiliate_admin_script():
+    return FileResponse(STATIC / "affiliates.js", media_type="application/javascript")
+
+
+@app.get("/api/admin/auth/status")
+def api_admin_auth_status():
+    return {"mode": "basic" if AFFILIATE_ADMIN_ON else "token",
+            "registered": affiliates.has_admin_token()}
+
+
+@app.post("/api/admin/auth/register")
+def api_admin_auth_register(request: Request, body: dict):
+    if AFFILIATE_ADMIN_ON:
+        raise HTTPException(409, "后台已使用服务器配置的管理员口令")
+    peer = request.client.host if request.client else ""
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")
+    source = forwarded[-1].strip() if forwarded and forwarded[-1].strip() else peer
+    try:
+        local_request = source == "testclient" or ipaddress.ip_address(source).is_loopback
+    except ValueError:
+        local_request = False
+    if not local_request:
+        raise HTTPException(403, "管理员注册仅允许从服务器本机完成")
+    try:
+        token = affiliates.register_admin_token(str(body.get("name", "管理员")))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"access_token": token}
+
+
+@app.post("/api/admin/auth/verify")
+def api_admin_auth_verify(request: Request):
+    authorization = request.headers.get("authorization", "")
+    token = authorization[7:].strip() if authorization[:7].lower() == "bearer " else ""
+    if AFFILIATE_ADMIN_ON:
+        return {"valid": False, "mode": "basic"}
+    return {"valid": affiliates.authenticate_admin_token(token), "mode": "token"}
+
+
+@app.get("/affiliate", response_class=HTMLResponse)
+def affiliate_portal_page():
+    return (STATIC / "affiliate.html").read_text(encoding="utf-8")
+
+
+@app.get("/affiliate.js")
+def affiliate_portal_script():
+    return FileResponse(STATIC / "affiliate.js", media_type="application/javascript")
+
+
+@app.get("/r/{code}")
+def affiliate_referral(code: str, request: Request, campaign: str = Query("", max_length=100)):
+    referral = affiliates.record_click(code, campaign)
+    response = RedirectResponse("/", status_code=302)
+    if referral:
+        secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie("affiliate_ref", referral["code"], max_age=30 * 86400,
+                            httponly=True, secure=secure, samesite="lax", path="/")
+        response.set_cookie("affiliate_campaign", referral["campaign"], max_age=30 * 86400,
+                            httponly=True, secure=secure, samesite="lax", path="/")
+    return response
+
+
+@app.get("/api/admin/affiliates")
+def api_admin_affiliates():
+    _require_affiliate_admin()
+    return {"affiliates": affiliates.list_affiliates()}
+
+
+@app.post("/api/admin/affiliates")
+def api_admin_create_affiliate(body: AffiliateCreateReq):
+    _require_affiliate_admin()
+    try:
+        return affiliates.create_affiliate(body.name, body.email, body.code, body.commission_rate)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "推广码已被使用") from None
+
+
+@app.patch("/api/admin/affiliates/{affiliate_id}")
+def api_admin_update_affiliate(affiliate_id: int, body: AffiliateUpdateReq):
+    _require_affiliate_admin()
+    try:
+        affiliate = affiliates.update_affiliate(affiliate_id, active=body.active,
+                                                commission_rate=body.commission_rate)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if not affiliate:
+        raise HTTPException(404, "推广员不存在")
+    return affiliate
+
+
+@app.post("/api/admin/affiliates/{affiliate_id}/portal-token")
+def api_admin_rotate_portal_token(affiliate_id: int):
+    _require_affiliate_admin()
+    token = affiliates.rotate_portal_token(affiliate_id)
+    if not token:
+        raise HTTPException(404, "推广员不存在或已停用")
+    return {"portal_token": token}
+
+
+@app.get("/api/admin/commissions")
+def api_admin_commissions(status: str | None = Query(None)):
+    _require_affiliate_admin()
+    try:
+        return {"commissions": affiliates.list_commissions(status)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.patch("/api/admin/commissions/{commission_id}")
+def api_admin_update_commission(commission_id: int, body: CommissionUpdateReq):
+    _require_affiliate_admin()
+    try:
+        commission = affiliates.update_commission(commission_id, body.status, body.payout_ref)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if not commission:
+        raise HTTPException(404, "佣金记录不存在")
+    return commission
+
+
+@app.get("/api/admin/coupons")
+def api_admin_coupons():
+    _require_affiliate_admin()
+    return {"coupons": affiliates.list_coupons()}
+
+
+@app.post("/api/admin/coupons")
+def api_admin_create_coupon(body: CouponCreateReq):
+    _require_affiliate_admin()
+    try:
+        return affiliates.create_coupon(body.code, body.discount_kind, body.discount_value,
+                                        body.school_key, body.max_uses)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "优惠码已存在") from None
+
+
+@app.patch("/api/admin/coupons/{coupon_id}")
+def api_admin_update_coupon(coupon_id: int, body: CouponUpdateReq):
+    _require_affiliate_admin()
+    coupon = affiliates.update_coupon(coupon_id, body.active)
+    if not coupon:
+        raise HTTPException(404, "优惠券不存在")
+    return coupon
+
+
+def _affiliate_from_request(request: Request):
+    authorization = request.headers.get("authorization", "")
+    if authorization[:7].lower() != "bearer ":
+        raise HTTPException(401, "请使用推广员访问令牌登录")
+    affiliate = affiliates.authenticate_portal(authorization[7:].strip())
+    if not affiliate:
+        raise HTTPException(401, "推广员令牌无效或账号已停用")
+    return affiliate
+
+
+@app.get("/api/affiliate/me")
+def api_affiliate_me(request: Request):
+    affiliate = _affiliate_from_request(request)
+    return {"affiliate": affiliate, **affiliates.affiliate_summary(affiliate["id"])}
+
+
+@app.post("/api/affiliate/withdrawals")
+def api_affiliate_request_withdrawal(body: PortalWithdrawalReq, request: Request):
+    affiliate = _affiliate_from_request(request)
+    try:
+        return affiliates.request_withdrawal(affiliate["id"], body.payout_info)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.get("/api/admin/withdrawals")
+def api_admin_withdrawals(status: str | None = Query(None)):
+    _require_affiliate_admin()
+    try:
+        return {"withdrawals": affiliates.list_withdrawals(status)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.patch("/api/admin/withdrawals/{withdrawal_id}")
+def api_admin_update_withdrawal(withdrawal_id: int, body: WithdrawalUpdateReq):
+    _require_affiliate_admin()
+    try:
+        withdrawal = affiliates.update_withdrawal(withdrawal_id, body.status)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if not withdrawal:
+        raise HTTPException(404, "提现申请不存在")
+    return withdrawal
+
+
+@app.post("/api/admin/withdrawals/{withdrawal_id}/paid")
+async def api_admin_finish_withdrawal(withdrawal_id: int, payout_ref: str = Form(...),
+                                      proof: UploadFile = File(...)):
+    _require_affiliate_admin()
+    suffix = Path(proof.filename or "").suffix.lower()
+    if suffix not in (".png", ".jpg", ".jpeg", ".pdf"):
+        raise HTTPException(400, "凭证仅支持 PNG、JPG 或 PDF")
+    content = await proof.read(5 * 1024 * 1024 + 1)
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(413, "凭证文件不能超过 5 MB")
+    valid = ((suffix == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n"))
+             or (suffix in (".jpg", ".jpeg") and content.startswith(b"\xff\xd8\xff"))
+             or (suffix == ".pdf" and content.startswith(b"%PDF-")))
+    if not valid:
+        raise HTTPException(400, "凭证内容与文件类型不匹配")
+    proof_dir = Path(os.environ.get("AFFILIATE_PROOF_DIR", str(ROOT / ".secrets" / "affiliate-proofs")))
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    proof_path = proof_dir / (secrets.token_hex(16) + suffix)
+    proof_path.write_bytes(content)
+    try:
+        withdrawal = affiliates.finish_withdrawal(withdrawal_id, payout_ref, str(proof_path))
+    except ValueError as exc:
+        proof_path.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from None
+    if not withdrawal:
+        proof_path.unlink(missing_ok=True)
+        raise HTTPException(404, "提现申请不存在")
+    return withdrawal
+
+
+@app.get("/api/admin/withdrawals/{withdrawal_id}/proof")
+def api_admin_withdrawal_proof(withdrawal_id: int):
+    _require_affiliate_admin()
+    withdrawals = affiliates.list_withdrawals()
+    withdrawal = next((row for row in withdrawals if row["id"] == withdrawal_id), None)
+    if not withdrawal or not withdrawal["proof_path"]:
+        raise HTTPException(404, "凭证不存在")
+    path = Path(withdrawal["proof_path"]).resolve()
+    proof_dir = Path(os.environ.get("AFFILIATE_PROOF_DIR", str(ROOT / ".secrets" / "affiliate-proofs"))).resolve()
+    if proof_dir not in path.parents or not path.is_file():
+        raise HTTPException(404, "凭证不存在")
+    return FileResponse(path, filename="withdrawal-proof" + path.suffix)
 
 
 @app.get("/api/schools")
@@ -379,17 +719,39 @@ def api_alipay_info():
     return alipay.public_status()
 
 
+@app.post("/api/format/jobs/{job_id}/coupon")
+def api_preview_coupon(job_id: str, body: CouponPreviewReq):
+    job = _format_job(job_id)
+    if job.get("state") != "done":
+        raise HTTPException(409, "排版任务尚未完成")
+    price = alipay.public_status()["amount_cents"]
+    try:
+        quote = affiliates.preview_coupon(body.code, job.get("school_key", ""), price)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return {"list_price_cents": price, **quote}
+
+
 @app.post("/api/format/jobs/{job_id}/payment")
-def api_create_payment(job_id: str):
+def api_create_payment(job_id: str, request: Request, body: PaymentCreateReq | None = None):
     job = _format_job(job_id)
     if job.get("state") != "done" or (job.get("kind") == "cloud" and not job.get("taskId")):
         raise HTTPException(409, "排版任务尚未完成")
     try:
-        order = alipay.create_order(job_id, job.get("name") or "论文")
+        order = alipay.create_order(job_id, job.get("name") or "论文",
+                                    request.cookies.get("affiliate_ref"),
+                                    request.cookies.get("affiliate_campaign", ""),
+                                    body.coupon_code if body else "",
+                                    job.get("school_key", ""))
     except alipay.AlipayError as exc:
         raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     return {"order_id": order["out_trade_no"], "status": order["status"],
             "amount_cents": order["amount_cents"],
+            "list_price_cents": order.get("list_price_cents") or order["amount_cents"],
+            "discount_cents": order.get("discount_cents", 0),
+            "coupon_code": order.get("coupon_code"),
             "qr_image": f"/api/format/jobs/{job_id}/payment/{order['out_trade_no']}/qr.png"}
 
 
@@ -496,17 +858,23 @@ async def api_dp_format(file: UploadFile = File(...),
         except (Exception, SystemExit):
             raise HTTPException(503, '学校排版模板或工具尚未配置完成')
         job = _new_job(kind='school')
-        job.update(name=meta['title'], stage='准备稿件', suggestions=[])
+        job.update(name=meta['title'], stage='准备稿件', suggestions=[],
+                   school_key='school:' + local_school)
         threading.Thread(target=schoolformat.run, args=(job, data, cfg, meta), daemon=True).start()
         return {'job': job['id'], 'title': meta['title']}
 
+    school_key = meta['ruleId']
     if meta['ruleId'].startswith('dayipaper:'):
         meta['ruleId'] = meta['ruleId'].split(':', 1)[1]
+        school_key = 'dayipaper:' + meta['ruleId']
     elif ':' in meta['ruleId']:
         raise HTTPException(400, '未注册的排版服务')
+    else:
+        school_key = 'dayipaper:' + meta['ruleId']
 
     job = _new_job(kind="cloud")
-    job.update({"name": meta["title"], "stage": "上传源文档", "status": None,
+    job.update({"name": meta["title"], "school_key": school_key,
+                "stage": "上传源文档", "status": None,
                 "statusLabel": "", "taskId": None, "suggestions": [],
                 "preview": None, "exported": False})
     threading.Thread(target=_run_cloud,
@@ -688,3 +1056,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+

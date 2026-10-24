@@ -3,8 +3,9 @@
 This directory is bind-mounted read-only into the app container. Place only the
 credentials you intend the server to use here:
 
-- `thesis_auth_pass` — generated HTTP Basic Auth password (required; deployment
-  refuses to start without it)
+- `thesis_auth_pass` — optional HTTP Basic Auth password. Authentication is
+  disabled by default; set `THESIS_REQUIRE_AUTH=true`, a username, and the
+  `THESIS_AUTH_PASS_FILE` path in `.env` to enable it.
 - `dayipaper_pat` — optional Dayipaper PAT, raw token or `PAT=...`
 - `tabword_api_key` — optional separate Tabword API key
 - `alipay_app_private_key.pem` — optional Alipay app private key
