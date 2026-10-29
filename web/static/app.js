@@ -380,7 +380,7 @@ function twChange() {
   $('twDetectionWrap').hidden = !detect;
   $('twDetectionMeta').hidden = !detect || !file;
   $('twFormatWrap').hidden = true;
-  $('twFile').accept = detect ? '.doc,.docx,.txt' : '.doc,.docx';
+  $('twFile').accept = detect ? '.doc,.docx,.txt' : '.docx';
   $('twPlatform').value = twPlatform;
   document.querySelector('.tw-platform-group .tw-option-label').textContent = '检测平台';
   document.querySelector('.tw-platform-group').hidden = !detect;
@@ -389,7 +389,7 @@ function twChange() {
     const active = button.dataset.twInput === twInput;
     button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active));
   }
-  $('twPrepare').innerHTML = `${twMode === 'detect' ? '开始检测' : '开始改写'} <span aria-hidden="true">↗</span>`;
+  $('twPrepare').innerHTML = '计价并创建付款订单 <span aria-hidden="true">↗</span>';
   $('twSubmit').hidden = true;
   $('twEstimate').hidden = true;
   $('twTaskWrap').hidden = !$('twTask').value;
@@ -447,10 +447,15 @@ function twRender(data, eventName = '') {
   }
   if (!payload.paraphrased_text && !(eventName === 'progress' && payload.original)) $('twCompare').disabled = true;
 }
-async function twRequest(operation, values, submit, includeFile = true) {
+async function twRequest(operation, values, submit, includeFile = true, paidOrder = '', savedFile = undefined) {
   const body = new FormData(); body.append('params', JSON.stringify(values)); body.append('submit', String(submit));
-  if (includeFile && !$('twFileWrap').hidden && $('twFile').files[0]) body.append('file', $('twFile').files[0]);
+  if (paidOrder) body.append('payment_order', paidOrder);
+  const file = savedFile === undefined ? (!$('twFileWrap').hidden ? $('twFile').files[0] : null) : savedFile;
+  if (includeFile && file) body.append('file', file);
   const response = await fetch('/api/tabword/' + operation, {method:'POST', body});
+  await twConsume(response);
+}
+async function twConsume(response) {
   if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.detail || '请求失败；请勿重复提交。'); }
   if (!(response.headers.get('content-type') || '').includes('text/event-stream')) { twRender(await response.json()); return; }
   const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '';
@@ -470,18 +475,82 @@ async function twRequest(operation, values, submit, includeFile = true) {
   } finally { await reader.cancel().catch(() => {}); }
 }
 async function twAction(submit, polling = false) {
+  if (submit && !polling) {
+    await twBuy();
+    return;
+  }
   if (twBusy) return; twBusy = true;
   for (const id of ['twPrepare','twSubmit','twPoll','twEstimate']) $(id).disabled = true;
   $('twMessage').textContent = polling ? '正在查询任务…' : '正在请求服务，请勿重复提交…';
   if (!polling) twSetOutputEmpty();
   try {
     const service = $('twService').value;
-    const operation = polling ? (service === 'document_async' ? 'document_task' : 'paraphrase_task') : service;
+    const operation = polling ? (twPending?.operation === 'document_async' ? 'document_task' : 'paraphrase_task') : service;
     const values = polling ? {task_id:$('twTask').value} : twPayload();
-    await twRequest(operation, values, submit, !polling);
+    await twRequest(operation, values, submit, !polling, twPending?.order_id || '');
   } catch (error) { $('twMessage').textContent = error.message; }
   finally { twBusy = false; for (const id of ['twPrepare','twSubmit','twPoll','twEstimate']) $(id).disabled = false; }
 }
+let twPending = null, twPurchase = null;
+try { twPending = JSON.parse(sessionStorage.getItem('twPayment') || 'null'); } catch {}
+if (twPending) {
+  $('twBilling').hidden = false;
+  $('twBillInfo').textContent = '有待处理的服务订单。页面刷新后请恢复原文、文件和选项，再确认付款状态。';
+  if (twPending.checkout_url) { $('twCheckout').href = twPending.checkout_url; $('twCheckout').hidden = false; }
+}
+async function twBuy() {
+  if (twBusy) return;
+  if (twPending) { $('twBilling').hidden = false; $('twMessage').textContent = '请先处理已有订单，或点击“另建新任务”。'; return; }
+  twBusy = true; $('twPrepare').disabled = true;
+  try {
+    const operation = $('twService').value, values = twPayload();
+    const file = !$('twFileWrap').hidden ? $('twFile').files[0] || null : null;
+    const body = new FormData(); body.append('operation', operation); body.append('params', JSON.stringify(values));
+    if (file) body.append('file', file);
+    const response = await fetch('/api/tabword/billing/quote', {method:'POST', body});
+    const quote = await response.json(); if (!response.ok) throw new Error(quote.detail || '计价失败');
+    const payment = await request(`/api/tabword/billing/${quote.quote_id}/payment`, {method:'POST'});
+    twPurchase = {operation, values, file};
+    twPending = {...payment, quote_id:quote.quote_id, operation};
+    sessionStorage.setItem('twPayment', JSON.stringify(twPending));
+    $('twBilling').hidden = false;
+    $('twBillInfo').textContent = `${operation.startsWith('detect') ? '检测' : '改写'}${quote.characters ? ` · ${quote.characters} 字符` : ''}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。订单号：${payment.order_id}。付款后点击“我已付款，开始处理”。`;
+    $('twCheckout').href = payment.checkout_url; $('twCheckout').hidden = false;
+    $('twMessage').textContent = '订单已创建，尚未调用处理服务。';
+  } catch (error) { $('twMessage').textContent = error.message; }
+  finally { twBusy = false; $('twPrepare').disabled = false; }
+}
+async function twRunPaid() {
+  if (twBusy || !twPending) return;
+  twBusy = true; $('twPaidRun').disabled = true;
+  try {
+    const state = await request(`/api/tabword/billing/${twPending.quote_id}/${twPending.order_id}`);
+    if (state.status !== 'TRADE_SUCCESS') throw new Error('尚未收到支付宝付款确认，请稍后重试。');
+    $('twCheckout').hidden = true;
+    if (state.service_state === 'complete') {
+      twSetOutputEmpty();
+      await twConsume(await fetch(`/api/tabword/billing/${twPending.quote_id}/${twPending.order_id}/result`));
+      $('twMessage').textContent = '已恢复已付款订单的结果，未重复调用处理服务。';
+      return;
+    }
+    if (state.task_id) { $('twTask').value = state.task_id; $('twTaskWrap').hidden = false; $('twMessage').textContent = '已提交，请查询任务结果。'; return; }
+    if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请联系管理员核查。');
+    const purchase = twPurchase || {operation:$('twService').value, values:twPayload(), file:!$('twFileWrap').hidden ? $('twFile').files[0] || null : null};
+    if (purchase.operation !== twPending.operation) throw new Error('请恢复购买时的处理类型和选项。');
+    $('twMessage').textContent = '付款已确认，正在处理，请勿关闭页面或重复提交…';
+    twSetOutputEmpty();
+    await twRequest(purchase.operation, purchase.values, true, true, twPending.order_id, purchase.file);
+    $('twBillInfo').textContent = `订单 ${twPending.order_id} 已提交处理；新内容请另建新任务。`;
+  } catch (error) { $('twMessage').textContent = error.message; }
+  finally { twBusy = false; $('twPaidRun').disabled = false; }
+}
+$('twPaidRun').addEventListener('click', twRunPaid);
+$('twNewOrder').addEventListener('click', () => {
+  if (twBusy) return;
+  if (!confirm('另建新任务需重新付款。请确认已有订单已处理完毕；未完成的订单请保留订单号以便核查。')) return;
+  twPending = null; twPurchase = null; sessionStorage.removeItem('twPayment');
+  $('twBilling').hidden = true; $('twMessage').textContent = '可以创建新任务。';
+});
 async function twEstimate() {
   if (twBusy || $('twFile').files.length === 0) { $('twMessage').textContent = '请先选择 Word 文档。'; return; }
   twBusy = true; $('twEstimate').disabled = true; $('twMessage').textContent = '正在本地准备费用估算请求…';
@@ -553,6 +622,8 @@ $('twCompare').addEventListener('click', () => {
 });
 fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); return response.json(); }).then(data => {
   twConfig = data; twChange();
+  const p = data.prices;
+  $('twPriceInfo').textContent = `文本检测 ¥${(p.detect_text_cents/100).toFixed(2)}/次 · 文件检测 ¥${(p.detect_file_cents/100).toFixed(2)}/次 · 改写 ¥${(p.rewrite_per_1000_cents/100).toFixed(2)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。`;
 }).catch(() => { $('twMessage').textContent = '服务配置加载失败。'; });
 function showWorkspace(view) {
   const format = view === 'format', detect = view === 'detect';

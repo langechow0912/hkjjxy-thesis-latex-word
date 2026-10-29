@@ -316,6 +316,30 @@ def _require_affiliate_admin():
     return None
 
 
+@app.get('/api/admin/service-prices')
+def service_prices():
+    _require_affiliate_admin()
+    from core import service_billing
+    return service_billing.prices()
+
+
+@app.get('/api/admin/service-orders')
+def service_orders():
+    _require_affiliate_admin()
+    from core import service_billing
+    return {'orders': service_billing.admin_orders()}
+
+
+@app.put('/api/admin/service-prices')
+def update_service_prices(body: dict):
+    _require_affiliate_admin()
+    from core import service_billing, tabword
+    try:
+        return service_billing.save_prices(body)
+    except tabword.TabwordError as exc:
+        raise HTTPException(exc.status, str(exc)) from None
+
+
 @app.get("/admin/affiliates", response_class=HTMLResponse)
 def affiliate_admin_page():
     _require_affiliate_admin()

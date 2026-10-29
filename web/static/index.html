@@ -38,6 +38,13 @@
  </div>
 <div class="tw-pane tw-result-pane"><div class="tw-pane-head"><strong>处理结果</strong><button class="tw-compare" id="twCompare" type="button" disabled aria-pressed="false">对比视图</button></div><div id="twOriginal" class="tw-original" hidden></div><div id="twOutput" class="tw-output"><div class="tw-empty"><span>▤</span><strong>当前暂无处理结果</strong><small>准备内容后，结果会显示在这里</small></div></div><div id="twStats" class="tw-stats"></div><div id="twLinks" class="files"></div></div>
 </div>
+<p id="twPriceInfo" class="msg">正在加载服务价格…</p>
+<div id="twBilling" hidden>
+  <p id="twBillInfo" role="status"></p>
+  <a id="twCheckout" class="primary" target="_blank" rel="noopener noreferrer" hidden>前往支付宝付款</a>
+  <button id="twPaidRun" class="secondary" type="button">我已付款，开始处理</button>
+  <button id="twNewOrder" class="secondary" type="button">另建新任务</button>
+</div>
 <div class="tw-actionbar"><div><button id="twPrepare" class="primary" type="button">开始改写 <span aria-hidden="true">↗</span></button><button id="twSubmit" class="secondary" type="button" hidden>提交至付费服务</button><button id="twEstimate" class="secondary" type="button" hidden>估算费用</button></div><span id="twMessage" class="msg" role="status" aria-live="polite"></span></div>
 <div id="twTaskWrap" class="tw-task" hidden><label for="twTask">异步任务编号</label><input id="twTask"><button id="twPoll" class="secondary" type="button">查询任务结果</button></div>
 </section>

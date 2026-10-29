@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import urlsplit, parse_qs
 from core import tabword as t
+from core import service_billing
 from fastapi.testclient import TestClient
 from web.app import app
 
@@ -129,12 +130,19 @@ class TabwordTests(unittest.TestCase):
             self.assertEqual(client.post('/api/tabword/paraphrase',data={'params':'not json'}).status_code,422)
             self.assertNotIn('sk-offline-only',client.get('/api/tabword').text)
         self.assertEqual(self.server.requests,[])
-    def test_route_sse_and_json(self):
+    def test_routes_block_unpaid_calls_even_when_provider_enabled(self):
         with TestClient(app) as client:
-            response=client.post('/api/tabword/paraphrase_stream',data={'submit':'true','params':json.dumps({'text':'测试','preset':'abc'})})
-            self.assertEqual(response.status_code,200);self.assertIn('event: done',response.text)
-            response=client.post('/api/tabword/balance',data={'submit':'true'})
-            self.assertEqual(response.status_code,200);self.assertNotIn('sk-offline-only',response.text)
+            for name, operation in t.OPERATIONS.items():
+                if name in t.FREE_CATALOG_OPERATIONS:
+                    continue
+                values, file = self.sample(operation)
+                with self.subTest(operation=name):
+                    response=client.post('/api/tabword/'+name,data={'submit':'true','params':json.dumps(values)},
+                                         files={'file':file} if file else None)
+                    expected = 402 if name in service_billing.SUBMISSIONS | {'document_task','paraphrase_task'} else 403
+                    self.assertEqual(response.status_code,expected)
+                    self.assertNotIn('sk-offline-only',response.text)
+        self.assertEqual(self.server.requests,[])
     def test_free_catalog_route_with_paid_calls_disabled(self):
         with TestClient(app) as client,patch.dict(os.environ,{'TABWORD_ENABLE_CALLS':'false'}):
             response=client.get('/api/tabword/catalog/presets?mode=reduce_ai')

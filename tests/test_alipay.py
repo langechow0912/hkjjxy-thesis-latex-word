@@ -12,7 +12,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from core import affiliates, alipay
+from core import affiliates, alipay, service_billing
 
 
 class AlipayCheckoutTests(unittest.TestCase):
@@ -41,6 +41,15 @@ class AlipayCheckoutTests(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
         self.temp.cleanup()
+
+    def test_backend_format_price_changes_actual_orders_but_preserves_existing(self):
+        self.assertEqual(alipay.config()['amount_cents'], 2999)
+        old = alipay.create_order('format-old-price', '旧论文')
+        service_billing.save_prices({**service_billing.DEFAULTS, 'format_export_cents': 1999})
+        self.assertEqual(alipay.public_status()['amount_cents'], 1999)
+        new = alipay.create_order('format-new-price', '新论文')
+        self.assertEqual(new['amount_cents'], 1999)
+        self.assertEqual(alipay.create_order('format-old-price', '旧论文')['amount_cents'], old['amount_cents'])
 
     def test_gateway_request_signature_includes_sign_type(self):
         import base64

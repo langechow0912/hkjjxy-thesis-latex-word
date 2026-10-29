@@ -43,7 +43,8 @@ def config():
     notify_url = _setting("ALIPAY_NOTIFY_URL")
     return_url = _setting("ALIPAY_RETURN_URL")
     seller_id = _setting("ALIPAY_SELLER_ID")
-    price = _setting("THESIS_FORMAT_PRICE_CENTS")
+    from core import service_billing
+    price = str(service_billing.prices()['format_export_cents'])
     enabled = _setting("ALIPAY_ENABLED").lower() == "true"
     ready = bool(enabled and app_id and private_path and private_path.is_file()
                  and alipay_public_path and alipay_public_path.is_file()
@@ -161,8 +162,12 @@ def _request(method, biz_content, cfg=None):
 
 
 def create_order(job_id, title, affiliate_code=None, affiliate_campaign="",
-                coupon_code=None, school_key=""):
+                coupon_code=None, school_key="", *, amount_cents=None, subject_prefix="论文排版成品导出："):
     cfg = config()
+    if amount_cents is not None:
+        if type(amount_cents) is not int or not 1 <= amount_cents <= 10000000:
+            raise ValueError("订单金额无效")
+        cfg = {**cfg, "amount_cents": amount_cents}
     if not cfg["enabled"]:
         raise AlipayError("支付宝电脑网站支付未启用或配置不完整")
     from core import affiliates
@@ -194,7 +199,7 @@ def create_order(job_id, title, affiliate_code=None, affiliate_campaign="",
         params = _signed_params("alipay.trade.page.pay", {
             "out_trade_no": order_no,
             "total_amount": f"{Decimal(quote['amount_cents']) / 100:.2f}",
-            "subject": ("论文排版成品导出：" + title)[:128],
+            "subject": (subject_prefix + title)[:128],
             "product_code": "FAST_INSTANT_TRADE_PAY",
             "time_expire": datetime.fromtimestamp(created_at + ORDER_LIFETIME, CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         }, cfg)

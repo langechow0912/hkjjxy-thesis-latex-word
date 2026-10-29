@@ -21,6 +21,23 @@
       <div id="newToken" hidden><p>管理员令牌只显示这一次，请妥善保存。</p><p class="token-output" id="newTokenValue"></p><button class="btn" id="continueAdmin" type="button">进入后台</button></div>
     </section>
     <div class="admin-content" id="adminContent" hidden>
+    <section class="section">
+      <div class="head"><h2>服务价格设置</h2></div>
+      <form class="form" id="servicePriceForm">
+        <div class="field"><label for="formatExportPrice">论文排版 Word 导出（元 / 篇）</label><input id="formatExportPrice" type="number" min="0.01" max="1000" step="0.01" required></div>
+        <div class="field"><label for="detectTextPrice">文本检测（元 / 次）</label><input id="detectTextPrice" type="number" min="0.01" max="1000" step="0.01" required></div>
+        <div class="field"><label for="detectFilePrice">文件检测（元 / 次）</label><input id="detectFilePrice" type="number" min="0.01" max="1000" step="0.01" required></div>
+        <div class="field"><label for="rewritePrice">改写 / 降重 / 降 AI / 双降（元 / 千字）</label><input id="rewritePrice" type="number" min="0.01" max="1000" step="0.01" required></div>
+        <button class="btn primary" type="submit">保存价格</button>
+      </form>
+      <p>按非空白字符计数，改写按实际字符数比例计费、向上取整到分。改价只影响新报价，已有订单保留原金额。</p>
+      <p class="message" id="servicePriceMessage" role="status"></p>
+    </section>
+    <section class="section">
+      <div class="head"><h2>最近服务订单</h2></div>
+      <p>付款后调用失败或处理中断的订单需人工核查并安排退款，不会自动再次调用。</p>
+      <div class="table-wrap"><table><thead><tr><th>支付订单号</th><th>服务</th><th>金额</th><th>字符数</th><th>支付状态</th><th>处理状态</th></tr></thead><tbody id="serviceOrderRows"></tbody></table></div>
+    </section>
     <h1>推广员与佣金</h1>
     <p class="intro">推广归因有效期 30 天；佣金在支付宝确认付款后生成。结算由管理员线下完成并记录流水号。</p>
     <section class="section">

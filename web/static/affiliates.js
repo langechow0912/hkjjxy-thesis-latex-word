@@ -187,8 +187,42 @@ async function updateCommission(id, status, payoutRef = "") {
 }
 
 async function reload() {
-  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals()]);
+  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals(), loadServicePrices(), loadServiceOrders()]);
 }
+
+async function loadServicePrices() {
+  const prices = await api('/api/admin/service-prices');
+  $('formatExportPrice').value = (prices.format_export_cents / 100).toFixed(2);
+  $('detectTextPrice').value = (prices.detect_text_cents / 100).toFixed(2);
+  $('detectFilePrice').value = (prices.detect_file_cents / 100).toFixed(2);
+  $('rewritePrice').value = (prices.rewrite_per_1000_cents / 100).toFixed(2);
+}
+async function loadServiceOrders() {
+  const result = await api('/api/admin/service-orders');
+  const body = $('serviceOrderRows'); body.replaceChildren();
+  for (const order of result.orders) {
+    const row = node('tr');
+    const service = ({detect_text:'文本检测',detect_file:'文件检测'})[order.operation] || '论文改写';
+    const state = ({ready:'待提交',processing:'处理中',submitted:'已提交',complete:'已完成',failed:'异常，待核查'})[order.state] || order.state;
+    row.append(node('td', order.out_trade_no || '未创建支付订单'), node('td',service), node('td',money(order.amount_cents)),
+      node('td',String(order.characters)), node('td',order.payment_status === 'TRADE_SUCCESS' ? '已支付' : '未支付'), node('td',state));
+    body.append(row);
+  }
+}
+$('servicePriceForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button'); button.disabled = true;
+  try {
+    await api('/api/admin/service-prices', {method:'PUT', body:JSON.stringify({
+      format_export_cents:Math.round(Number($('formatExportPrice').value) * 100),
+      detect_text_cents:Math.round(Number($('detectTextPrice').value) * 100),
+      detect_file_cents:Math.round(Number($('detectFilePrice').value) * 100),
+      rewrite_per_1000_cents:Math.round(Number($('rewritePrice').value) * 100),
+    })});
+    setMessage($('servicePriceMessage'), '价格已保存，新报价立即生效。');
+  } catch (error) { setMessage($('servicePriceMessage'), error.message, true); }
+  finally { button.disabled = false; }
+});
 
 $("affiliateForm").addEventListener("submit", async (event) => {
   event.preventDefault();
