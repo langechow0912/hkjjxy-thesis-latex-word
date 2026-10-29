@@ -111,32 +111,36 @@ async function submit() {
 }
 async function setupPayment(id) {
   clearTimeout(paymentTimer); paymentJob = id; paymentOrder = null;
-  $('paymentPanel').hidden = false; $('paymentQr').style.display = 'none';
+  $('paymentPanel').hidden = false; $('paymentCheckout').hidden = true;
   $('paidDownload').hidden = true; $('createPayment').hidden = true;
   $('couponControls').hidden = true; $('couponInfo').textContent = ''; $('couponCode').value = '';
+  $('couponCode').disabled = false; $('applyCoupon').disabled = false;
   try {
     const config = await request('/api/alipay');
     if (paymentJob !== id) return;
     if (!config.enabled) {
-      $('paymentInfo').textContent = '支付宝扫码支付尚未配置完成，暂不能下载 Word。';
+      $('paymentInfo').textContent = '支付宝支付尚未配置完成，暂不能下载 Word。';
       return;
     }
-    $('paymentInfo').textContent = `扫码支付 ¥${(config.amount_cents / 100).toFixed(2)} 后导出成品`;
+    $('paymentInfo').textContent = `支付宝付款 ¥${(config.amount_cents / 100).toFixed(2)} 后导出成品`;
     $('couponControls').hidden = false;
     $('createPayment').hidden = false;
     const saved = sessionStorage.getItem('thesisPaymentOrder');
     if (saved) {
       try {
         const order = JSON.parse(saved);
-        if (order.job === id && order.orderId && order.qrImage) {
-          paymentOrder = order.orderId; $('paymentQr').src = order.qrImage;
-          $('paymentQr').style.display = 'block'; $('createPayment').hidden = true;
+        if (order.job === id && order.orderId) {
+          paymentOrder = order.orderId;
+          $('paymentCheckout').href = `/api/format/jobs/${encodeURIComponent(id)}/payment/${encodeURIComponent(paymentOrder)}/checkout`;
+          $('paymentCheckout').hidden = false; $('createPayment').hidden = true;
+          $('couponCode').value = order.couponCode || '';
+          $('couponCode').disabled = true; $('applyCoupon').disabled = true;
           checkPayment(id, paymentOrder);
         }
       } catch { sessionStorage.removeItem('thesisPaymentOrder'); }
     }
   } catch (error) {
-    $('paymentInfo').textContent = error.message;
+    if (paymentJob === id) $('paymentInfo').textContent = error.message;
   }
 }
 async function createPayment() {
@@ -150,29 +154,40 @@ async function createPayment() {
     });
     if (paymentJob !== id) return;
     paymentOrder = result.order_id;
-    sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:id,orderId:paymentOrder,qrImage:result.qr_image}));
+    sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:id,orderId:paymentOrder,couponCode:result.coupon_code}));
     button.hidden = true;
-    $('paymentQr').src = result.qr_image;
-    $('paymentQr').style.display = 'block';
+    $('paymentCheckout').href = result.checkout_url;
+    $('paymentCheckout').hidden = result.status === 'TRADE_SUCCESS';
+    $('couponCode').disabled = true; $('applyCoupon').disabled = true;
     const priceText = result.discount_cents
       ? `原价 ¥${(result.list_price_cents / 100).toFixed(2)}，优惠 -¥${(result.discount_cents / 100).toFixed(2)}，应付 ¥${(result.amount_cents / 100).toFixed(2)}`
       : `应付 ¥${(result.amount_cents / 100).toFixed(2)}`;
-    $('paymentInfo').textContent = `请使用支付宝扫描二维码支付。${priceText}`;
+    $('paymentInfo').textContent = `点击“前往支付宝付款”打开收银台，付款后回到本页下载。${priceText}`;
     if (result.coupon_code) $('couponInfo').textContent = `已使用优惠码 ${result.coupon_code}`;
     checkPayment(id, paymentOrder);
-  } catch (error) { $('paymentInfo').textContent = error.message; }
+  } catch (error) { if (paymentJob === id) $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
 }
 async function checkPayment(id, order) {
   if (paymentJob !== id || paymentOrder !== order) return;
   try {
     const state = await request(`/api/format/jobs/${encodeURIComponent(id)}/payment/${encodeURIComponent(order)}`);
+    if (paymentJob !== id || paymentOrder !== order) return;
     if (state.paid) {
       clearTimeout(paymentTimer); $('paymentInfo').textContent = '支付成功，可以下载排版成品。';
+      $('paymentCheckout').hidden = true;
       $('paidDownload').hidden = false; return;
     }
-    $('paymentInfo').textContent = '等待支付宝确认付款…';
-  } catch (error) { $('paymentInfo').textContent = error.message; }
+    if (state.expired) {
+      $('paymentCheckout').hidden = true; $('createPayment').hidden = false;
+      $('couponCode').disabled = false; $('applyCoupon').disabled = false;
+      $('paymentInfo').textContent = '订单已过期或支付方式已更新，请重新创建支付订单。';
+      sessionStorage.removeItem('thesisPaymentOrder'); paymentOrder = null; return;
+    }
+  } catch (error) {
+    if (paymentJob !== id || paymentOrder !== order) return;
+    $('paymentInfo').textContent = error.message;
+  }
   paymentTimer = setTimeout(() => checkPayment(id, order), 2500);
 }
 async function downloadPaid() {
@@ -248,9 +263,9 @@ $('query').addEventListener('compositionstart', () => { composing = true; queueS
 $('query').addEventListener('compositionend', () => { composing = false; queueSearch(); });
 $('query').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); searchRules(); } };
 function routeHint() {
-  $('routeHint').textContent = selectedRule?.id.startsWith('school:')
-    ? '该院校使用学校排版系统；请上传 .docx 文件，完成后可预览，下载 Word 需扫码支付。'
-    : selectedRule?.id ? '该规范由大以论文提供，稿件将提交给服务方处理；导出计费前会单独确认。' : '请先选择院校规范。';
+  $('routeHint').textContent = selectedRule?.id
+    ? '该规范由大以论文 API 提供，稿件将提交给服务方处理；导出计费前会单独确认。'
+    : '请先选择院校规范。';
 }
 for (const id of fields) $(id).oninput = () => { if (!busy) clearResult(); controls(); };
 $('drop').onclick = () => $('file').click();

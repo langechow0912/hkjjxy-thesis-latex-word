@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""毕业论文格式流水线 · 本地 Web 界面。
+"""毕业论文格式流水线 · API Web 界面。
 
 启动：
     python web/app.py                       # 默认 http://127.0.0.1:8000
@@ -12,12 +12,7 @@
     THESIS_MAX_UPLOAD_MB                    上传 docx 大小上限（默认 20）
     THESIS_KEEP_JOBS                        内存中保留的任务数（默认 50）
 
-接口：
-    GET  /api/schools                       学校列表
-    POST /api/convert   (file, school)      docx → tex（返回 tex 文本供编辑）
-    POST /api/build     {school,name,tex}   提交构建，返回 job id
-    GET  /api/job/{id}                      任务状态与日志
-    GET  /api/download/{id}/{pdf|docx}      下载产物
+所有院校走云端 API；旧 /api/schools、/api/convert、/api/build 返回 410。
 
 云端排版通道（大易论文排版开放接口，见 core/dayipaper.py 与 docs/dayipaper-api.md）：
     GET  /api/dayipaper                     通道是否可用（有没有配 PAT）
@@ -45,11 +40,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import affiliates, alipay, build as corebuild   # noqa: E402
-from core import dayipaper, schoolformat      # noqa: E402
+from core import affiliates, alipay, dayipaper   # noqa: E402
 from core.localconfig import load_pat
 load_pat(ROOT)
-from core import docx2tex, profile as P      # noqa: E402
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -571,96 +564,17 @@ def api_admin_withdrawal_proof(withdrawal_id: int):
 
 @app.get("/api/schools")
 def schools():
-    out = []
-    if not os.path.isdir(P.SCHOOLS):
-        return out
-    for d in sorted(Path(P.SCHOOLS).iterdir()):
-        if (d / "profile.yaml").is_file():
-            try:
-                cfg = P.load(d.name)
-                out.append({"id": d.name,
-                            "name": cfg["school"].get("name", d.name)})
-            except Exception:
-                pass
-    return out
+    raise HTTPException(410, "本地排版已停用，请使用 /api/format/rules 查询院校规范")
 
 
 @app.post("/api/convert")
 async def api_convert(file: UploadFile = File(...), school: str = Form("hkjjxy")):
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix != ".docx":
-        raise HTTPException(400, "目前只支持 .docx；若已有 main.tex，请用「直接粘贴 tex」")
-    name = sanitize(Path(file.filename).stem)
-    work = Path(P.SAMPLES) / school / name
-    work.mkdir(parents=True, exist_ok=True)
-    src = work / "_source.docx"
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, "文件超过 %d MB，请压缩图片后重试" % MAX_UPLOAD_MB)
-    src.write_bytes(data)
-
-    cfg = P.load(school)
-    lines = []
-
-    def log(*a):
-        lines.append(" ".join(str(x) for x in a))
-
-    try:
-        tex, stat = docx2tex.convert(str(src), str(work), cfg, log=log)
-    except Exception:
-        raise HTTPException(500, "转换失败：\n" + traceback.format_exc())
-
-    (work / "main.tex").write_text(tex, encoding="utf-8", newline="\n")
-    _LAST_CONVERT[school] = str(work)
-    return {"name": name, "school": school, "tex": tex,
-            "stat": stat, "log": lines}
-
-
-def _run(job, cfg, name, tex, do_pdf, do_docx):
-    def log(*a):
-        job["log"].append(" ".join(str(x) for x in a))
-    try:
-        paths = corebuild.build_one(cfg, name, tmp=job["tmp"],
-                                    do_docx=do_docx, do_pdf=do_pdf,
-                            log=log)
-        files = {}
-        pdf_path = Path(paths["work"]) / "main.pdf"
-        if pdf_path.is_file():
-            files["pdf"] = str(pdf_path)
-        docx_path = paths["docx"]
-        if os.path.isfile(docx_path):
-            files["docx"] = docx_path
-        job["files"] = files
-        job["state"] = "done"
-    except BaseException:
-        job["state"] = "error"
-        job["log"].append(traceback.format_exc())
+    raise HTTPException(410, "本地转换已停用，请使用 /api/format 提交 API 排版")
 
 
 @app.post("/api/build")
 def api_build(req: BuildReq):
-    if _running_count() >= MAX_RUNNING:
-        raise HTTPException(503, "已有 %d 个任务在编译，请等它们完成后再提交（本机同时最多 %d 个）"
-                            % (_running_count(), MAX_RUNNING))
-    cfg = P.load(req.school)
-    name = sanitize(req.name)
-    work = Path(P.SAMPLES) / req.school / name
-    work.mkdir(parents=True, exist_ok=True)
-    (work / "main.tex").write_text(req.tex, encoding="utf-8", newline="\n")
-
-    # 缺图会编译出「看起来成功但没有图」的 PDF，这里拦在构建之前
-    missing = _prepare_figures(work, req.school, req.tex, print)
-    if missing:
-        raise HTTPException(400, "缺少 %d 个图片文件（例如 %s）。论文改名或换目录后图片不会跟着走，"
-                                 "请重新上传一次 Word 稿，或把 figures 目录放回论文目录下。"
-                            % (len(missing), "、".join(missing[:5])))
-
-    job = _new_job()
-    job["name"] = name
-    t = threading.Thread(target=_run, args=(job, cfg, name, req.tex,
-                                            req.pdf, req.docx), daemon=True)
-    t.start()
-    return {"job": job["id"], "name": name}
+    raise HTTPException(410, "本地构建已停用，请使用 /api/format 提交 API 排版")
 
 
 @app.get("/api/job/{job_id}")
@@ -682,8 +596,7 @@ def api_download(job_id: str, kind: str):
 
 
 # ---------------------------------------------------------------- 云端排版通道
-# 复用 JOBS（kind="cloud"）：本地编译要跑 3 遍 XeLaTeX，云端只是长轮询，
-# 所以并发额度和 _running_count 分开算，避免云端任务把本地编译挡在门外。
+# 云端任务复用 JOBS（kind="cloud"），由独立额度限制轮询并发。
 def _dp_call(fn, *args, **kwargs):
     """把接口异常翻成 HTTP 错误：鉴权类原样透出，其余归为 502。"""
     try:
@@ -752,7 +665,7 @@ def api_create_payment(job_id: str, request: Request, body: PaymentCreateReq | N
             "list_price_cents": order.get("list_price_cents") or order["amount_cents"],
             "discount_cents": order.get("discount_cents", 0),
             "coupon_code": order.get("coupon_code"),
-            "qr_image": f"/api/format/jobs/{job_id}/payment/{order['out_trade_no']}/qr.png"}
+            "checkout_url": f"/api/format/jobs/{job_id}/payment/{order['out_trade_no']}/checkout"}
 
 
 @app.get("/api/format/jobs/{job_id}/payment/{order_id}")
@@ -762,7 +675,23 @@ def api_payment_status(job_id: str, order_id: str):
     if not order:
         raise HTTPException(404, "支付订单不存在")
     return {"order_id": order["out_trade_no"], "status": order["status"],
-            "paid": order["status"] == "TRADE_SUCCESS"}
+            "paid": order["status"] == "TRADE_SUCCESS",
+            "expired": (order["status"] != "TRADE_SUCCESS" and
+                        (time.time() >= order["created_at"] + alipay.ORDER_LIFETIME
+                         or order["payment_product"] != "page_pay"))}
+
+
+@app.get("/api/format/jobs/{job_id}/payment/{order_id}/checkout")
+def api_payment_checkout(job_id: str, order_id: str):
+    _format_job(job_id)
+    try:
+        url = alipay.checkout_url(order_id, job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except alipay.AlipayError as exc:
+        raise HTTPException(503, str(exc)) from None
+    return RedirectResponse(url, status_code=303,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 @app.get("/api/format/jobs/{job_id}/payment/{order_id}/qr.png")
@@ -795,13 +724,8 @@ def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关�
 
 @app.get('/api/format/rules')
 def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=1, le=20)):
-    local = [dict(id='school:' + s['id'], name=s['name'] + '本科毕业论文规范',
-                  targetSchoolName=s['name'], targetSubjectLevel='本科', provider='school')
-             for s in schools() if q.strip() in s['name'] or q.strip() == s['id']]
-    if local:
-        return {'items': local[:size], 'total': len(local)}
     result = api_dp_rules(q, size)
-    # Namespace provider rules so later adapters can be added without ID collisions.
+    # All schools, including Haikou Economics University, use the provider API.
     return {**result, 'items': [{**r, 'id': 'dayipaper:' + str(r['id']),
                                 'provider': 'dayipaper'} for r in result.get('items', [])]}
 
@@ -820,22 +744,15 @@ async def api_dp_format(file: UploadFile = File(...),
                         tutorNameEn: str = Form(""),
                         subjectName: str = Form(""),
                         subjectNameEn: str = Form("")):
-    local_school = ruleId[7:] if ruleId.startswith('school:') else None
-    if local_school and local_school not in {s['id'] for s in schools()}:
-        raise HTTPException(400, '未知院校规范')
-    if not local_school and not dayipaper.has_token():
+    if not dayipaper.has_token():
         raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
-    if local_school and _running_count() >= MAX_RUNNING:
-        raise HTTPException(503, '学校排版任务繁忙，请稍后重试')
-    if not local_school and _cloud_running_count() >= MAX_CLOUD:
+    if _cloud_running_count() >= MAX_CLOUD:
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
                             % (_cloud_running_count(), MAX_CLOUD))
 
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in (".docx", ".doc"):
         raise HTTPException(400, "云端排版只收 .docx / .doc 源文件")
-    if local_school and suffix != '.docx':
-        raise HTTPException(400, '该院校请上传 .docx，请先在 Word 中另存为此格式')
     data = await file.read()
     if not data:
         raise HTTPException(400, "上传的文件是空的")
@@ -851,17 +768,6 @@ async def api_dp_format(file: UploadFile = File(...),
             meta[key] = value.strip()
     if not all(meta.get(k) for k in ("title", "authorName", "ruleId")):
         raise HTTPException(400, "题目、作者名、规范 ID 都是必填")
-
-    if local_school:
-        try:
-            cfg = schoolformat.validate(local_school)
-        except (Exception, SystemExit):
-            raise HTTPException(503, '学校排版模板或工具尚未配置完成')
-        job = _new_job(kind='school')
-        job.update(name=meta['title'], stage='准备稿件', suggestions=[],
-                   school_key='school:' + local_school)
-        threading.Thread(target=schoolformat.run, args=(job, data, cfg, meta), daemon=True).start()
-        return {'job': job['id'], 'title': meta['title']}
 
     school_key = meta['ruleId']
     if meta['ruleId'].startswith('dayipaper:'):
@@ -979,20 +885,20 @@ def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
         if fmt != 1 or 'docx' not in local['files']:
             raise HTTPException(409, 'Word 尚未生成或格式不支持')
         if not alipay.public_status()["enabled"]:
-            raise HTTPException(503, "支付宝扫码支付尚未配置完成，暂不能下载 Word")
+            raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
         order = alipay.get_order(payment_order, job_id)
         if not order or order["status"] != "TRADE_SUCCESS":
-            raise HTTPException(402, "请先完成支付宝扫码支付")
+            raise HTTPException(402, "请先完成支付宝电脑网站支付")
         return FileResponse(local['files']['docx'], filename=sanitize(local['name']) + '.docx')
     job = _cloud_job(job_id)
     with _LOCK:
         export_lock = job.setdefault("exportLock", threading.Lock())
     with export_lock:
         if not alipay.public_status()["enabled"]:
-            raise HTTPException(503, "支付宝扫码支付尚未配置完成，暂不能下载 Word")
+            raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
         order = alipay.get_order(payment_order, job_id)
         if not order or order["status"] != "TRADE_SUCCESS":
-            raise HTTPException(402, "请先完成支付宝扫码支付")
+            raise HTTPException(402, "请先完成支付宝电脑网站支付")
         confirm = True
         return _export_job(job, fmt, confirm)
 

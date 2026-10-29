@@ -1,4 +1,9 @@
+import base64
+from contextlib import closing
+import json
 import os
+import time
+import urllib.parse
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,23 +42,134 @@ class AlipayCheckoutTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def test_precreate_uses_full_price_without_first_order_discount(self):
-        with patch.object(alipay, "_request", return_value={"qr_code": "https://qr.example/order"}) as request:
-            order = alipay.create_order("job-12345678", "测试论文")
-            conn = alipay._connect()
-            try:
+    def test_gateway_request_signature_includes_sign_type(self):
+        import base64
+        import json
+        import urllib.parse
+        from io import BytesIO
+
+        response = {"alipay_trade_precreate_response": {
+            "code": "10000", "qr_code": "https://qr.example/order"}}
+        with patch("core.alipay.urllib.request.urlopen",
+                   return_value=BytesIO(json.dumps(response).encode())) as gateway:
+            alipay._request("alipay.trade.precreate", {
+                "out_trade_no": "LP-test-signature", "total_amount": "29.99",
+                "subject": "测试论文",
+            })
+        request = gateway.call_args.args[0]
+        params = dict(urllib.parse.parse_qsl(request.data.decode("utf-8")))
+        signature = base64.b64decode(params.pop("sign"), validate=True)
+        self.assertEqual(params["sign_type"], "RSA2")
+        # Build the expected source independently of the production helper.
+        source = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+        self.private.public_key().verify(signature, source.encode("utf-8"),
+                                         padding.PKCS1v15(), hashes.SHA256())
+
+    def test_notification_signature_excludes_sign_type(self):
+        import base64
+
+        source = b"app_id=test-app&out_trade_no=LP-test-notify&total_amount=29.99"
+        params = {"app_id": "test-app", "out_trade_no": "LP-test-notify",
+                  "total_amount": "29.99", "sign_type": "RSA2"}
+        params["sign"] = base64.b64encode(self.private.sign(
+            source, padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
+        self.assertTrue(alipay.verify(params, self.public_path))
+        params["total_amount"] = "0.01"
+        self.assertFalse(alipay.verify(params, self.public_path))
+
+    def checkout_params(self, order):
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(order["payment_url"]).query))
+        signature = base64.b64decode(params.pop("sign"), validate=True)
+        source = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+        self.private.public_key().verify(signature, source.encode("utf-8"),
+                                         padding.PKCS1v15(), hashes.SHA256())
+        self.assertEqual(params["method"], "alipay.trade.page.pay")
+        self.assertEqual(params["sign_type"], "RSA2")
+        self.assertEqual(params["notify_url"], "https://merchant.example/api/alipay/notify")
+        biz = json.loads(params["biz_content"])
+        self.assertEqual(biz["product_code"], "FAST_INSTANT_TRADE_PAY")
+        self.assertEqual(biz["out_trade_no"], order["out_trade_no"])
+        return biz
+
+    def test_page_pay_signed_full_price_and_pending_paid_reuse(self):
+        with patch("core.alipay.urllib.request.urlopen") as network:
+            order = alipay.create_order("job-12345678", "测试论文 & <测试>")
+            reused_pending = alipay.create_order("job-12345678", "测试论文")
+            self.assertEqual(reused_pending["out_trade_no"], order["out_trade_no"])
+            with closing(alipay._connect()) as conn, conn:
                 conn.execute("UPDATE payment_orders SET status='TRADE_SUCCESS' WHERE out_trade_no=?",
                              (order["out_trade_no"],))
-                conn.commit()
-            finally:
-                conn.close()
             reused = alipay.create_order("job-12345678", "测试论文")
+            network.assert_not_called()
         self.assertEqual(order["amount_cents"], 2999)
-        self.assertEqual(request.call_args.args[1]["total_amount"], "29.99")
-        self.assertTrue(order["qr_code"].startswith("https://"))
+        biz = self.checkout_params(order)
+        self.assertEqual(biz["total_amount"], "29.99")
+        self.assertIn("& <测试>", biz["subject"])
+        expires = alipay.datetime.strptime(biz["time_expire"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=alipay.CHINA_TZ)
+        self.assertEqual(int(expires.timestamp()), order["created_at"] + 900)
         self.assertEqual(reused["out_trade_no"], order["out_trade_no"])
-        request.assert_called_once()
-        self.assertTrue(alipay.qr_png(order["out_trade_no"], "job-12345678").startswith(b"\x89PNG"))
+        self.assertEqual(order["qr_code"], "")
+        self.assertIsNone(alipay.qr_png(order["out_trade_no"], "job-12345678"))
+
+    def test_checkout_blocks_wrong_job_expired_paid_and_untrusted_host(self):
+        order = alipay.create_order("job-checkout", "测试")
+        number = order["out_trade_no"]
+        self.assertEqual(alipay.checkout_url(number, "job-checkout"), order["payment_url"])
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            alipay.checkout_url(number, "another-job")
+        with patch("core.alipay.time.time", return_value=order["created_at"] + 900):
+            with self.assertRaisesRegex(ValueError, "过期"):
+                alipay.checkout_url(number, "job-checkout")
+            new = alipay.create_order("job-checkout", "测试")
+            self.assertNotEqual(new["out_trade_no"], number)
+        with closing(alipay._connect()) as conn, conn:
+            conn.execute("UPDATE payment_orders SET payment_url='https://evil.example/pay' WHERE out_trade_no=?", (number,))
+        with self.assertRaises(alipay.AlipayError):
+            alipay.checkout_url(number, "job-checkout")
+        with closing(alipay._connect()) as conn, conn:
+            conn.execute("UPDATE payment_orders SET status='TRADE_SUCCESS' WHERE out_trade_no=?", (number,))
+        with self.assertRaisesRegex(ValueError, "已支付"):
+            alipay.checkout_url(number, "job-checkout")
+
+    def test_old_schema_migrates_without_reusing_legacy_qr_order(self):
+        # The previous database schema and paid history survive the migration.
+        import sqlite3
+        with closing(sqlite3.connect(alipay._db_path())) as conn, conn:
+            conn.execute("CREATE TABLE payment_orders (out_trade_no TEXT PRIMARY KEY, job_id TEXT NOT NULL, amount_cents INTEGER NOT NULL, status TEXT NOT NULL, qr_code TEXT NOT NULL, trade_no TEXT, created_at INTEGER NOT NULL, paid_at INTEGER)")
+            conn.execute("INSERT INTO payment_orders VALUES(?,?,?,?,?,?,?,?)",
+                         ("LP-legacy-order", "job-legacy", 2999, "WAIT_BUYER_PAY", "https://qr.example/old", None, int(time.time()), None))
+        old = alipay.get_order("LP-legacy-order")
+        self.assertEqual(old["payment_product"], "precreate")
+        with self.assertRaisesRegex(ValueError, "旧支付订单"):
+            alipay.checkout_url(old["out_trade_no"], "job-legacy")
+        new = alipay.create_order("job-legacy", "测试")
+        self.assertEqual(new["payment_product"], "page_pay")
+        self.assertNotEqual(new["out_trade_no"], old["out_trade_no"])
+
+    def test_checkout_route_redirects_but_does_not_unlock_download(self):
+        from fastapi.testclient import TestClient
+        from web import app as web
+        job = "j-page-pay-test"
+        web.JOBS[job] = {"kind": "cloud", "state": "done", "taskId": "task-1", "name": "测试", "school_key": "dayipaper:test"}
+        try:
+            with TestClient(web.app) as client:
+                response = client.post(f"/api/format/jobs/{job}/payment", json={})
+                self.assertEqual(response.status_code, 200)
+                data = response.json()
+                self.assertNotIn("qr_image", data)
+                redirect = client.get(data["checkout_url"], follow_redirects=False)
+                self.assertEqual(redirect.status_code, 303)
+                self.assertTrue(redirect.headers["location"].startswith("https://openapi-sandbox.dl.alipaydev.com/gateway.do?"))
+                self.assertEqual(redirect.headers["cache-control"], "no-store")
+                state = client.get(f"/api/format/jobs/{job}/payment/{data['order_id']}").json()
+                self.assertFalse(state["paid"])
+                denied = client.get(f"/api/format/jobs/{job}/download?fmt=1&payment_order={data['order_id']}&trade_status=TRADE_SUCCESS")
+                self.assertEqual(denied.status_code, 402)
+                with patch("core.alipay.time.time", return_value=time.time() + 1000):
+                    self.assertTrue(client.get(f"/api/format/jobs/{job}/payment/{data['order_id']}").json()["expired"])
+                    self.assertEqual(client.get(data["checkout_url"], follow_redirects=False).status_code, 409)
+        finally:
+            web.JOBS.pop(job, None)
 
     def test_notification_requires_valid_signature_and_exact_amount(self):
         conn = alipay._connect()
@@ -83,8 +199,7 @@ class AlipayCheckoutTests(unittest.TestCase):
 
     def test_paid_referral_order_creates_one_pending_commission(self):
         affiliate = affiliates.create_affiliate("测试推广员", code="TESTAFF", commission_rate=10)
-        with patch.object(alipay, "_request", return_value={"qr_code": "https://qr.example/order"}):
-            order = alipay.create_order("job-referral-123", "测试论文", affiliate["code"], "autumn")
+        order = alipay.create_order("job-referral-123", "测试论文", affiliate["code"], "autumn")
         params = {"app_id": "test-app", "out_trade_no": order["out_trade_no"],
                   "total_amount": "29.99", "trade_status": "TRADE_SUCCESS",
                   "trade_no": "trade-referral", "seller_id": "seller"}
@@ -116,10 +231,11 @@ class AlipayCheckoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不适用于"):
             affiliates.preview_coupon(coupon["code"], "dayipaper:other", 2999)
 
-        with patch.object(alipay, "_request", return_value={"qr_code": "https://qr.example/coupon"}) as request:
+        with patch("core.alipay.urllib.request.urlopen") as network:
             order = alipay.create_order("job-coupon-123", "测试论文", coupon_code="haikou10",
                                         school_key="school:hkjjxy")
-            self.assertEqual(request.call_args.args[1]["total_amount"], "26.99")
+            self.assertEqual(self.checkout_params(order)["total_amount"], "26.99")
+            network.assert_not_called()
             self.assertEqual(order["discount_cents"], 300)
             self.assertEqual(order["coupon_code"], "HAIKOU10")
             with self.assertRaisesRegex(ValueError, "使用次数上限"):

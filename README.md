@@ -2,21 +2,25 @@
 
 统一流程：搜索院校规范 → 上传 Word、填写题目与作者 → 排版 → PDF 预览 → 下载 Word。
 
-海口经济学院使用现有学校模板及排版系统，不依赖大以论文 PAT。其他院校由后端调用大以论文 API。前端没有本地/云端选项，也不显示 LaTeX。页面采用暖白、墨色、绿色强调的简洁工作台。
+所有院校（包括海口经济学院）的规范搜索和论文排版都通过大以论文 API。需要配置 Dayipaper PAT；排版预览由服务方生成，Word 导出前会单独确认并按服务方规则计费。前端没有本地排版分支，也不显示 LaTeX。
+
+2026-10-29 更新：支付宝付款使用电脑网站支付并跳转官方收银台；本地已确认收银台可打开，但没有进行真实付款。生产环境仍须提供有效的支付宝平台公钥和可从公网访问的 HTTPS 通知地址，才能验签解锁付费下载。AWS 部署继续使用仓库根目录的 `docker-compose.yml`（app + Caddy），不使用轻量服务器专用文件。62 项离线测试通过。
+
+`requirements.txt` 和 Docker 镜像只安装 API 网站运行依赖，不安装 TeX Live、LibreOffice 或字体。旧本地排版库放在 `requirements-local.txt`，仅供旧工具维护和测试使用。旧 `/api/schools`、`/api/convert`、`/api/build` 接口返回 410；线上统一使用 `/api/format/rules` 和 `/api/format`。
 
 ## 运行与验证
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-local.txt
 python web/app.py --port 8765
 python -m unittest discover -s tests -t . -q
 ```
 
-打开 http://127.0.0.1:8765/ ，不要直接双击 HTML。学校排版需要 LibreOffice；工具路径按 schools/hkjjxy/profile.yaml 与 core/tools.py 的配置解析。
+打开 http://127.0.0.1:8765/ ，不要直接双击 HTML。论文规范搜索和排版需要配置 `DAYIPAPER_PAT`。
 
 ## EC2 + Docker Compose + Caddy 部署
 
-网页和所有依赖最终都在 AWS EC2 的 Docker 容器里运行；本地电脑只负责把代码提交到 GitHub、必要时用 SSH 连接 EC2 和上传密钥。本地 Docker Desktop 可以关闭，不负责生产网站。仓库已有 `Dockerfile`、`docker-compose.yml` 和 `Caddyfile`：镜像内含 LibreOffice、XeLaTeX、中文字体和 Python 依赖；Caddy 负责 80/443 和自动 HTTPS。
+网页和 Python 运行依赖在 AWS EC2 的 Docker 容器里运行，论文排版统一由 Dayipaper API 处理。`docker-compose.yml` 保留 app 与 Caddy 双容器、内部网络、只读应用容器和持久化数据卷；轻量 API 镜像不再安装 TeX Live、LibreOffice 或字体包。Caddy 负责 80/443 和自动 HTTPS。
 
 当前已知信息：域名是 `lunwenpaiban.dpdns.org`，EC2 当前公网 IPv4 是 `15.135.187.3`。域名的 NS 已确认由 Cloudflare 管理（`javon.ns.cloudflare.com`、`princess.ns.cloudflare.com`）；目前还没有查到该域名的 A 记录。项目代码已上传到 GitHub 私有仓库 [`langechow0912/hkjjxy-thesis-latex-word`](https://github.com/langechow0912/hkjjxy-thesis-latex-word)，默认分支为 `master`。EC2 可以按下文配置只读 Deploy key 后克隆。
 
@@ -142,7 +146,7 @@ chmod 600 .env
 
 分销管理后台使用独立认证，不需要给公众网站整体加 Basic Auth。未配置 `AFFILIATE_ADMIN_USER` / `AFFILIATE_ADMIN_PASS_FILE` 时，首次管理员注册仅允许从服务器本机访问 `/admin/affiliates`；系统生成一次性访问令牌，数据库只保存哈希。令牌丢失后需由服务器维护者按部署流程处理，不开放公网自助重置。已配置 Basic Auth 的部署继续使用 `AFFILIATE_ADMIN_USER=admin`、`AFFILIATE_ADMIN_PASS_FILE=/run/secrets/affiliate_admin_pass`。不要把任何令牌或口令提交到 GitHub。后台可创建全平台优惠券，或按 `school:<院校ID>` / `dayipaper:<规则ID>` 限定学校；支付下单时会在服务端校验并冻结优惠金额。推广员入口为 `/affiliate`，新增推广员时显示一次性访问令牌；推广员可申请提现，管理员审核后手动转账，登记流水号并上传 PNG/JPG/PDF 凭证。凭证保存在持久化 `/data` 卷中。
 
-其他院校云端排版需要的 Dayipaper PAT 放入 `deploy/secrets/dayipaper_pat`；Tabword 服务需要独立 API Key，放入 `deploy/secrets/tabword_api_key`。海口经济学院本地模板不依赖这两个服务。本地密钥通过 PowerShell `scp` 单独传输，不进 GitHub。以下以 Ubuntu 为例，Amazon Linux 把 `ubuntu` 和 `/home/ubuntu` 分别改为 `ec2-user` 和 `/home/ec2-user`：
+所有院校云端排版需要的 Dayipaper PAT 放入 `deploy/secrets/dayipaper_pat`；Tabword 服务需要独立 API Key，放入 `deploy/secrets/tabword_api_key`。本地密钥通过 PowerShell `scp` 单独传输，不进 GitHub。以下以 Ubuntu 为例，Amazon Linux 把 `ubuntu` 和 `/home/ubuntu` 分别改为 `ec2-user` 和 `/home/ec2-user`：
 
 ```powershell
 scp -i "C:\实际路径\EC2登录密钥.pem" "C:\实际路径\应用私钥.pem" ubuntu@<弹性IP>:/home/ubuntu/alipay_app_private_key.pem
@@ -157,7 +161,7 @@ sudo install -o 10001 -g 10001 -m 600 /home/ubuntu/alipay_platform_public_key.pe
 rm /home/ubuntu/alipay_app_private_key.pem /home/ubuntu/alipay_platform_public_key.pem
 ```
 
-支付宝先保持关闭。确认当面付和商户权限已开通、网站 HTTPS 已正常，再把应用私钥和支付宝平台公钥分别作为 PEM 文件放在：
+支付宝先保持关闭。确认电脑网站支付签约生效并绑定当前应用、网站 HTTPS 已正常，再把应用私钥和支付宝平台公钥分别作为 PEM 文件放在：
 
 ```text
 deploy/secrets/alipay_app_private_key.pem
@@ -182,20 +186,21 @@ sudo docker compose logs --tail=100 app caddy
 curl -fsS https://lunwenpaiban.dpdns.org/api/health
 ```
 
-首次 build 会下载 Python 依赖、LibreOffice、XeLaTeX 和中文字体，可能需要一段时间。等待 `app` 状态显示 `healthy`、`caddy` 显示运行中，再用浏览器打开 [https://lunwenpaiban.dpdns.org](https://lunwenpaiban.dpdns.org)。默认公开访问，不会要求 Basic Auth。Caddy 会自动申请 HTTPS 证书；若无法连接，检查 Cloudflare A 记录是否指向弹性 IP，以及安全组是否允许 TCP 80/443。
+首次 build 会下载 Python 基础镜像及应用依赖。等待 `app` 状态显示 `healthy`、`caddy` 显示运行中，再用浏览器打开 [https://lunwenpaiban.dpdns.org](https://lunwenpaiban.dpdns.org)。默认公开访问，不会要求 Basic Auth。Caddy 会自动申请 HTTPS 证书；若无法连接，检查 Cloudflare A 记录是否指向弹性 IP，以及安全组是否允许 TCP 80/443。
 
-PDF 预览仍免费。Word 下载在支付宝配置完整并收到匹配的支付通知前会被拒绝。确认当面付权限、商户号及密钥等条件后，才在 EC2 的 `.env` 设置：
+PDF 预览仍免费。Word 下载在支付宝配置完整并收到匹配的支付通知前会被拒绝。确认电脑网站支付权限、商户号及密钥等条件后，才在 EC2 的 `.env` 设置：
 
 ```dotenv
 ALIPAY_ENABLED=true
 ALIPAY_APP_ID=2021007108658866
 ALIPAY_SELLER_ID=<支付宝商户PID>
 ALIPAY_NOTIFY_URL=https://lunwenpaiban.dpdns.org/api/alipay/notify
+ALIPAY_RETURN_URL=https://lunwenpaiban.dpdns.org/
 ALIPAY_MODE=production
 THESIS_FORMAT_PRICE_CENTS=2999
 ```
 
-保存后在 EC2 项目目录执行 `sudo docker compose up -d` 使配置生效。若当面付尚未开通或商户 ID、密钥不匹配，支付宝无法创建正式订单；代码不会绕过付款。
+保存后在 EC2 项目目录执行 `sudo docker compose up -d` 使配置生效。若电脑网站支付尚未开通或商户 ID、密钥不匹配，支付宝无法创建正式订单；代码不会绕过付款。
 
 ### 7. 后续更新（本地电脑，再到 EC2）
 
@@ -224,9 +229,9 @@ sudo docker compose ps
 - `POST /api/format`：multipart file、ruleId、title、authorName 与可选元信息。
 - `GET /api/format/jobs/{id}`：进度、建议、预览及计费标记，不返回内部日志。
 - `GET /api/format/jobs/{id}/preview`：学校 PDF 或新获取的服务方预览地址。
-- `GET /api/format/jobs/{id}/download?fmt=1`：下载 Word 前需完成支付宝扫码支付；学校与云端排版均适用。海口经济学院 PDF 预览和下载免费（`fmt=2`）。
+- `GET /api/format/jobs/{id}/download?fmt=1`：下载 Word 前需完成支付宝电脑网站支付；具体收费以服务方及支付配置为准。
 
-规范 ID 使用 `school:hkjjxy`、`dayipaper:<id>` 命名空间。以后可在后端增加服务适配，继续复用统一任务、预览和下载交互。当前尚不是通用插件注册框架；其他功能 API 应按其实际输入、输出与计费规则增加独立适配。
+规范 ID 使用 `dayipaper:<id>` 命名空间；学校规范搜索和排版统一使用 Dayipaper 适配器。其他功能 API 按各自输入、输出和计费规则独立适配。
 
 ## 实测状态（2026-10-21）
 
@@ -245,8 +250,8 @@ PAT 本身有效。此前 401 是凭证读取代码把 `PAT=` 标签一并发送
 当前按用户要求只做本地请求校验，未提交真实任务、未产生费用。配置见 `.env.example`，需独立 Tabword API Key；不会沿用大以论文 PAT。环境变量必须显式设置，.env 不会自动加载。
 新版本本次运行在 http://127.0.0.1:8766/ ，原 8765 保留此前预览任务。26 个接口完成离线模拟验证，上线域名、真实鉴权和收费效果仍待正式接通时验证。
 
-## 支付宝扫码支付
+## 支付宝电脑网站支付
 
-排版完成后可通过支付宝当面付二维码购买 Word 导出，当前标价为 29.99 元，学校模板与云端排版均适用。PDF 预览免费。新用户减 10 元暂不启用，等接入登录后再按账户判断资格。
+排版完成后会打开支付宝电脑网站收银台购买 Word 导出，当前标价为 29.99 元。电脑端收银台可能由支付宝自行提供扫码入口，但本网站不再生成或展示二维码。PDF 预览免费。新用户减 10 元暂不启用，等接入登录后再按账户判断资格。
 
-正式配置项见 `.env.example`。应用只读取进程环境变量，不会自动加载 `.env` 文件。需先在支付宝开放平台开通当面付，并准备应用私钥、支付宝公钥、商户 ID 和可从公网访问的 HTTPS 异步通知地址。通知验签使用支付宝公钥，不是应用公钥。`ALIPAY_ENABLED` 默认为 `false`；配置完整后才允许创建订单。离线测试不创建支付宝订单；正式收款状态仍需在商户开放平台确认并联调。
+正式配置项见 `.env.example`。需在支付宝开放平台开通电脑网站支付并绑定当前应用，准备应用私钥、支付宝公钥、商户 ID、HTTPS 异步通知地址和支付完成返回地址。通知验签使用支付宝公钥，不是应用公钥。`ALIPAY_ENABLED` 默认为 `false`；配置完整后才允许创建订单。离线测试不创建支付宝订单；正式收款状态仍需在商户开放平台确认并联调。
