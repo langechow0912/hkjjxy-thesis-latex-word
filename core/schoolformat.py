@@ -49,6 +49,8 @@ def run(job, payload, cfg, meta):
                         str(cover), entries)
         job['stage'] = '生成 PDF 预览'
         pdf = compiler.convert_pdf(cfg, str(output), str(work), log=lambda *a: None)
+        from .preview_watermark import haikou_preview
+        pdf = haikou_preview(pdf, cfg.get('id'))
         job['files'] = {'docx': str(output), 'pdf': pdf}
         job['suggestions'] = ['请补全封面的学号、二级学院和日期，并核对目录、图表及分页。']
         job['stage'] = '排版完成'

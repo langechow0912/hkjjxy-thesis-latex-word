@@ -3,6 +3,15 @@
 This directory is bind-mounted read-only into the app container. Place only the
 credentials you intend the server to use here:
 
+- `affiliate_admin_pass` — independent management dashboard password. Set
+  `AFFILIATE_ADMIN_USER=admin` and
+  `AFFILIATE_ADMIN_PASS_FILE=/run/secrets/affiliate_admin_pass` in `.env`.
+  The host file is `deploy/secrets/affiliate_admin_pass`; Docker mounts it at
+  `/run/secrets/affiliate_admin_pass`. Use these exact lowercase directory and
+  file names: Linux paths are case-sensitive. Environment variable names stay
+  uppercase. `thesis_auth_pass` below protects the public site and is a separate
+  password. Local preview credentials under `.secrets/local-preview/` are
+  machine-specific and are not the server's Docker secret path.
 - `thesis_auth_pass` — optional HTTP Basic Auth password. Authentication is
   disabled by default; set `THESIS_REQUIRE_AUTH=true`, a username, and the
   `THESIS_AUTH_PASS_FILE` path in `.env` to enable it.
