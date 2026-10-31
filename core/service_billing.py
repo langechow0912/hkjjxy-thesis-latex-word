@@ -197,7 +197,12 @@ def admin_orders():
         pass
     with closing(connect()) as conn:
         rows = conn.execute("""SELECT q.id, q.operation, q.amount_cents, q.characters,
-            q.created_at,q.state,q.error,p.out_trade_no,p.status AS payment_status
+            q.created_at,q.state,q.error,p.out_trade_no,p.status AS payment_status,
+            p.affiliate_id,p.affiliate_code,p.affiliate_campaign,p.affiliate_bps,
+            a.name AS affiliate_name,a.email AS affiliate_email,
+            m.amount_cents AS commission_cents,m.status AS commission_status
             FROM service_quotes q LEFT JOIN payment_orders p ON p.job_id=q.id
+            LEFT JOIN affiliates a ON a.id=p.affiliate_id
+            LEFT JOIN affiliate_commissions m ON m.order_no=p.out_trade_no
             ORDER BY q.created_at DESC LIMIT 100""").fetchall()
     return [dict(row) for row in rows]

@@ -24,6 +24,8 @@
 """
 import argparse
 import base64
+import csv
+import io
 import ipaddress
 import os
 import re
@@ -328,6 +330,34 @@ def service_orders():
     _require_affiliate_admin()
     from core import service_billing
     return {'orders': service_billing.admin_orders()}
+
+
+@app.get('/api/admin/service-orders.csv')
+def service_orders_csv():
+    _require_affiliate_admin()
+    from core import service_billing
+    fields = ('订单号', '服务', '金额(元)', '字符数', '支付状态', '处理状态',
+              '推广员', '推广员邮箱', '推广码', '活动', '佣金(元)', '佣金状态', '创建时间')
+    output = io.StringIO(newline='')
+    writer = csv.writer(output)
+    writer.writerow(fields)
+    labels = {'detect_text': '文本检测', 'detect_file': '文件检测'}
+    states = {'ready': '待提交', 'processing': '处理中', 'submitted': '已提交',
+              'complete': '已完成', 'failed': '异常，待核查'}
+    for order in service_billing.admin_orders():
+        writer.writerow([
+            order.get('out_trade_no') or '', labels.get(order['operation'], '论文改写'),
+            f"{int(order['amount_cents'] or 0) / 100:.2f}", order.get('characters') or 0,
+            '已支付' if order.get('payment_status') == 'TRADE_SUCCESS' else '未支付',
+            states.get(order.get('state'), order.get('state') or ''),
+            order.get('affiliate_name') or '', order.get('affiliate_email') or '',
+            order.get('affiliate_code') or '', order.get('affiliate_campaign') or '',
+            f"{int(order['commission_cents'] or 0) / 100:.2f}",
+            order.get('commission_status') or '',
+            time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(order['created_at'])),
+        ])
+    return Response('\ufeff' + output.getvalue(), media_type='text/csv; charset=utf-8',
+                    headers={'Content-Disposition': 'attachment; filename="service-orders.csv"'})
 
 
 @app.put('/api/admin/service-prices')

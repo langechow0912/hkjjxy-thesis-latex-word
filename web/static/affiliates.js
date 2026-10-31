@@ -209,6 +209,15 @@ async function loadServiceOrders() {
     body.append(row);
   }
 }
+$('downloadServiceOrders').addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/admin/service-orders.csv', {headers: {Authorization: `Bearer ${adminToken}`}});
+    if (!response.ok) throw new Error('订单导出失败');
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob); const link = document.createElement('a');
+    link.href = url; link.download = 'service-orders.csv'; link.click(); URL.revokeObjectURL(url);
+  } catch (error) { alert(error.message); }
+});
 $('servicePriceForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = event.target.querySelector('button'); button.disabled = true;
