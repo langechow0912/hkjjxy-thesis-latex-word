@@ -778,6 +778,10 @@ def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关�
 
 @app.get('/api/format/rules')
 def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=1, le=20)):
+    query = q.strip().lower()
+    if 'hkjjxy' in query or '海口经济学院' in q:
+        return {'total': 1, 'items': [{'id': 'school:hkjjxy', 'name': '海口经济学院',
+                                       'provider': 'local'}]}
     result = api_dp_rules(q, size)
     # All schools, including Haikou Economics University, use the provider API.
     return {**result, 'items': [{**r, 'id': 'dayipaper:' + str(r['id']),
@@ -798,7 +802,8 @@ async def api_dp_format(file: UploadFile = File(...),
                         tutorNameEn: str = Form(""),
                         subjectName: str = Form(""),
                         subjectNameEn: str = Form("")):
-    if not dayipaper.has_token():
+    local_rule = ruleId.strip() in ('hkjjxy', 'school:hkjjxy')
+    if not local_rule and not dayipaper.has_token():
         raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
     if _cloud_running_count() >= MAX_CLOUD:
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
@@ -823,6 +828,16 @@ async def api_dp_format(file: UploadFile = File(...),
     if not all(meta.get(k) for k in ("title", "authorName", "ruleId")):
         raise HTTPException(400, "题目、作者名、规范 ID 都是必填")
 
+    if meta['ruleId'] in ('hkjjxy', 'school:hkjjxy'):
+        if suffix != '.docx':
+            raise HTTPException(400, '海口经济学院本地排版只收 .docx 源文件')
+        job = _new_job(kind='school')
+        job.update({'name': meta['title'], 'school_key': 'school:hkjjxy',
+                    'stage': '准备本地排版', 'status': None, 'statusLabel': '',
+                    'taskId': None, 'suggestions': [], 'preview': None, 'exported': False})
+        threading.Thread(target=_run_school, args=(job, data, meta), daemon=True).start()
+        return {'job': job['id'], 'title': meta['title']}
+
     school_key = meta['ruleId']
     if meta['ruleId'].startswith('dayipaper:'):
         meta['ruleId'] = meta['ruleId'].split(':', 1)[1]
@@ -841,6 +856,17 @@ async def api_dp_format(file: UploadFile = File(...),
                      args=(job, data, file.filename or "source.docx", meta),
                      daemon=True).start()
     return {"job": job["id"], "title": meta["title"]}
+
+
+def _run_school(job, payload, meta):
+    try:
+        from core import profile, schoolformat
+        cfg = schoolformat.validate('hkjjxy')
+        schoolformat.run(job, payload, cfg, meta)
+    except BaseException:
+        job['state'] = 'error'
+        job['stage'] = '本地排版失败'
+        job['log'].append(traceback.format_exc())
 
 
 def _run_cloud(job, payload, filename, meta):

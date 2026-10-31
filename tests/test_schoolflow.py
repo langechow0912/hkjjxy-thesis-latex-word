@@ -29,12 +29,10 @@ class SchoolRouting(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(web.app)
 
-    def test_haikou_search_uses_provider_api(self):
-        with patch.object(web.dayipaper, 'has_token', return_value=True), patch.object(
-                web.dayipaper, 'search_rules', return_value={'items': [{'id': 'hk-rule'}], 'total': 1}) as remote:
-            data = self.client.get('/api/format/rules', params={'q': '海口经济学院'}).json()
-            self.assertEqual(data['items'][0]['id'], 'dayipaper:hk-rule')
-            self.assertEqual(remote.call_args.args[0], '海口经济学院')
+    def test_haikou_search_uses_local_template(self):
+        data = self.client.get('/api/format/rules', params={'q': '海口经济学院'}).json()
+        self.assertEqual(data['items'][0]['id'], 'school:hkjjxy')
+        self.assertEqual(data['items'][0]['provider'], 'local')
 
     def test_other_school_gets_provider_namespace(self):
         with patch.object(web.dayipaper, 'has_token', return_value=True), patch.object(
@@ -42,17 +40,16 @@ class SchoolRouting(unittest.TestCase):
             data = self.client.get('/api/format/rules?q=other').json()
             self.assertEqual(data['items'][0]['id'], 'dayipaper:r')
 
-    def test_haikou_submission_uses_cloud_api(self):
-        with patch.object(web.dayipaper, 'has_token', return_value=True), patch.object(
-                web, '_run_cloud') as remote:
+    def test_haikou_submission_uses_local_template(self):
+        with patch.object(web, '_run_school') as local:
             response = self.client.post('/api/format', files={'file': ('paper.docx', b'input')},
-                data={'ruleId': 'dayipaper:hk-rule', 'title': 'Title', 'authorName': 'Author'})
+                data={'ruleId': 'school:hkjjxy', 'title': 'Title', 'authorName': 'Author'})
             self.assertEqual(response.status_code, 200)
             jid = response.json()['job']
             try:
-                self.assertEqual(web.JOBS[jid]['kind'], 'cloud')
-                remote.assert_called_once()
-                self.assertEqual(remote.call_args.args[3]['ruleId'], 'hk-rule')
+                self.assertEqual(web.JOBS[jid]['kind'], 'school')
+                local.assert_called_once()
+                self.assertEqual(local.call_args.args[2]['ruleId'], 'school:hkjjxy')
             finally:
                 job = web.JOBS.pop(jid)
                 shutil.rmtree(job['tmp'])

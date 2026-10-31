@@ -7,6 +7,15 @@ ENV LANG=C.UTF-8 \
     HOME=/home/thesis \
     TMPDIR=/data/tmp
 
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates fontconfig fonts-arphic-ukai fonts-arphic-uming \
+        fonts-liberation fonts-noto-cjk fonts-noto-core libreoffice-writer \
+        texlive-fonts-recommended texlive-lang-chinese texlive-latex-extra texlive-xetex \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 thesis \
     && useradd --uid 10001 --gid thesis --create-home --shell /usr/sbin/nologin thesis \
     && mkdir -p /app/core /app/web/static /app/schools /app/samples /data/tmp /data/cache \
@@ -15,7 +24,8 @@ RUN groupadd --gid 10001 thesis \
 WORKDIR /app
 
 COPY requirements.txt ./requirements.txt
-RUN python -m pip install --no-cache-dir --prefer-binary -r requirements.txt
+COPY requirements-local.txt ./requirements-local.txt
+RUN python -m pip install --no-cache-dir --prefer-binary -r requirements-local.txt
 
 COPY --chown=thesis:thesis core/ ./core/
 COPY --chown=thesis:thesis web/ ./web/
