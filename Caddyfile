@@ -12,5 +12,10 @@
 		-Server
 	}
 
-	reverse_proxy app:8000
+	# Keep the container hop on HTTP/1.1; the app's Uvicorn listener is HTTP/1 only.
+	reverse_proxy app:8000 {
+		transport http {
+			versions 1.1
+		}
+	}
 }
