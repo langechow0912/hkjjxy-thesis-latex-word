@@ -1,6 +1,7 @@
 FROM python:3.12-slim-bookworm
 
-ENV LANG=C.UTF-8 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,8 +9,14 @@ ENV LANG=C.UTF-8 \
     TMPDIR=/data/tmp
 
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && mkdir -p /data/tmp \
+    && printf 'force-unsafe-io\n' > /etc/dpkg/dpkg.cfg.d/01-force-unsafe-io \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=60 update \
+    && apt-get -y -o Acquire::Retries=5 -o Acquire::https::Timeout=60 --no-install-recommends --download-only install \
+        ca-certificates fontconfig fonts-arphic-ukai fonts-arphic-uming \
+        fonts-liberation fonts-noto-cjk fonts-noto-core libreoffice-writer \
+        texlive-fonts-recommended texlive-lang-chinese texlive-latex-extra texlive-xetex \
+    && apt-get -o Acquire::Retries=5 --no-install-recommends install -y \
         ca-certificates fontconfig fonts-arphic-ukai fonts-arphic-uming \
         fonts-liberation fonts-noto-cjk fonts-noto-core libreoffice-writer \
         texlive-fonts-recommended texlive-lang-chinese texlive-latex-extra texlive-xetex \
