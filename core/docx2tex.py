@@ -5,6 +5,7 @@
 
 识别规则：
   * 章节标题靠编号格式识别（1 / 1.1 / 1.1.1 / （1））；**没有编号的标题识别不出来**
+  * 原稿编号完整就沿用；有跳号、重号、节不属于当前章时，按出现顺序自动编号
   * 图表按「图/表 X-Y：题名」识别，编号重排为全文连续（图 1…N、表 1…N）
   * 参考文献取「参考文献」之后的连续段落，逐条 \\item
   * 封面信息表、声明页自动跳过（以摘要位置为界）
@@ -132,6 +133,47 @@ def _is_heading_line(s):
     return len(s) <= MAX_HEADING_LEN and "。" not in s and "；" not in s
 
 
+_SEC_LEVEL = {"sec1": 1, "sec2": 2, "sec3": 3}
+
+
+def _promote_chapter_title(blocks, chapter):
+    """遇到 X.Y 却还没见过第 X 章时，往回找被当成正文的「X 章题」并升格。
+
+    章题过长或带句读时 _is_heading_line() 会放过它，整章就并进了上一章。
+    只在上一个标题之后找，不跨标题。
+    """
+    for b in reversed(blocks):
+        if b["t"] in _SEC_LEVEL:
+            return
+        if b["t"] != "body":
+            continue
+        m = RE_H1.match(b["text"])
+        if m and int(m.group(1)) == chapter and len(b["text"]) <= 2 * MAX_HEADING_LEN:
+            b.update(t="sec1", text=m.group(2), src=(chapter,))
+            return
+
+
+def number_headings(blocks):
+    """原稿标题编号完整就沿用，否则按出现顺序自动编号。
+
+    完整 = 章从 1 起连续，节、小节在所属上级下从 1 起连续。这恰好等于按顺序
+    自动编出的号，所以两种情况 LaTeX 计数器给出的都是最终编号；这里只负责判断
+    并找出第一处错误。返回 ("user", None) 或 ("auto", 错误说明)。
+    """
+    cnt = [0, 0, 0]
+    for b in blocks:
+        lv = _SEC_LEVEL.get(b["t"])
+        if lv is None:
+            continue
+        cnt[lv - 1] += 1
+        cnt[lv:] = [0] * (3 - lv)
+        want = tuple(cnt[:lv])
+        if b["src"] != want:
+            return "auto", "「%s %s」按顺序应为 %s" % (
+                ".".join(map(str, b["src"])), b["text"], ".".join(map(str, want)))
+    return "user", None
+
+
 def _superscripts(s):
     """正文里的 [1] / [1,2] → \\textsuperscript{[1]}"""
     return RE_CITE.sub(lambda m: r"\textsuperscript{[%s]}" % m.group(1), s)
@@ -234,17 +276,22 @@ def scan(items, marks, figmap):
             continue
 
         # ---------- 标题 ----------
+        # src 记下原稿写的编号，number_headings() 据此判断沿用原稿还是自动编号。
         if pno >= body_start:
             m3 = RE_H3.match(t)
             m2 = RE_H2.match(t)
             m1 = RE_H1.match(t)
             m4 = RE_H4.match(t)
             if m3:
-                blocks.append({"t": "sec3", "text": m3.group(4)})
+                src = tuple(int(x) for x in m3.group(1, 2, 3))
+                _promote_chapter_title(blocks, src[0])
+                blocks.append({"t": "sec3", "text": m3.group(4), "src": src})
             elif m2:
-                blocks.append({"t": "sec2", "text": m2.group(3)})
+                src = tuple(int(x) for x in m2.group(1, 2))
+                _promote_chapter_title(blocks, src[0])
+                blocks.append({"t": "sec2", "text": m2.group(3), "src": src})
             elif m1 and _is_heading_line(t):
-                blocks.append({"t": "sec1", "text": m1.group(2)})
+                blocks.append({"t": "sec1", "text": m1.group(2), "src": (int(m1.group(1)),)})
             elif m4 and len(m4.group(2)) <= 26:
                 blocks.append({"t": "sec4", "text": m4.group(2)})
             elif t:
@@ -365,6 +412,9 @@ def convert(docx_path, out_dir, cfg=None, log=print):
     figmap, fig_order = extract_figures(docx_path, items, out_dir,
                                         marks["body_start"], log=log)
     blocks, refs, ack = scan(items, marks, figmap)
+    numbering, problem = number_headings(blocks)
+    if problem:
+        log("  标题编号有误（%s），已按顺序自动编号" % problem)
     meta = _meta(items, marks)
     tex = render(blocks, refs, ack, meta, cfg, figmap, fig_order)
     stat = {
@@ -375,6 +425,7 @@ def convert(docx_path, out_dir, cfg=None, log=print):
         "sec2": sum(1 for b in blocks if b["t"] == "sec2"),
         "sec3": sum(1 for b in blocks if b["t"] == "sec3"),
         "sec4": sum(1 for b in blocks if b["t"] == "sec4"),
+        "numbering": numbering,
         "title": meta["cn_title"],
     }
     return tex, stat
