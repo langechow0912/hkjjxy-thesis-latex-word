@@ -135,6 +135,8 @@ THESIS_MAX_JOBS=1
 ALIPAY_ENABLED=false
 ```
 
+多台服务器使用同一个仓库，不要另外复制一份代码；差异只写在各自的 `.env` 里。`THESIS_LOCAL_FORMAT=true` 时海口经济学院走本地学校模板（镜像安装 LibreOffice，转换时内存占用较高，2 核 2G 服务器请设 `THESIS_MAX_JOBS=1`）；设为 `false` 时海口经济学院也走云端规范，镜像不装 LibreOffice。修改这一项后需要 `docker compose up -d --build` 重新构建。
+
 保存 nano：按 `Ctrl+O`、Enter，再按 `Ctrl+X`。默认不启用网页口令，任何人都可以访问。`.env` 不提交 GitHub。
 
 ```bash

@@ -30,7 +30,8 @@ def create_payment(quote_id: str, request: Request):
     try:
         if not tabword.enabled('TABWORD_ENABLE_CALLS') or not tabword.api_key():
             raise tabword.TabwordError('处理服务暂未启用，暂不接受付款', 503)
-        order = billing.create_payment(quote_id, request.cookies.get('affiliate_ref'), request.cookies.get('affiliate_campaign', ''))
+        order = billing.create_payment(quote_id, request.cookies.get('affiliate_ref'), request.cookies.get('affiliate_campaign', ''),
+                                       resume_return=True)
         return {'order_id': order['out_trade_no'], 'amount_cents': order['amount_cents'],
                 'status': order['status'], 'checkout_url': f"/api/tabword/billing/{quote_id}/{order['out_trade_no']}/checkout"}
     except tabword.TabwordError as exc:
@@ -41,7 +42,7 @@ def create_payment(quote_id: str, request: Request):
 
 @router.get('/billing/{quote_id}/{order_id}')
 def payment_status(quote_id: str, order_id: str):
-    order = alipay.get_order(order_id, quote_id)
+    order = alipay.sync_order(order_id, quote_id)
     if not order or not quote_id.startswith('TW-'):
         raise HTTPException(404, '订单不存在')
     q = billing.get_quote(quote_id)

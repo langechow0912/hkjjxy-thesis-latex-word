@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const fields = ['title','authorName','titleEn','authorNameEn','tutorName','tutorNameEn','subjectName','subjectNameEn','subTitle','subTitleEn'];
 let selectedRule = null, searchTimer = null, searchVersion = 0, composing = false;
 let selectedFile = null, busy = false, searching = false, job = null, timer = null;
-let paymentJob = null, paymentOrder = null, paymentTimer = null;
+let paymentJob = null, paymentOrder = null, paymentTimer = null, finished = false, autoTitle = '';
 function message(text, kind = '') { $('msg').textContent = text; $('msg').className = 'msg ' + kind; }
 function controls() {
   for (const id of [...fields, 'query','drop']) $(id).disabled = busy;
@@ -13,10 +13,14 @@ function controls() {
   $('bar').hidden = !busy;
   $('result').setAttribute('aria-busy', String(busy));
 }
-function clearResult() {
+// A finished (possibly paid) result stays on screen until the user submits a new
+// paper; editing fields, searching or choosing a file must not discard the order.
+function clearResult(force = false) {
+  if (finished && !force) return;
+  finished = false;
   clearTimeout(timer); job = null; $('files').replaceChildren(); $('summary').replaceChildren();
   clearTimeout(paymentTimer); paymentJob = null; paymentOrder = null; $('paymentPanel').hidden = true;
-  sessionStorage.removeItem('thesisPaymentOrder');
+  sessionStorage.removeItem('thesisPaymentOrder'); sessionStorage.removeItem('thesisJob');
   $('summary').hidden = true; $('resume').hidden = true;
   $('state').textContent = selectedFile ? '待排版' : '待上传'; message('');
 }
@@ -24,11 +28,17 @@ async function request(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
-    const response = await fetch(url, {...options, signal:controller.signal});
+    let response;
+    try { response = await fetch(url, {...options, signal:controller.signal}); }
+    catch (error) {
+      throw new Error(error.name === 'AbortError' ? '请求超时（超过 2 分钟），请检查网络后重试。' : '网络连接失败，请检查网络后重试。');
+    }
     if (!response.ok) {
       const errors = {401:'排版服务拒绝了当前鉴权请求，请联系维护人员核对接口配置。',403:'排版服务未授权，请检查接口权限。',413:'文件过大，请压缩至 20 MB 以内。',429:'请求过于频繁，请稍后再试。',503:'排版服务暂不可用，请检查配置或稍后重试。'};
       const detail = await response.json().catch(() => ({}));
-      throw new Error(errors[response.status] || (typeof detail.detail === 'string' ? detail.detail : '请求未成功，请检查填写内容或稍后重试。'));
+      const error = new Error(typeof detail.detail === 'string' && detail.detail ? detail.detail : errors[response.status] || '请求未成功，请检查填写内容或稍后重试。');
+      error.status = response.status;
+      throw error;
     }
     return await response.json();
   } finally { clearTimeout(timeout); }
@@ -84,14 +94,20 @@ function selectFile(file) {
   else if (!file.size || file.size > 20 * 1024 * 1024) message('文件不能为空，且不能超过 20 MB。', 'error');
   else {
     selectedFile = file; $('filename').hidden = false; $('filename').textContent = file.name;
-    if (!$('title').value.trim()) $('title').value = file.name.replace(/\.(docx|doc)$/i, '');
+    // Follow the file name unless the user typed their own title.
+    const title = $('title').value.trim();
+    if (!title || title === autoTitle) { autoTitle = file.name.replace(/\.(docx|doc)$/i, ''); $('title').value = autoTitle; }
     $('state').textContent = '待排版'; message('稿件已选择，请核对题目、作者和排版规范。');
   }
   controls();
 }
 async function submit() {
   if ($('go').disabled) return;
-  busy = true; clearResult(); controls(); $('state').textContent = '提交中';
+  if (selectedRule.id === 'school:hkjjxy' && /\.doc$/i.test(selectedFile.name)) {
+    message('海口经济学院排版只支持 .docx。请在 Word 里“另存为 .docx”后重新上传。', 'error'); return;
+  }
+  if (paymentOrder && !confirm('开始新的排版会关闭当前结果。若当前论文已付款，请先下载 Word。确定继续？')) return;
+  busy = true; clearResult(true); controls(); $('state').textContent = '提交中';
   const data = new FormData(); data.append('file', selectedFile); data.append('ruleId', selectedRule.id);
   for (const id of fields) data.append(id, $(id).value.trim());
   message('正在上传稿件并提交排版…');
@@ -198,7 +214,11 @@ async function downloadPaid() {
     const response = await fetch(url);
     if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.detail || '下载失败，请稍后重试。'); }
     const blob = await response.blob(), objectUrl = URL.createObjectURL(blob);
-    const link = document.createElement('a'); link.href = objectUrl; link.download = '排版论文.docx'; link.click();
+    const disposition = response.headers.get('content-disposition') || '';
+    const encoded = /filename\*=utf-8''([^;]+)/i.exec(disposition), plain = /filename="([^"]+)"/i.exec(disposition);
+    let filename = ($('title').value.trim() || '排版论文') + '.docx';
+    try { if (encoded) filename = decodeURIComponent(encoded[1]); else if (plain) filename = plain[1]; } catch {}
+    const link = document.createElement('a'); link.href = objectUrl; link.download = filename; link.click();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
   } catch (error) { $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
@@ -226,8 +246,10 @@ async function poll() {
       timer = setTimeout(poll, 2000); return;
     }
     if (!['done','error'].includes(data.state)) throw new Error('任务状态异常。');
-    busy = false; controls(); $('resume').hidden = true; sessionStorage.removeItem('thesisJob');
-    if (data.state === 'error') { $('state').textContent = '排版失败'; message(data.stage || '稿件排版失败，请检查 Word 原稿或稍后重试。', 'error'); return; }
+    busy = false; controls(); $('resume').hidden = true;
+    if (data.state === 'error') { sessionStorage.removeItem('thesisJob'); $('state').textContent = '排版失败'; message(data.stage || '稿件排版失败，请检查 Word 原稿或稍后重试。', 'error'); return; }
+    // Keep thesisJob: after paying, a refresh or the Alipay return page must find this job again.
+    finished = true;
     $('state').textContent = '已完成'; message('排版完成，请先预览并核对建议，再导出 Word。', 'ok');
     $('files').replaceChildren();
     if (data.preview) {
@@ -253,7 +275,19 @@ async function poll() {
       $('summary').append(item);
     }
     $('summary').hidden = !suggestions.length;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('thesisPaymentOrder') || 'null');
+      if (saved?.job === completedJob) setupPayment(completedJob);
+    } catch { sessionStorage.removeItem('thesisPaymentOrder'); }
   } catch (e) {
+    if (e.status === 404) {
+      // The server no longer has this job; unlock the page instead of retrying forever.
+      const order = (() => { try { return JSON.parse(sessionStorage.getItem('thesisPaymentOrder') || 'null')?.orderId; } catch { return null; } })();
+      busy = false; finished = false; job = null; sessionStorage.removeItem('thesisJob'); controls();
+      $('resume').hidden = true; $('state').textContent = '任务已失效';
+      message('服务器上已找不到这个排版任务。' + (order ? `如已付款，请保留订单号 ${order} 联系客服处理，` : '') + '可以重新上传排版。', 'error');
+      return;
+    }
     $('bar').hidden = true; $('result').setAttribute('aria-busy','false'); $('state').textContent = '进度待确认'; $('resume').hidden = false;
     message(e.message + ' 点击继续查询进度，避免重复提交。', 'error');
   }
@@ -267,7 +301,7 @@ function routeHint() {
     ? '该规范由大以论文 API 提供，稿件将提交给服务方处理；导出计费前会单独确认。'
     : '请先选择院校规范。';
 }
-for (const id of fields) $(id).oninput = () => { if (!busy) clearResult(); controls(); };
+for (const id of fields) $(id).oninput = () => { if (!busy && !finished) clearResult(); controls(); };
 $('drop').onclick = () => $('file').click();
 $('file').onchange = e => { if (e.target.files[0]) selectFile(e.target.files[0]); };
 for (const event of ['dragenter','dragover']) $('drop').addEventListener(event, e => { e.preventDefault(); if (!busy) $('drop').classList.add('over'); });
@@ -279,6 +313,21 @@ $('paidDownload').onclick = downloadPaid;
 $('applyCoupon').onclick = applyCoupon;
 $('couponCode').addEventListener('input', () => { $('couponInfo').textContent = ''; });
 $('resume').onclick = () => { $('resume').hidden = true; controls(); poll(); };
+{
+  // Alipay returns to return_url?job=...&order=... in a new tab with empty sessionStorage.
+  const params = new URLSearchParams(location.search);
+  const returnedJob = params.get('job'), returnedOrder = params.get('order');
+  if (/^j[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')) {
+    sessionStorage.setItem('thesisJob', returnedJob);
+    sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:returnedJob, orderId:returnedOrder}));
+  }
+  // API service orders: the paid text/file lives in the tab that created the order.
+  if (/^TW-[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')
+      && sessionStorage.getItem('twPayment') === null) {
+    sessionStorage.setItem('twReturned', JSON.stringify({quote_id:returnedJob, order_id:returnedOrder}));
+  }
+  if (params.has('job') || params.has('out_trade_no')) history.replaceState(null, '', location.pathname);
+}
 job = sessionStorage.getItem('thesisJob');
 if (job) {
   let draft = null;
@@ -491,12 +540,41 @@ async function twAction(submit, polling = false) {
   } catch (error) { $('twMessage').textContent = error.message; }
   finally { twBusy = false; for (const id of ['twPrepare','twSubmit','twPoll','twEstimate']) $(id).disabled = false; }
 }
-let twPending = null, twPurchase = null;
+let twPending = null, twPurchase = null, twWatchTimer = null;
 try { twPending = JSON.parse(sessionStorage.getItem('twPayment') || 'null'); } catch {}
+// Poll the order after checkout opens; once Alipay confirms, start processing
+// without waiting for the user to come back and click.
+function twWatchPayment(started = Date.now()) {
+  clearTimeout(twWatchTimer);
+  const pending = twPending;
+  if (!pending?.order_id) return;
+  twWatchTimer = setTimeout(async () => {
+    if (twPending !== pending) return;
+    try {
+      const state = await request(`/api/tabword/billing/${pending.quote_id}/${pending.order_id}`);
+      if (twPending !== pending) return;
+      if (state.status === 'TRADE_SUCCESS') {
+        if (twBusy) { twWatchPayment(started); return; }
+        twRunPaid();
+        return;
+      }
+    } catch (error) {
+      if (error.status === 404) { $('twMessage').textContent = '订单不存在，请另建新任务。'; return; }
+    }
+    if (Date.now() - started > 20 * 60 * 1000) {
+      $('twMessage').textContent = '长时间未收到付款确认。如已付款，请点击“我已付款，开始处理”。';
+      return;
+    }
+    twWatchPayment(started);
+  }, 3000);
+}
 if (twPending) {
   $('twBilling').hidden = false;
-  $('twBillInfo').textContent = '有待处理的服务订单。页面刷新后请恢复原文、文件和选项，再确认付款状态。';
+  $('twBillInfo').textContent = `订单 ${twPending.order_id}：付款完成后会自动开始处理。` +
+    (twPending.fileName ? `购买的是文件处理，请重新选择文件「${twPending.fileName}」。` : '');
   if (twPending.checkout_url) { $('twCheckout').href = twPending.checkout_url; $('twCheckout').hidden = false; }
+  if (twPending.values?.text) $('twText').value = twPending.values.text;
+  twWatchPayment();
 }
 async function twBuy() {
   if (twBusy) return;
@@ -511,12 +589,15 @@ async function twBuy() {
     const quote = await response.json(); if (!response.ok) throw new Error(quote.detail || '计价失败');
     const payment = await request(`/api/tabword/billing/${quote.quote_id}/payment`, {method:'POST'});
     twPurchase = {operation, values, file};
-    twPending = {...payment, quote_id:quote.quote_id, operation};
+    // Keep the exact paid parameters: after a refresh the form may differ, and the
+    // server only accepts the content that was quoted.
+    twPending = {...payment, quote_id:quote.quote_id, operation, values, fileName:file ? file.name : ''};
     sessionStorage.setItem('twPayment', JSON.stringify(twPending));
     $('twBilling').hidden = false;
-    $('twBillInfo').textContent = `${operation.startsWith('detect') ? '检测' : '改写'}${quote.characters ? ` · ${quote.characters} 字符` : ''}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。订单号：${payment.order_id}。付款后点击“我已付款，开始处理”。`;
+    $('twBillInfo').textContent = `${operation.startsWith('detect') ? '检测' : '改写'}${quote.characters ? ` · ${quote.characters} 字符` : ''}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。订单号：${payment.order_id}。付款完成后本页会自动开始处理。`;
     $('twCheckout').href = payment.checkout_url; $('twCheckout').hidden = false;
-    $('twMessage').textContent = '订单已创建，尚未调用处理服务。';
+    $('twMessage').textContent = '订单已创建，等待支付宝付款…';
+    twWatchPayment();
   } catch (error) { $('twMessage').textContent = error.message; }
   finally { twBusy = false; $('twPrepare').disabled = false; }
 }
@@ -535,7 +616,14 @@ async function twRunPaid() {
     }
     if (state.task_id) { $('twTask').value = state.task_id; $('twTaskWrap').hidden = false; $('twMessage').textContent = '已提交，请查询任务结果。'; return; }
     if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请联系管理员核查。');
-    const purchase = twPurchase || {operation:$('twService').value, values:twPayload(), file:!$('twFileWrap').hidden ? $('twFile').files[0] || null : null};
+    let purchase = twPurchase;
+    if (!purchase && twPending.values) {
+      // After a refresh: reuse the stored parameters; only a file must be chosen again.
+      const file = twPending.fileName ? $('twFile').files[0] || null : null;
+      if (twPending.fileName && !file) throw new Error(`付款已确认。请重新选择购买时的文件「${twPending.fileName}」，再点击“我已付款，开始处理”。`);
+      purchase = {operation:twPending.operation, values:twPending.values, file};
+    }
+    if (!purchase) purchase = {operation:$('twService').value, values:twPayload(), file:!$('twFileWrap').hidden ? $('twFile').files[0] || null : null};
     if (purchase.operation !== twPending.operation) throw new Error('请恢复购买时的处理类型和选项。');
     $('twMessage').textContent = '付款已确认，正在处理，请勿关闭页面或重复提交…';
     twSetOutputEmpty();
@@ -548,7 +636,7 @@ $('twPaidRun').addEventListener('click', twRunPaid);
 $('twNewOrder').addEventListener('click', () => {
   if (twBusy) return;
   if (!confirm('另建新任务需重新付款。请确认已有订单已处理完毕；未完成的订单请保留订单号以便核查。')) return;
-  twPending = null; twPurchase = null; sessionStorage.removeItem('twPayment');
+  clearTimeout(twWatchTimer); twPending = null; twPurchase = null; sessionStorage.removeItem('twPayment');
   $('twBilling').hidden = true; $('twMessage').textContent = '可以创建新任务。';
 });
 async function twEstimate() {
@@ -628,6 +716,8 @@ fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); re
 function showWorkspace(view) {
   const format = view === 'format', detect = view === 'detect';
   $('formatPanel').hidden = !format; $('onlinePanel').hidden = format;
+  // The Word payment panel belongs to the formatting view only.
+  $('paymentPanel').hidden = !format || !paymentJob;
   const title = format ? '论文排版' : detect ? 'AIGC 检测' : '降重 / 降 AI';
   $('pageTitle').textContent = title; $('pageCrumb').textContent = title;
   $('pageLede').textContent = format ? '匹配院校规范，从初稿到成稿。' : detect ? '选择检测平台，查看论文的 AI 率报告。' : '按需选择降重或降 AI 模型，保留原意，整理表达。';
@@ -642,5 +732,16 @@ for (const link of document.querySelectorAll('.flow-step')) link.addEventListene
   for (const item of document.querySelectorAll('.flow-step')) item.classList.toggle('active', item === link);
 });
 twSetMode('reduce_ai');
-showWorkspace('format');
+{
+  let returned = null;
+  try { returned = JSON.parse(sessionStorage.getItem('twReturned') || 'null'); } catch {}
+  sessionStorage.removeItem('twReturned');
+  if (twPending && !sessionStorage.getItem('thesisJob')) {
+    showWorkspace(twPending.operation?.startsWith('detect') ? 'detect' : 'rewrite');
+  } else if (returned && !sessionStorage.getItem('thesisJob')) {
+    showWorkspace('rewrite');
+    $('twBilling').hidden = true;
+    $('twMessage').textContent = `订单 ${returned.order_id} 已从支付宝返回。请回到下单的那个页面，付款确认后那里会自动开始处理；如果那个页面已关闭，请保留订单号联系客服。`;
+  } else showWorkspace('format');
+}
 

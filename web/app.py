@@ -27,6 +27,7 @@ import base64
 import csv
 import io
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -107,15 +108,31 @@ if "*" not in ALLOWED_HOSTS:
 MAX_RUNNING = int(os.environ.get("THESIS_MAX_JOBS", "2") or 2)
 MAX_UPLOAD_MB = int(os.environ.get("THESIS_MAX_UPLOAD_MB", "20") or 20)
 KEEP_JOBS = int(os.environ.get("THESIS_KEEP_JOBS", "50") or 50)
+PAID_KEEP_DAYS = 30
 
 # ---- 云端排版通道（大易论文排版开放接口）----
 # PAT 只从环境变量 DAYIPAPER_PAT 读（core/dayipaper.py 每次调用现取），没配就整条通道不可用。
 # 云端任务不占 CPU（只是长轮询），所以并发上限和本地编译的 MAX_RUNNING 分开算，
 # 但它们同样受 KEEP_JOBS 回收策略管理。
 MAX_CLOUD = int(os.environ.get("THESIS_MAX_CLOUD_JOBS", "3") or 3)
+# 海口经济学院本地排版（LibreOffice）开关。小内存服务器可设为 false：
+# 这时海口经济学院也走云端规范，镜像可以不装 LibreOffice。
+LOCAL_FORMAT = os.environ.get("THESIS_LOCAL_FORMAT", "true").strip().lower() not in ("0", "false", "no", "off")
+LOCAL_SCHOOL = {"id": "school:hkjjxy", "name": "海口经济学院", "provider": "local"}
 # 轮询间隔对方有硬性下限：低于 1 秒会被风控拦，core/dayipaper.py 里还会再夹一次。
 CLOUD_POLL = float(os.environ.get("THESIS_CLOUD_POLL", "2") or 2)
 CLOUD_TIMEOUT = float(os.environ.get("THESIS_CLOUD_TIMEOUT", "900") or 900)
+
+
+def _basic_matches(header, user, password):
+    if not (user and password) or header[:6].lower() != "basic ":
+        return False
+    try:
+        raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
+    except Exception:
+        return False
+    got_user, _, got_pass = raw.partition(":")
+    return secrets.compare_digest(got_user, user) and secrets.compare_digest(got_pass, password)
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -130,15 +147,11 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                 or AffiliateAdminAuthMiddleware._is_admin_path(request.url.path)):
             return await call_next(request)
         header = request.headers.get("authorization", "")
-        ok = False
-        if header[:6].lower() == "basic ":
-            try:
-                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
-                user, _, pwd = raw.partition(":")
-                ok = (secrets.compare_digest(user, AUTH_USER)
-                      and secrets.compare_digest(pwd, AUTH_PASS))
-            except Exception:
-                ok = False
+        # The browser keeps only one Basic credential per origin and path. Accepting
+        # the admin credential here stops the site and admin prompts from alternating.
+        ok = (_basic_matches(header, AUTH_USER, AUTH_PASS)
+              or (AFFILIATE_ADMIN_ON
+                  and _basic_matches(header, AFFILIATE_ADMIN_USER, AFFILIATE_ADMIN_PASS)))
         if not ok:
             return self._denied()
         return await call_next(request)
@@ -163,15 +176,9 @@ class AffiliateAdminAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         ok = False
-        if AFFILIATE_ADMIN_ON and header[:6].lower() == "basic ":
-            try:
-                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
-                user, _, pwd = raw.partition(":")
-                ok = (secrets.compare_digest(user, AFFILIATE_ADMIN_USER)
-                      and secrets.compare_digest(pwd, AFFILIATE_ADMIN_PASS))
-            except Exception:
-                ok = False
-        elif header[:7].lower() == "bearer " and not AFFILIATE_ADMIN_ON:
+        if AFFILIATE_ADMIN_ON:
+            ok = _basic_matches(header, AFFILIATE_ADMIN_USER, AFFILIATE_ADMIN_PASS)
+        elif header[:7].lower() == "bearer ":
             ok = affiliates.authenticate_admin_token(header[7:].strip())
         if not ok:
             headers = ({"WWW-Authenticate": 'Basic realm="affiliate-admin", charset="UTF-8"'}
@@ -225,13 +232,56 @@ def _prepare_figures(work, school, tex, log):
 
 
 def _reap_jobs():
-    """只保留最近 KEEP_JOBS 个任务，顺手清掉临时目录，避免长时间在线后堆满磁盘。"""
+    """只保留最近 KEEP_JOBS 个任务，顺手清掉临时目录，避免长时间在线后堆满磁盘。
+
+    已付款的任务在 PAID_KEEP_DAYS 内不回收，否则用户付了钱却下载不到文件。
+    """
     if len(JOBS) <= KEEP_JOBS:
         return
-    oldest = sorted((j for j in JOBS.values() if j["state"] != "running"), key=lambda j: j.get("t", 0))[:len(JOBS) - KEEP_JOBS]
+    paid_since = time.time() - PAID_KEEP_DAYS * 86400
+    candidates = [j for j in JOBS.values() if j["state"] != "running"
+                  and not (j.get("t", 0) >= paid_since and alipay.job_paid(j["id"]))]
+    oldest = sorted(candidates, key=lambda j: j.get("t", 0))[:len(JOBS) - KEEP_JOBS]
     for job in oldest:
         JOBS.pop(job["id"], None)
         shutil.rmtree(job.get("tmp", ""), ignore_errors=True)
+
+
+# 任务只在内存里，服务重启（例如重新部署）后已付款的任务会丢失。
+# 完成的任务把元信息写进自己的临时目录，启动时扫描恢复。
+_JOB_FILE = "job.json"
+_PERSIST_KEYS = ("id", "kind", "state", "name", "school_key", "stage", "status", "statusLabel",
+                 "taskId", "suggestions", "files", "tmp", "t", "exported")
+
+
+def _save_job(job):
+    if job.get("state") != "done" or not job.get("tmp"):
+        return
+    data = {k: job.get(k) for k in _PERSIST_KEYS}
+    target = Path(job["tmp"]) / _JOB_FILE
+    try:
+        partial = target.with_suffix(".tmp")
+        partial.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(partial, target)
+    except OSError:
+        pass
+
+
+def _restore_jobs():
+    for path in Path(tempfile.gettempdir()).glob("thesis-web-*/" + _JOB_FILE):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (not isinstance(data, dict) or not re.fullmatch(r"j[0-9a-f]{32}", str(data.get("id")))
+                or data.get("kind") not in ("school", "cloud") or data.get("state") != "done"):
+            continue
+        data["tmp"] = str(path.parent)
+        data["log"] = []
+        data["files"] = {k: v for k, v in (data.get("files") or {}).items()
+                         if isinstance(v, str) and Path(v).is_file()
+                         and Path(v).resolve().parent == path.parent.resolve()}
+        JOBS.setdefault(data["id"], data)
 
 
 def sanitize(name, fallback="thesis"):
@@ -293,6 +343,9 @@ class WithdrawalUpdateReq(BaseModel):
     status: str
 
 
+_restore_jobs()
+
+
 def _new_job(kind="build"):
     with _LOCK:
         jid = "j" + secrets.token_hex(16)
@@ -341,9 +394,9 @@ def service_orders_csv():
     output = io.StringIO(newline='')
     writer = csv.writer(output)
     writer.writerow(fields)
-    labels = {'detect_text': '文本检测', 'detect_file': '文件检测'}
+    labels = {'detect_text': '文本检测', 'detect_file': '文件检测', 'format_export': '论文排版 Word 导出'}
     states = {'ready': '待提交', 'processing': '处理中', 'submitted': '已提交',
-              'complete': '已完成', 'failed': '异常，待核查'}
+              'complete': '已完成', 'failed': '异常，待核查', 'paid': '已付款，可下载'}
     for order in service_billing.admin_orders():
         writer.writerow([
             order.get('out_trade_no') or '', labels.get(order['operation'], '论文改写'),
@@ -391,13 +444,18 @@ def api_admin_auth_status():
 def api_admin_auth_register(request: Request, body: dict):
     if AFFILIATE_ADMIN_ON:
         raise HTTPException(409, "后台已使用服务器配置的管理员口令")
+    # Local only when the TCP peer is this machine AND no proxy reports an outside
+    # client. A tunnel (cloudflared) connects from loopback but forwards a public
+    # address, and a direct client could otherwise send a fake X-Forwarded-For.
+    def loopback(value):
+        value = value.strip()
+        try:
+            return value == "testclient" or ipaddress.ip_address(value).is_loopback
+        except ValueError:
+            return False
     peer = request.client.host if request.client else ""
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")
-    source = forwarded[-1].strip() if forwarded and forwarded[-1].strip() else peer
-    try:
-        local_request = source == "testclient" or ipaddress.ip_address(source).is_loopback
-    except ValueError:
-        local_request = False
+    forwarded = [part for part in request.headers.get("x-forwarded-for", "").split(",") if part.strip()]
+    local_request = loopback(peer) and all(loopback(part) for part in forwarded)
     if not local_request:
         raise HTTPException(403, "管理员注册仅允许从服务器本机完成")
     try:
@@ -692,6 +750,8 @@ def api_preview_coupon(job_id: str, body: CouponPreviewReq):
     if job.get("state") != "done":
         raise HTTPException(409, "排版任务尚未完成")
     price = alipay.public_status()["amount_cents"]
+    if price is None:
+        raise HTTPException(503, "支付宝支付尚未配置完成，暂不能使用优惠码")
     try:
         quote = affiliates.preview_coupon(body.code, job.get("school_key", ""), price)
     except ValueError as exc:
@@ -709,7 +769,7 @@ def api_create_payment(job_id: str, request: Request, body: PaymentCreateReq | N
                                     request.cookies.get("affiliate_ref"),
                                     request.cookies.get("affiliate_campaign", ""),
                                     body.coupon_code if body else "",
-                                    job.get("school_key", ""))
+                                    job.get("school_key", ""), resume_return=True)
     except alipay.AlipayError as exc:
         raise HTTPException(503, str(exc)) from None
     except ValueError as exc:
@@ -725,7 +785,7 @@ def api_create_payment(job_id: str, request: Request, body: PaymentCreateReq | N
 @app.get("/api/format/jobs/{job_id}/payment/{order_id}")
 def api_payment_status(job_id: str, order_id: str):
     _format_job(job_id)
-    order = alipay.get_order(order_id, job_id)
+    order = alipay.sync_order(order_id, job_id)
     if not order:
         raise HTTPException(404, "支付订单不存在")
     return {"order_id": order["out_trade_no"], "status": order["status"],
@@ -778,14 +838,26 @@ def api_dp_rules(q: str = Query(..., min_length=1, description="学校名或关�
 
 @app.get('/api/format/rules')
 def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=1, le=20)):
-    query = q.strip().lower()
-    if 'hkjjxy' in query or '海口经济学院' in q:
-        return {'total': 1, 'items': [{'id': 'school:hkjjxy', 'name': '海口经济学院',
-                                       'provider': 'local'}]}
+    query = re.sub(r'\s+', '', q).lower()
+    # 海口经济学院走本地学校模板（封面、声明、字体按学校规范）；"海口经济""海经"等
+    # 简称也必须命中，否则会落到云端通用规范，排出来没有学校封面。
+    if LOCAL_FORMAT and ('hkjjxy' in query or query.startswith('海口经济') or query in ('海口', '海经', '海经院')):
+        return {'total': 1, 'items': [dict(LOCAL_SCHOOL)]}
     result = api_dp_rules(q, size)
-    # All schools, including Haikou Economics University, use the provider API.
-    return {**result, 'items': [{**r, 'id': 'dayipaper:' + str(r['id']),
-                                'provider': 'dayipaper'} for r in result.get('items', [])]}
+    items = [{**r, 'id': 'dayipaper:' + str(r['id']), 'provider': 'dayipaper'}
+             for r in result.get('items', [])]
+    if LOCAL_FORMAT:
+        # 云端结果里出现的海口经济学院也换成本地模板：用户点的是"海口经济学院"就走本地。
+        haikou = [r for r in items if _is_haikou_rule(r)]
+        if haikou:
+            items = [dict(LOCAL_SCHOOL)] + [r for r in items if not _is_haikou_rule(r)]
+            return {**result, 'items': items, 'total': len(items)}
+    return {**result, 'items': items}
+
+
+def _is_haikou_rule(rule):
+    names = " ".join(str(rule.get(k) or "") for k in ("name", "targetSchoolName", "label"))
+    return "海口经济学院" in names
 
 
 @app.post("/api/format")
@@ -803,9 +875,13 @@ async def api_dp_format(file: UploadFile = File(...),
                         subjectName: str = Form(""),
                         subjectNameEn: str = Form("")):
     local_rule = ruleId.strip() in ('hkjjxy', 'school:hkjjxy')
+    if local_rule and not LOCAL_FORMAT:
+        raise HTTPException(400, "本服务器未开启海口经济学院本地排版，请重新搜索院校并选择云端规范")
     if not local_rule and not dayipaper.has_token():
         raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
-    if _cloud_running_count() >= MAX_CLOUD:
+    if local_rule and _running_count() >= MAX_RUNNING:
+        raise HTTPException(503, "当前排版任务较多，请稍后再提交")
+    if not local_rule and _cloud_running_count() >= MAX_CLOUD:
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
                             % (_cloud_running_count(), MAX_CLOUD))
 
@@ -863,6 +939,7 @@ def _run_school(job, payload, meta):
         from core import profile, schoolformat
         cfg = schoolformat.validate('hkjjxy')
         schoolformat.run(job, payload, cfg, meta)
+        _save_job(job)
     except BaseException:
         job['state'] = 'error'
         job['stage'] = '本地排版失败'
@@ -906,6 +983,7 @@ def _run_cloud(job, payload, filename, meta):
             log("有 %d 条排版建议，导出前建议先看一眼" % len(job["suggestions"]))
         job["stage"] = "排版完成（尚未导出；导出接口计费）"
         job["state"] = "done"
+        _save_job(job)
     except dayipaper.ApiError as exc:
         job["state"] = "error"
         job["stage"] = "失败"
@@ -966,7 +1044,7 @@ def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
             raise HTTPException(409, 'Word 尚未生成或格式不支持')
         if not alipay.public_status()["enabled"]:
             raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
-        order = alipay.get_order(payment_order, job_id)
+        order = alipay.sync_order(payment_order, job_id)
         if not order or order["status"] != "TRADE_SUCCESS":
             raise HTTPException(402, "请先完成支付宝电脑网站支付")
         return FileResponse(local['files']['docx'], filename=sanitize(local['name']) + '.docx')
@@ -976,7 +1054,7 @@ def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
     with export_lock:
         if not alipay.public_status()["enabled"]:
             raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
-        order = alipay.get_order(payment_order, job_id)
+        order = alipay.sync_order(payment_order, job_id)
         if not order or order["status"] != "TRADE_SUCCESS":
             raise HTTPException(402, "请先完成支付宝电脑网站支付")
         confirm = True
@@ -1003,9 +1081,10 @@ def _export_job(job, fmt, confirm):
     except dayipaper.ApiError as exc:
         job["log"].append("导出失败：%s" % exc)
         raise HTTPException(502, "导出失败，请稍后重试")
-    job["files"][kind] = path
+    job.setdefault("files", {})[kind] = path
     job["exported"] = True
     job["log"].append("已导出成品：%s" % os.path.basename(path))
+    _save_job(job)
     return FileResponse(path, filename=os.path.basename(path))
 
 
