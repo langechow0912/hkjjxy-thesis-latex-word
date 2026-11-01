@@ -24,6 +24,7 @@
 """
 import argparse
 import base64
+import contextlib
 import csv
 import io
 import ipaddress
@@ -59,7 +60,18 @@ except ImportError:                                       # pragma: no cover
     raise
 
 PRODUCTION = os.environ.get("THESIS_ENV", "").lower() == "production"
-app = FastAPI(title="毕业论文格式流水线",
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    # 每 SWEEP_INTERVAL 秒删一次过期成品；访问时另有即时检查，所以不必更频繁。
+    stop = threading.Event()
+    threading.Thread(target=_sweep, args=(stop,), daemon=True, name="result-sweeper").start()
+    yield
+    stop.set()
+
+
+app = FastAPI(title="毕业论文格式流水线", lifespan=_lifespan,
               docs_url=None if PRODUCTION else "/docs",
               redoc_url=None if PRODUCTION else "/redoc",
               openapi_url=None if PRODUCTION else "/openapi.json")
@@ -112,7 +124,6 @@ if "*" not in ALLOWED_HOSTS:
 MAX_RUNNING = int(os.environ.get("THESIS_MAX_JOBS", "2") or 2)
 MAX_UPLOAD_MB = int(os.environ.get("THESIS_MAX_UPLOAD_MB", "20") or 20)
 KEEP_JOBS = int(os.environ.get("THESIS_KEEP_JOBS", "50") or 50)
-PAID_KEEP_DAYS = 30
 
 # ---- 云端排版通道（大易论文排版开放接口）----
 # PAT 只从环境变量 DAYIPAPER_PAT 读（core/dayipaper.py 每次调用现取），没配就整条通道不可用。
@@ -235,20 +246,43 @@ def _prepare_figures(work, school, tex, log):
     return [r for r in refs if not (work / r).is_file()]
 
 
+def _drop_job(job):
+    JOBS.pop(job["id"], None)
+    shutil.rmtree(job.get("tmp", ""), ignore_errors=True)
+
+
 def _reap_jobs():
     """只保留最近 KEEP_JOBS 个任务，顺手清掉临时目录，避免长时间在线后堆满磁盘。
 
-    已付款的任务在 PAID_KEEP_DAYS 内不回收，否则用户付了钱却下载不到文件。
+    已付款的任务在付款后 alipay.RESULT_TTL 内不回收，否则用户付了钱却下载不到文件。
     """
     if len(JOBS) <= KEEP_JOBS:
         return
-    paid_since = time.time() - PAID_KEEP_DAYS * 86400
     candidates = [j for j in JOBS.values() if j["state"] != "running"
-                  and not (j.get("t", 0) >= paid_since and alipay.job_paid(j["id"]))]
+                  and not (alipay.job_paid(j["id"]) and not alipay.result_expired(j["id"]))]
     oldest = sorted(candidates, key=lambda j: j.get("t", 0))[:len(JOBS) - KEEP_JOBS]
     for job in oldest:
-        JOBS.pop(job["id"], None)
-        shutil.rmtree(job.get("tmp", ""), ignore_errors=True)
+        _drop_job(job)
+
+
+def _purge_expired():
+    """付款满 RESULT_TTL 的排版成品连同上传的原稿一起删除"""
+    for job in list(JOBS.values()):
+        if job["state"] != "running" and alipay.result_expired(job["id"]):
+            _drop_job(job)
+    from core import service_billing
+    service_billing.purge_expired()
+
+
+def _sweep(stop):
+    while not stop.wait(SWEEP_INTERVAL):
+        try:
+            _purge_expired()
+        except Exception:                       # 清理失败不能拖垮服务，下一轮再试
+            traceback.print_exc()
+
+
+SWEEP_INTERVAL = 600
 
 
 # 任务只在内存里，服务重启（例如重新部署）后已付款的任务会丢失。
@@ -400,7 +434,8 @@ def service_orders_csv():
     writer.writerow(fields)
     labels = {'detect_text': '文本检测', 'detect_file': '文件检测', 'format_export': '论文排版 Word 导出'}
     states = {'ready': '待提交', 'processing': '处理中', 'submitted': '已提交',
-              'complete': '已完成', 'failed': '异常，待核查', 'paid': '已付款，可下载'}
+              'complete': '已完成', 'failed': '异常，待核查', 'paid': '已付款，可下载',
+              'expired': '已完成，结果已过期删除'}
     for order in service_billing.admin_orders():
         writer.writerow([
             order.get('out_trade_no') or '', labels.get(order['operation'], '论文改写'),
@@ -722,8 +757,17 @@ def _dp_call(fn, *args, **kwargs):
         raise HTTPException(status, "排版服务请求失败，请检查配置或稍后重试")
 
 
-def _format_job(job_id):
+def _live_job(job_id):
+    """取任务；已付款满 RESULT_TTL 的当场删除并返回 410，不等定时清理"""
     job = JOBS.get(job_id)
+    if job and job["state"] != "running" and alipay.result_expired(job_id):
+        _drop_job(job)
+        raise HTTPException(410, "付款已超过 24 小时，排版成品已按规定删除")
+    return job
+
+
+def _format_job(job_id):
+    job = _live_job(job_id)
     if not job or job.get("kind") not in ("school", "cloud"):
         raise HTTPException(404, "排版任务不存在")
     return job
@@ -1017,7 +1061,7 @@ def api_dp_job(job_id: str):
 @app.get("/api/dayipaper/preview/{job_id}")
 def api_dp_preview(job_id: str):
     """现取一次状态再跳转：接口给的 pdfShareUrl 只有 3 分钟有效期，存下来会点开失败。"""
-    local = JOBS.get(job_id)
+    local = _live_job(job_id)
     if local and local.get('kind') == 'school':
         if 'pdf' not in local['files']:
             raise HTTPException(409, '预览尚未生成')
@@ -1041,7 +1085,7 @@ def api_dp_preview(job_id: str):
 def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
                     confirm: bool = Query(False, description="导出计费，必须显式确认"),
                     payment_order: str | None = Query(None)):
-    local = JOBS.get(job_id)
+    local = _live_job(job_id)
     if local and local.get('kind') == 'school':
         if fmt == 2:
             if 'pdf' not in local['files']:
@@ -1098,7 +1142,7 @@ def _export_job(job, fmt, confirm):
 
 @app.get("/api/format/jobs/{job_id}")
 def api_format_job(job_id: str):
-    job = JOBS.get(job_id)
+    job = _live_job(job_id)
     if not job or job.get('kind') not in ('school', 'cloud'):
         raise HTTPException(404, '排版任务不存在')
     return {"id": job["id"], "state": job["state"],

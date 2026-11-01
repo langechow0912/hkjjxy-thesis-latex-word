@@ -103,12 +103,39 @@ def quote(operation, values, file=None):
     return {"quote_id": identity, "amount_cents": amount, "characters": count, "prices": p}
 
 
+EXPIRED = "付款已超过 24 小时，结果已按规定删除"
+
+
 def get_quote(identity):
     with closing(connect()) as conn:
         row = conn.execute("SELECT * FROM service_quotes WHERE id=?", (identity,)).fetchone()
     if not row:
         raise tabword.TabwordError("服务订单不存在", 404)
-    return dict(row)
+    row = dict(row)
+    # Enforce the retention limit on every read, not only when the sweeper runs.
+    if row['state'] != 'expired' and alipay.result_expired(identity):
+        _expire(identity)
+        row.update(state='expired', result_json=None, result_sse=None)
+    return row
+
+
+def _expire(identity):
+    with closing(connect()) as conn, conn:
+        conn.execute("UPDATE service_quotes SET state='expired', result_json=NULL, result_sse=NULL WHERE id=?",
+                     (identity,))
+
+
+def purge_expired():
+    """删除付款满 RESULT_TTL 的改写 / 检测结果；订单和金额记录保留"""
+    cutoff = int(time.time()) - alipay.RESULT_TTL
+    with closing(alipay._connect()) as conn:
+        ids = [r[0] for r in conn.execute("""SELECT DISTINCT job_id FROM payment_orders WHERE job_id LIKE 'TW-%'
+            AND status='TRADE_SUCCESS' AND COALESCE(paid_at, created_at) < ?""", (cutoff,))]
+    with closing(connect()) as conn:
+        live = {r[0] for r in conn.execute("SELECT id FROM service_quotes WHERE state!='expired'")}
+    for identity in ids:
+        if identity in live:
+            _expire(identity)
 
 
 def create_payment(identity, referral=None, campaign='', resume_return=False):
@@ -132,6 +159,8 @@ def authorize(operation, values, file, order_id):
     if not order or not order['job_id'].startswith('TW-') or order['status'] != 'TRADE_SUCCESS':
         raise tabword.TabwordError("请先完成此服务的支付宝付款", 402)
     q = get_quote(order['job_id'])
+    if q['state'] == 'expired':
+        raise tabword.TabwordError(EXPIRED, 410)
     if order['amount_cents'] != q['amount_cents']:
         raise tabword.TabwordError("订单金额不匹配", 402)
     if operation in ('document_task', 'paraphrase_task'):

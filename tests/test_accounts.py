@@ -81,41 +81,63 @@ class AccountTests(unittest.TestCase):
         quote = self.client.post('/api/tabword/billing/quote', data={'operation': 'detect_text', 'params': '{}'})
         self.assertEqual(quote.status_code, 401)
 
-    def test_history_lists_only_own_uploads_and_unpaid_can_be_deleted(self):
-        self.register()
+    def upload(self, title='我的论文'):
         with patch.object(web, '_run_school'):
-            response = self.client.post('/api/format', files={'file': ('paper.docx', b'PK')},
-                                        data={'ruleId': 'school:hkjjxy', 'title': '我的论文', 'authorName': 'a',
-                                              'ruleLabel': '海口经济学院'})
-        jid = response.json()['job']
+            jid = self.client.post('/api/format', files={'file': ('paper.docx', b'PK')},
+                                   data={'ruleId': 'school:hkjjxy', 'title': title, 'authorName': 'a',
+                                         'ruleLabel': '海口经济学院'}).json()['job']
         self.addCleanup(lambda: shutil.rmtree(web.JOBS.pop(jid, {}).get('tmp', ''), ignore_errors=True))
+        web.JOBS[jid]['state'] = 'done'
+        return jid
+
+    def pay(self, ref, order='ORDER0001', paid_at=None):
+        paid_at = int(time.time()) if paid_at is None else paid_at
+        with closing(alipay._connect()) as conn, conn:
+            conn.execute("""INSERT INTO payment_orders (out_trade_no,job_id,amount_cents,status,qr_code,created_at,paid_at)
+                            VALUES (?,?,2999,'TRADE_SUCCESS','',?,?)""", (order, ref, paid_at, paid_at))
+
+    def test_history_lists_only_paid_uploads_of_this_account(self):
+        self.register()
+        jid = self.upload()
+        self.assertEqual(self.client.get('/api/account/history').json()['items'], [])
+        self.pay(jid)
         items = self.client.get('/api/account/history').json()['items']
-        self.assertEqual([(i['ref'], i['name'], i['detail'], i['paid']) for i in items],
-                         [(jid, '我的论文', '海口经济学院', False)])
+        self.assertEqual([(i['ref'], i['name'], i['detail'], i['order_id'], i['state']) for i in items],
+                         [(jid, '我的论文', '海口经济学院', 'ORDER0001', 'done')])
+        self.assertEqual(items[0]['expires_at'] - items[0]['paid_at'], alipay.RESULT_TTL)
 
         other = TestClient(web.app)
         other.post('/api/account/register', json={'username': name(), 'password': 'correct-horse'})
         self.assertEqual(other.get('/api/account/history').json()['items'], [])
-        self.assertEqual(other.delete('/api/account/history/' + jid).status_code, 404)
 
-        web.JOBS[jid]['state'] = 'done'
-        self.assertEqual(self.client.delete('/api/account/history/' + jid).status_code, 200)
-        self.assertNotIn(jid, web.JOBS)
-        self.assertEqual(self.client.get('/api/account/history').json()['items'], [])
+    def test_paid_text_service_is_listed(self):
+        user_id = self.register().json()['user']['id']
+        from core import service_billing
+        with patch.dict(os.environ, {'TABWORD_ENABLE_CALLS': 'true', 'TABWORD_API_KEY': 'offline-only'}):
+            quote = service_billing.quote('detect_text', {'text': '论文正文', 'task_platform': 'test'})
+        accounts.record_upload(user_id, 'tabword', quote['quote_id'], '论文正文', 'detect_text')
+        self.pay(quote['quote_id'], 'ORDER0002')
+        items = self.client.get('/api/account/history').json()['items']
+        self.assertEqual([(i['kind'], i['name'], i['detail']) for i in items], [('tabword', '论文正文', 'detect_text')])
 
-    def test_paid_upload_cannot_be_deleted(self):
+    def test_paid_results_are_deleted_after_24_hours(self):
         self.register()
-        with patch.object(web, '_run_school'):
-            jid = self.client.post('/api/format', files={'file': ('paper.docx', b'PK')},
-                                   data={'ruleId': 'school:hkjjxy', 'title': 't', 'authorName': 'a'}).json()['job']
-        self.addCleanup(lambda: shutil.rmtree(web.JOBS.pop(jid, {}).get('tmp', ''), ignore_errors=True))
-        web.JOBS[jid]['state'] = 'done'
-        with closing(alipay._connect()) as conn, conn:
-            conn.execute("""INSERT INTO payment_orders (out_trade_no,job_id,amount_cents,status,qr_code,created_at,paid_at)
-                            VALUES ('ORDER0001',?,2999,'TRADE_SUCCESS','',?,?)""", (jid, int(time.time()), int(time.time())))
-        item = self.client.get('/api/account/history').json()['items'][0]
-        self.assertEqual((item['paid'], item['order_id']), (True, 'ORDER0001'))
-        self.assertEqual(self.client.delete('/api/account/history/' + jid).status_code, 409)
+        jid = self.upload()
+        tmp = web.JOBS[jid]['tmp']
+        self.pay(jid, paid_at=int(time.time()) - alipay.RESULT_TTL - 1)
+        self.assertEqual(self.client.get('/api/account/history').json()['items'][0]['state'], 'expired')
+        self.assertEqual(self.client.get(f'/api/format/jobs/{jid}').status_code, 410)
+        self.assertNotIn(jid, web.JOBS)
+        self.assertFalse(os.path.exists(tmp))
+
+    def test_sweeper_deletes_expired_paid_results(self):
+        self.register()
+        fresh, old = self.upload('新'), self.upload('旧')
+        self.pay(fresh, 'ORDER0003')
+        self.pay(old, 'ORDER0004', paid_at=int(time.time()) - alipay.RESULT_TTL - 1)
+        web._purge_expired()
+        self.assertIn(fresh, web.JOBS)
+        self.assertNotIn(old, web.JOBS)
 
 
 if __name__ == '__main__':

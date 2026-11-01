@@ -102,6 +102,17 @@ class PaidDownloadTests(unittest.TestCase):
         self.assertEqual(restored["files"]["docx"], job["files"]["docx"])
         self.assertEqual(restored["state"], "done")
 
+    def test_paid_download_is_gone_after_24_hours(self):
+        order = alipay.create_order(self.job_id, "论文")
+        alipay._mark_paid(order["out_trade_no"], "T1")
+        tmp = web.JOBS[self.job_id]["tmp"]
+        with patch("core.alipay.time.time", return_value=__import__("time").time() + alipay.RESULT_TTL + 1):
+            response = self.client.get(f"/api/format/jobs/{self.job_id}/download",
+                                       params={"fmt": 1, "payment_order": order["out_trade_no"]})
+        self.assertEqual(response.status_code, 410)
+        self.assertNotIn(self.job_id, web.JOBS)
+        self.assertFalse(Path(tmp).exists())
+
     def test_paid_job_is_not_reaped(self):
         order = alipay.create_order(self.job_id, "论文")
         alipay._mark_paid(order["out_trade_no"], "T1")

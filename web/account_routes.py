@@ -2,8 +2,6 @@
 
 排版任务表 JOBS 在 web/app.py 里；为避免循环导入，app.py 启动时调用 bind() 传进来。
 """
-import shutil
-
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
@@ -69,41 +67,26 @@ def me(request: Request):
 
 
 def _entry(row):
+    """只列已付款的；付款满 RESULT_TTL 的标为 expired（文件和结果已删除）"""
     order = accounts.paid_order(row['ref'])
-    item = {**row, 'paid': bool(order), 'order_id': order}
-    if row['kind'] == 'format':
+    if not order:
+        return None
+    paid_at = alipay.paid_at(row['ref'])
+    item = {**row, 'order_id': order, 'paid_at': paid_at, 'expires_at': paid_at + alipay.RESULT_TTL}
+    if alipay.result_expired(row['ref']):
+        item['state'] = 'expired'
+    elif row['kind'] == 'format':
         job = _JOBS.get(row['ref'])
         item['state'] = job['state'] if job else 'expired'
-        return item
-    if not order:
-        return None             # 没付款的降重 / 检测报价只是一次询价，不算记录
-    try:
-        item['state'] = billing.get_quote(row['ref'])['state']
-    except tabword.TabwordError:
-        return None
+    else:
+        try:
+            item['state'] = billing.get_quote(row['ref'])['state']
+        except tabword.TabwordError:
+            return None
     return item
 
 
 @router.get('/history')
 def history(user=Depends(current_user)):
-    return {'items': [e for e in map(_entry, accounts.uploads(user['id'])) if e]}
-
-
-@router.delete('/history/{ref}')
-def delete_history(ref: str, user=Depends(current_user)):
-    row = accounts.get_upload(user['id'], ref)
-    if not row:
-        raise HTTPException(404, '记录不存在')
-    if accounts.paid_order(ref):
-        raise HTTPException(409, '已付款的记录不能删除')
-    if accounts.open_order(ref, alipay.ORDER_LIFETIME):
-        raise HTTPException(409, '这条记录有刚创建的付款订单，%d 分钟内不能删除' % (alipay.ORDER_LIFETIME // 60))
-    if row['kind'] == 'format':
-        job = _JOBS.get(ref)
-        if job and job['state'] == 'running':
-            raise HTTPException(409, '排版还在进行中，完成后再删除')
-        if job:
-            _JOBS.pop(ref, None)
-            shutil.rmtree(job.get('tmp', ''), ignore_errors=True)
-    accounts.delete_upload(user['id'], ref)
-    return {'ok': True}
+    return {'items': [e for e in map(_entry, accounts.uploads(user['id'])) if e],
+            'keep_hours': alipay.RESULT_TTL // 3600}

@@ -192,21 +192,9 @@ def get_upload(user_id, ref):
     return dict(row) if row else None
 
 
-def delete_upload(user_id, ref):
-    with closing(_connect()) as conn, conn:
-        conn.execute("DELETE FROM user_uploads WHERE user_id=? AND ref=?", (user_id, ref))
-
-
 def paid_order(ref):
     """该任务已付款的订单号；没付款返回 None"""
     with closing(alipay._connect()) as conn:
         row = conn.execute("""SELECT out_trade_no FROM payment_orders WHERE job_id=? AND status='TRADE_SUCCESS'
                               ORDER BY paid_at DESC LIMIT 1""", (ref,)).fetchone()
     return row["out_trade_no"] if row else None
-
-
-def open_order(ref, lifetime):
-    """该任务还在有效期内、尚未付款的订单（用户可能正在另一个标签页付款）"""
-    with closing(alipay._connect()) as conn:
-        return conn.execute("""SELECT 1 FROM payment_orders WHERE job_id=? AND status!='TRADE_SUCCESS'
-                               AND created_at>=? LIMIT 1""", (ref, int(time.time()) - lifetime)).fetchone() is not None

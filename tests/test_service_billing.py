@@ -2,6 +2,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -140,6 +141,28 @@ class ServiceBillingTests(unittest.TestCase):
             self.assertEqual(recovered.content, payload)
             self.assertEqual(self.dispatch('paraphrase_stream', values, order['out_trade_no']).status_code, 409)
             upstream.assert_called_once()
+
+    def test_paid_result_is_deleted_after_24_hours(self):
+        quote, order, values = self.purchase('paraphrase_stream', {'text': '正文', 'preset': 'a'})
+        self.paid(order)
+        with patch.object(tabword, 'stream_call', return_value=iter([b'event: done\ndata: {}\n\n'])):
+            self.dispatch('paraphrase_stream', values, order['out_trade_no'])
+        result = f"/api/tabword/billing/{quote['quote_id']}/{order['out_trade_no']}/result"
+        self.assertEqual(self.client.get(result).status_code, 200)
+        later = time.time() + alipay.RESULT_TTL + 1
+        with patch('core.alipay.time.time', return_value=later), patch('core.service_billing.time.time', return_value=later):
+            billing.purge_expired()
+            self.assertEqual(self.client.get(result).status_code, 410)
+        stored = billing.get_quote(quote['quote_id'])
+        self.assertEqual((stored['state'], stored['result_sse'], stored['result_json']), ('expired', None, None))
+
+    def test_paid_but_unused_order_cannot_run_after_24_hours(self):
+        quote, order, values = self.purchase()
+        self.paid(order)
+        with patch('core.alipay.time.time', return_value=time.time() + alipay.RESULT_TTL + 1), \
+             patch.object(tabword, 'call') as upstream:
+            self.assertEqual(self.dispatch('detect_text', values, order['out_trade_no']).status_code, 410)
+        upstream.assert_not_called()
 
     def test_failure_is_not_automatically_retryable_and_visible_to_admin(self):
         quote, order, values = self.purchase()

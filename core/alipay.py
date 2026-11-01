@@ -271,6 +271,23 @@ def job_paid(job_id):
                             (job_id,)).fetchone() is not None
 
 
+# 付款后的成品和处理结果只保存这么久，到期删除（用户隐私，也省磁盘）。订单本身一直保留。
+RESULT_TTL = 24 * 3600
+
+
+def paid_at(job_id):
+    """任务最早一笔付款的时间；没付款返回 None"""
+    with closing(_connect()) as conn:
+        row = conn.execute("""SELECT MIN(COALESCE(paid_at, created_at)) AS t FROM payment_orders
+                              WHERE job_id=? AND status='TRADE_SUCCESS'""", (job_id,)).fetchone()
+    return row["t"] if row else None
+
+
+def result_expired(job_id):
+    t = paid_at(job_id)
+    return t is not None and time.time() >= t + RESULT_TTL
+
+
 def checkout_url(order_no, job_id):
     order = get_order(order_no, job_id)
     if not config()["enabled"]:

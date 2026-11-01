@@ -67,6 +67,8 @@ def saved_result(quote_id: str, order_id: str):
         q = billing.get_quote(quote_id)
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
+    if q['state'] == 'expired':
+        raise HTTPException(410, billing.EXPIRED)
     headers = {'Cache-Control': 'no-store'}
     if q['result_sse']:
         return Response(q['result_sse'], media_type='text/event-stream', headers=headers)
