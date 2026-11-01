@@ -29,6 +29,25 @@ class AffiliateAdminTests(unittest.TestCase):
     def test_admin_shell_is_public_but_api_requires_a_token(self):
         self.assertEqual(self.client.get("/admin/affiliates").status_code, 200)
         self.assertEqual(self.client.get("/api/admin/affiliates").status_code, 401)
+        self.assertEqual(self.client.get("/api/admin/service-orders.csv").status_code, 401)
+
+    def test_service_order_csv_accepts_token_or_basic_auth(self):
+        token = self.client.post("/api/admin/auth/register", json={"name": "管理员"}).json()["access_token"]
+        token_response = self.client.get("/api/admin/service-orders.csv",
+                                         headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(token_response.status_code, 200)
+        self.assertIn("text/csv", token_response.headers["content-type"])
+        self.assertIn("推广员", token_response.content.decode("utf-8-sig"))
+
+        web.AFFILIATE_ADMIN_ON = True
+        try:
+            self.assertEqual(self.client.get("/api/admin/service-orders.csv",
+                                             headers={"Authorization": f"Bearer {token}"}).status_code, 401)
+            basic_response = self.client.get("/api/admin/service-orders.csv", auth=("admin", "secret"))
+            self.assertEqual(basic_response.status_code, 200)
+            self.assertIn("订单号", basic_response.content.decode("utf-8-sig"))
+        finally:
+            web.AFFILIATE_ADMIN_ON = False
 
     def test_local_first_admin_registration_issues_a_bearer_token_once(self):
         registered = self.client.post("/api/admin/auth/register", json={"name":"本地管理员"})

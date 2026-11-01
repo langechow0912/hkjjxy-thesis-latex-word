@@ -211,7 +211,8 @@ async function loadServiceOrders() {
 }
 $('downloadServiceOrders').addEventListener('click', async () => {
   try {
-    const response = await fetch('/api/admin/service-orders.csv', {headers: {Authorization: `Bearer ${adminToken}`}});
+    const headers = adminToken ? {Authorization: `Bearer ${adminToken}`} : {};
+    const response = await fetch('/api/admin/service-orders.csv', {headers});
     if (!response.ok) throw new Error('订单导出失败');
     const blob = await response.blob();
     const url = URL.createObjectURL(blob); const link = document.createElement('a');
@@ -285,6 +286,7 @@ async function showDashboard() {
 async function initializeAdmin() {
   const status = await fetch("/api/admin/auth/status").then((response) => response.json());
   if (status.mode === "basic") {
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY); adminToken = "";
     $("adminContent").hidden = false;
     await reload();
     return;
