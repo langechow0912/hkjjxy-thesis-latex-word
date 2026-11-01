@@ -1,8 +1,9 @@
 """Local preparation and gated execution for the allowlisted Tabword API."""
 import json
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, Response
-from core import tabword, alipay, service_billing as billing
+from core import accounts, tabword, alipay, service_billing as billing
+from web.account_routes import current_user
 
 router = APIRouter(prefix='/api/tabword')
 
@@ -13,20 +14,27 @@ def status():
 
 
 @router.post('/billing/quote')
-def price_quote(operation: str = Form(...), params: str = Form('{}'), file: UploadFile | None = File(None)):
+def price_quote(operation: str = Form(...), params: str = Form('{}'), file: UploadFile | None = File(None),
+                user=Depends(current_user)):
     try:
         try:
             values = json.loads(params)
         except ValueError:
             raise tabword.TabwordError('参数不是有效 JSON', 422)
         content = (file.filename or '', file.file.read(20*1024*1024+1)) if file else None
-        return billing.quote(operation, values, content)
+        quote = billing.quote(operation, values, content)
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
+    text = values.get('text') if isinstance(values, dict) else ''
+    name = content[0] if content else ' '.join(str(text or '').split())[:30] or '文本'
+    accounts.record_upload(user['id'], 'tabword', quote['quote_id'], name, operation)
+    return quote
 
 
 @router.post('/billing/{quote_id}/payment')
-def create_payment(quote_id: str, request: Request):
+def create_payment(quote_id: str, request: Request, user=Depends(current_user)):
+    if not accounts.get_upload(user['id'], quote_id):
+        raise HTTPException(404, '服务订单不存在')
     try:
         if not tabword.enabled('TABWORD_ENABLE_CALLS') or not tabword.api_key():
             raise tabword.TabwordError('处理服务暂未启用，暂不接受付款', 503)

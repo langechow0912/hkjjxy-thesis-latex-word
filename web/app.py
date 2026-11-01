@@ -43,12 +43,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import affiliates, alipay, dayipaper   # noqa: E402
+from core import accounts, affiliates, alipay, dayipaper   # noqa: E402
 from core.localconfig import load_pat
 load_pat(ROOT)
 
 try:
-    from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+    from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
     from pydantic import BaseModel
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -64,10 +64,14 @@ app = FastAPI(title="毕业论文格式流水线",
               redoc_url=None if PRODUCTION else "/redoc",
               openapi_url=None if PRODUCTION else "/openapi.json")
 from web.tabword_routes import router as tabword_router
+from web import account_routes
+from web.account_routes import current_user
 app.include_router(tabword_router)
+app.include_router(account_routes.router)
 STATIC = Path(__file__).resolve().parent / "static"
 
 JOBS = {}
+account_routes.bind(JOBS)
 _LOCK = threading.Lock()
 
 _BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -873,7 +877,9 @@ async def api_dp_format(file: UploadFile = File(...),
                         tutorName: str = Form(""),
                         tutorNameEn: str = Form(""),
                         subjectName: str = Form(""),
-                        subjectNameEn: str = Form("")):
+                        subjectNameEn: str = Form(""),
+                        ruleLabel: str = Form(""),
+                        user=Depends(current_user)):
     local_rule = ruleId.strip() in ('hkjjxy', 'school:hkjjxy')
     if local_rule and not LOCAL_FORMAT:
         raise HTTPException(400, "本服务器未开启海口经济学院本地排版，请重新搜索院校并选择云端规范")
@@ -911,6 +917,7 @@ async def api_dp_format(file: UploadFile = File(...),
         job.update({'name': meta['title'], 'school_key': 'school:hkjjxy',
                     'stage': '准备本地排版', 'status': None, 'statusLabel': '',
                     'taskId': None, 'suggestions': [], 'preview': None, 'exported': False})
+        accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip() or LOCAL_SCHOOL['name'])
         threading.Thread(target=_run_school, args=(job, data, meta), daemon=True).start()
         return {'job': job['id'], 'title': meta['title']}
 
@@ -928,6 +935,7 @@ async def api_dp_format(file: UploadFile = File(...),
                 "stage": "上传源文档", "status": None,
                 "statusLabel": "", "taskId": None, "suggestions": [],
                 "preview": None, "exported": False})
+    accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip())
     threading.Thread(target=_run_cloud,
                      args=(job, data, file.filename or "source.docx", meta),
                      daemon=True).start()
