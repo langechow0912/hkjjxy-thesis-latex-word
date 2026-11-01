@@ -103,15 +103,42 @@ def quote(operation, values, file=None):
     return {"quote_id": identity, "amount_cents": amount, "characters": count, "prices": p}
 
 
+EXPIRED = "付款已超过 24 小时，结果已按规定删除"
+
+
 def get_quote(identity):
     with closing(connect()) as conn:
         row = conn.execute("SELECT * FROM service_quotes WHERE id=?", (identity,)).fetchone()
     if not row:
         raise tabword.TabwordError("服务订单不存在", 404)
-    return dict(row)
+    row = dict(row)
+    # Enforce the retention limit on every read, not only when the sweeper runs.
+    if row['state'] != 'expired' and alipay.result_expired(identity):
+        _expire(identity)
+        row.update(state='expired', result_json=None, result_sse=None)
+    return row
 
 
-def create_payment(identity, referral=None, campaign=''):
+def _expire(identity):
+    with closing(connect()) as conn, conn:
+        conn.execute("UPDATE service_quotes SET state='expired', result_json=NULL, result_sse=NULL WHERE id=?",
+                     (identity,))
+
+
+def purge_expired():
+    """删除付款满 RESULT_TTL 的改写 / 检测结果；订单和金额记录保留"""
+    cutoff = int(time.time()) - alipay.RESULT_TTL
+    with closing(alipay._connect()) as conn:
+        ids = [r[0] for r in conn.execute("""SELECT DISTINCT job_id FROM payment_orders WHERE job_id LIKE 'TW-%'
+            AND status='TRADE_SUCCESS' AND COALESCE(paid_at, created_at) < ?""", (cutoff,))]
+    with closing(connect()) as conn:
+        live = {r[0] for r in conn.execute("SELECT id FROM service_quotes WHERE state!='expired'")}
+    for identity in ids:
+        if identity in live:
+            _expire(identity)
+
+
+def create_payment(identity, referral=None, campaign='', resume_return=False):
     q = get_quote(identity)
     if q['state'] != 'ready':
         raise tabword.TabwordError("该订单已提交处理，请勿再次购买", 409)
@@ -123,7 +150,8 @@ def create_payment(identity, referral=None, campaign=''):
         if not existing:
             raise tabword.TabwordError("报价已过期，请重新计价", 409)
     title = '文本检测' if q['operation'] == 'detect_text' else '文件检测' if q['operation'] == 'detect_file' else '论文改写'
-    return alipay.create_order(identity, title, referral, campaign, amount_cents=q['amount_cents'], subject_prefix='良品论文：')
+    return alipay.create_order(identity, title, referral, campaign, amount_cents=q['amount_cents'], subject_prefix='良品论文：',
+                               resume_return=resume_return)
 
 
 def authorize(operation, values, file, order_id):
@@ -131,6 +159,8 @@ def authorize(operation, values, file, order_id):
     if not order or not order['job_id'].startswith('TW-') or order['status'] != 'TRADE_SUCCESS':
         raise tabword.TabwordError("请先完成此服务的支付宝付款", 402)
     q = get_quote(order['job_id'])
+    if q['state'] == 'expired':
+        raise tabword.TabwordError(EXPIRED, 410)
     if order['amount_cents'] != q['amount_cents']:
         raise tabword.TabwordError("订单金额不匹配", 402)
     if operation in ('document_task', 'paraphrase_task'):
@@ -205,4 +235,20 @@ def admin_orders():
             LEFT JOIN affiliates a ON a.id=p.affiliate_id
             LEFT JOIN affiliate_commissions m ON m.order_no=p.out_trade_no
             ORDER BY q.created_at DESC LIMIT 100""").fetchall()
-    return [dict(row) for row in rows]
+        # Thesis-format Word exports are paid orders too; list them so a customer's
+        # "paid but nothing happened" can be looked up by order number.
+        exports = conn.execute("""SELECT p.job_id AS id, 'format_export' AS operation, p.amount_cents,
+            0 AS characters, p.created_at,
+            CASE WHEN p.status='TRADE_SUCCESS' THEN 'paid' ELSE 'ready' END AS state, NULL AS error,
+            p.out_trade_no, p.status AS payment_status,
+            p.affiliate_id,p.affiliate_code,p.affiliate_campaign,p.affiliate_bps,
+            a.name AS affiliate_name,a.email AS affiliate_email,
+            m.amount_cents AS commission_cents,m.status AS commission_status
+            FROM payment_orders p
+            LEFT JOIN affiliates a ON a.id=p.affiliate_id
+            LEFT JOIN affiliate_commissions m ON m.order_no=p.out_trade_no
+            WHERE p.job_id NOT LIKE 'TW-%'
+            ORDER BY p.created_at DESC LIMIT 100""").fetchall()
+    merged = sorted([dict(row) for row in rows] + [dict(row) for row in exports],
+                    key=lambda row: row['created_at'], reverse=True)
+    return merged[:100]

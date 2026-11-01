@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        THESIS_LOCAL_FORMAT: ${THESIS_LOCAL_FORMAT:-true}
     image: thesis-format:local
     restart: unless-stopped
     init: true
@@ -20,6 +22,7 @@ services:
       THESIS_KEEP_JOBS: ${THESIS_KEEP_JOBS:-50}
       THESIS_MAX_JOBS: ${THESIS_MAX_JOBS:-2}
       THESIS_MAX_CLOUD_JOBS: ${THESIS_MAX_CLOUD_JOBS:-3}
+      THESIS_LOCAL_FORMAT: ${THESIS_LOCAL_FORMAT:-true}
       TMPDIR: /data/tmp
       DAYIPAPER_PAT_FILE: /run/secrets/dayipaper_pat
       TABWORD_API_KEY_FILE: /run/secrets/tabword_api_key

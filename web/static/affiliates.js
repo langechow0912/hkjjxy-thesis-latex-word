@@ -10,6 +10,10 @@ function node(tag, text, className) {
   return el;
 }
 
+function authHeaders() {
+  return adminToken ? {Authorization: `Bearer ${adminToken}`} : {};
+}
+
 async function api(url, options = {}) {
   const headers = {"Content-Type": "application/json", ...(options.headers || {})};
   if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
@@ -143,7 +147,17 @@ async function loadWithdrawals() {
   for (const withdrawal of rows) {
     const tr = node("tr");
     const proof = node("td");
-    if (withdrawal.proof_path) { const a = node("a", "查看凭证"); a.href = `/api/admin/withdrawals/${withdrawal.id}/proof`; a.target = "_blank"; a.rel = "noreferrer"; proof.append(a); }
+    if (withdrawal.proof_path) {
+      // A plain link cannot send the admin token, so fetch the file and open it locally.
+      const view = actionButton("查看凭证", async () => {
+        const response = await fetch(`/api/admin/withdrawals/${withdrawal.id}/proof`, {headers: authHeaders()});
+        if (!response.ok) throw new Error("凭证读取失败");
+        const url = URL.createObjectURL(await response.blob());
+        window.open(url, "_blank", "noopener");
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      });
+      proof.append(view);
+    }
     else proof.textContent = "-";
     tr.append(node("td", `${withdrawal.affiliate_name} · ${withdrawal.affiliate_code}`),
       node("td", money(withdrawal.amount_cents)), node("td", withdrawal.payout_info),
@@ -163,11 +177,13 @@ async function loadWithdrawals() {
       const paid = node("button", "登记已转账", "btn"); paid.type = "button";
       paid.addEventListener("click", async () => {
         if (!ref.value.trim() || !file.files[0]) { alert("请填写流水号并选择凭证文件。"); return; }
-        const form = new FormData(); form.append("payout_ref", ref.value.trim()); form.append("proof", file.files[0]);
-        const response = await fetch(`/api/admin/withdrawals/${withdrawal.id}/paid`, {method:"POST",body:form});
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(result.detail || "登记失败");
-        await reload();
+        try {
+          const form = new FormData(); form.append("payout_ref", ref.value.trim()); form.append("proof", file.files[0]);
+          const response = await fetch(`/api/admin/withdrawals/${withdrawal.id}/paid`, {method:"POST",body:form,headers:authHeaders()});
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(result.detail || "登记失败");
+          await reload();
+        } catch (error) { alert(error.message); }
       });
       action.append(ref, file, paid);
     }
@@ -202,8 +218,8 @@ async function loadServiceOrders() {
   const body = $('serviceOrderRows'); body.replaceChildren();
   for (const order of result.orders) {
     const row = node('tr');
-    const service = ({detect_text:'文本检测',detect_file:'文件检测'})[order.operation] || '论文改写';
-    const state = ({ready:'待提交',processing:'处理中',submitted:'已提交',complete:'已完成',failed:'异常，待核查'})[order.state] || order.state;
+    const service = ({detect_text:'文本检测',detect_file:'文件检测',format_export:'论文排版 Word 导出'})[order.operation] || '论文改写';
+    const state = ({ready:'待提交',processing:'处理中',submitted:'已提交',complete:'已完成',failed:'异常，待核查',paid:'已付款，可下载'})[order.state] || order.state;
     row.append(node('td', order.out_trade_no || '未创建支付订单'), node('td',service), node('td',money(order.amount_cents)),
       node('td',String(order.characters)), node('td',order.payment_status === 'TRADE_SUCCESS' ? '已支付' : '未支付'), node('td',state));
     body.append(row);
@@ -211,8 +227,7 @@ async function loadServiceOrders() {
 }
 $('downloadServiceOrders').addEventListener('click', async () => {
   try {
-    const headers = adminToken ? {Authorization: `Bearer ${adminToken}`} : {};
-    const response = await fetch('/api/admin/service-orders.csv', {headers});
+    const response = await fetch('/api/admin/service-orders.csv', {headers: authHeaders()});
     if (!response.ok) throw new Error('订单导出失败');
     const blob = await response.blob();
     const url = URL.createObjectURL(blob); const link = document.createElement('a');
@@ -270,12 +285,11 @@ $("couponForm").addEventListener("submit", async (event) => {
   } catch (error) { setMessage($("couponMessage"), error.message, true); }
 });
 
-api("/api/schools").then((schools) => {
-  const list = $("schoolKeys");
-  for (const school of schools) {
-    const option = node("option"); option.value = `school:${school.id}`; option.label = school.name; list.append(option);
-  }
-}).catch(() => {});
+// Only /api/admin/* may be called here: any other path asks for the site login
+// (a different Basic realm) and the browser then alternates between both prompts.
+{
+  const option = node("option"); option.value = "school:hkjjxy"; option.label = "海口经济学院"; $("schoolKeys").append(option);
+}
 
 async function showDashboard() {
   $("adminAuth").hidden = true;

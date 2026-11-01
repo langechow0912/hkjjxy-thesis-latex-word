@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const fields = ['title','authorName','titleEn','authorNameEn','tutorName','tutorNameEn','subjectName','subjectNameEn','subTitle','subTitleEn'];
 let selectedRule = null, searchTimer = null, searchVersion = 0, composing = false;
 let selectedFile = null, busy = false, searching = false, job = null, timer = null;
-let paymentJob = null, paymentOrder = null, paymentTimer = null;
+let paymentJob = null, paymentOrder = null, paymentTimer = null, finished = false, autoTitle = '';
 function message(text, kind = '') { $('msg').textContent = text; $('msg').className = 'msg ' + kind; }
 function controls() {
   for (const id of [...fields, 'query','drop']) $(id).disabled = busy;
@@ -13,10 +13,14 @@ function controls() {
   $('bar').hidden = !busy;
   $('result').setAttribute('aria-busy', String(busy));
 }
-function clearResult() {
+// A finished (possibly paid) result stays on screen until the user submits a new
+// paper; editing fields, searching or choosing a file must not discard the order.
+function clearResult(force = false) {
+  if (finished && !force) return;
+  finished = false;
   clearTimeout(timer); job = null; $('files').replaceChildren(); $('summary').replaceChildren();
   clearTimeout(paymentTimer); paymentJob = null; paymentOrder = null; $('paymentPanel').hidden = true;
-  sessionStorage.removeItem('thesisPaymentOrder');
+  sessionStorage.removeItem('thesisPaymentOrder'); sessionStorage.removeItem('thesisJob');
   $('summary').hidden = true; $('resume').hidden = true;
   $('state').textContent = selectedFile ? '待排版' : '待上传'; message('');
 }
@@ -24,11 +28,21 @@ async function request(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
-    const response = await fetch(url, {...options, signal:controller.signal});
+    let response;
+    try { response = await fetch(url, {...options, signal:controller.signal}); }
+    catch (error) {
+      throw new Error(error.name === 'AbortError' ? '请求超时（超过 2 分钟），请检查网络后重试。' : '网络连接失败，请检查网络后重试。');
+    }
+    if (response.status === 401 && !url.startsWith('/api/account/')) {
+      // Login expired or never happened: ask for it instead of showing a raw error.
+      currentUser = null; renderAccount(); openLogin();
+    }
     if (!response.ok) {
-      const errors = {401:'排版服务拒绝了当前鉴权请求，请联系维护人员核对接口配置。',403:'排版服务未授权，请检查接口权限。',413:'文件过大，请压缩至 20 MB 以内。',429:'请求过于频繁，请稍后再试。',503:'排版服务暂不可用，请检查配置或稍后重试。'};
+      const errors = {401:'请先登录。',403:'排版服务未授权，请检查接口权限。',413:'文件过大，请压缩至 20 MB 以内。',429:'请求过于频繁，请稍后再试。',503:'排版服务暂不可用，请检查配置或稍后重试。'};
       const detail = await response.json().catch(() => ({}));
-      throw new Error(errors[response.status] || (typeof detail.detail === 'string' ? detail.detail : '请求未成功，请检查填写内容或稍后重试。'));
+      const error = new Error(typeof detail.detail === 'string' && detail.detail ? detail.detail : errors[response.status] || '请求未成功，请检查填写内容或稍后重试。');
+      error.status = response.status;
+      throw error;
     }
     return await response.json();
   } finally { clearTimeout(timeout); }
@@ -84,15 +98,22 @@ function selectFile(file) {
   else if (!file.size || file.size > 20 * 1024 * 1024) message('文件不能为空，且不能超过 20 MB。', 'error');
   else {
     selectedFile = file; $('filename').hidden = false; $('filename').textContent = file.name;
-    if (!$('title').value.trim()) $('title').value = file.name.replace(/\.(docx|doc)$/i, '');
+    // Follow the file name unless the user typed their own title.
+    const title = $('title').value.trim();
+    if (!title || title === autoTitle) { autoTitle = file.name.replace(/\.(docx|doc)$/i, ''); $('title').value = autoTitle; }
     $('state').textContent = '待排版'; message('稿件已选择，请核对题目、作者和排版规范。');
   }
   controls();
 }
 async function submit() {
-  if ($('go').disabled) return;
-  busy = true; clearResult(); controls(); $('state').textContent = '提交中';
+  if ($('go').disabled || !requireLogin(submit)) return;
+  if (selectedRule.id === 'school:hkjjxy' && /\.doc$/i.test(selectedFile.name)) {
+    message('海口经济学院排版只支持 .docx。请在 Word 里“另存为 .docx”后重新上传。', 'error'); return;
+  }
+  // The previous result (paid or not) stays in 我的记录, so no confirmation is needed.
+  busy = true; clearResult(true); controls(); $('state').textContent = '提交中';
   const data = new FormData(); data.append('file', selectedFile); data.append('ruleId', selectedRule.id);
+  data.append('ruleLabel', selectedRule.label || '');
   for (const id of fields) data.append(id, $(id).value.trim());
   message('正在上传稿件并提交排版…');
   try {
@@ -109,6 +130,33 @@ async function submit() {
     message(e.message + ' 若提交时网络中断，请先确认任务是否已创建，避免重复提交。', 'error');
   }
 }
+// 「付款」goes straight to Alipay. The tab is opened during the click itself (a
+// window opened after the order request would be blocked as a popup) and pointed
+// at the cashier once the order exists. This page stays open to watch the payment.
+function openPayWindow() {
+  const win = window.open('', '_blank');
+  if (!win) return null;
+  try {
+    win.opener = null;
+    win.document.title = '正在打开支付宝…';
+    win.document.body.innerHTML = '<p style="font:16px sans-serif;margin:40px;color:#555">正在打开支付宝收银台…</p>';
+  } catch {}
+  return win;
+}
+function sendToCheckout(win, url, link) {
+  link.href = url; link.hidden = false;
+  if (win && !win.closed) {
+    win.location.href = new URL(url, location.href).href;
+    link.classList.remove('blocked'); link.textContent = '没看到付款页？重新打开';
+    return true;
+  }
+  // Popup blocked: the fallback link becomes the main action.
+  link.classList.add('blocked'); link.textContent = '打开支付宝付款';
+  return false;
+}
+function closePayWindow(win) { try { if (win && !win.closed) win.close(); } catch {} }
+let formatPrice = 0;
+function formatPayLabel(cents = formatPrice) { $('createPayment').textContent = `支付宝付款 ¥${(cents / 100).toFixed(2)}`; }
 async function setupPayment(id) {
   clearTimeout(paymentTimer); paymentJob = id; paymentOrder = null;
   $('paymentPanel').hidden = false; $('paymentCheckout').hidden = true;
@@ -122,7 +170,8 @@ async function setupPayment(id) {
       $('paymentInfo').textContent = '支付宝支付尚未配置完成，暂不能下载 Word。';
       return;
     }
-    $('paymentInfo').textContent = `支付宝付款 ¥${(config.amount_cents / 100).toFixed(2)} 后导出成品`;
+    formatPrice = config.amount_cents; formatPayLabel();
+    $('paymentInfo').textContent = '付款后即可下载 Word 成品。成品保存 24 小时，到期自动删除。';
     $('couponControls').hidden = false;
     $('createPayment').hidden = false;
     const saved = sessionStorage.getItem('thesisPaymentOrder');
@@ -131,8 +180,9 @@ async function setupPayment(id) {
         const order = JSON.parse(saved);
         if (order.job === id && order.orderId) {
           paymentOrder = order.orderId;
-          $('paymentCheckout').href = `/api/format/jobs/${encodeURIComponent(id)}/payment/${encodeURIComponent(paymentOrder)}/checkout`;
-          $('paymentCheckout').hidden = false; $('createPayment').hidden = true;
+          // Restored after a refresh: no cashier tab was opened by this page, so the link is the main action.
+          sendToCheckout(null, `/api/format/jobs/${encodeURIComponent(id)}/payment/${encodeURIComponent(paymentOrder)}/checkout`, $('paymentCheckout'));
+          $('createPayment').hidden = true;
           $('couponCode').value = order.couponCode || '';
           $('couponCode').disabled = true; $('applyCoupon').disabled = true;
           checkPayment(id, paymentOrder);
@@ -145,27 +195,26 @@ async function setupPayment(id) {
 }
 async function createPayment() {
   if (!paymentJob) return;
-  const id = paymentJob, button = $('createPayment'); button.disabled = true;
-  $('paymentInfo').textContent = '正在创建支付宝订单…';
+  const id = paymentJob, button = $('createPayment'), win = openPayWindow(); button.disabled = true;
+  $('paymentInfo').textContent = '正在打开支付宝…';
   try {
     const result = await request(`/api/format/jobs/${encodeURIComponent(id)}/payment`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({coupon_code:$('couponCode').value.trim()}),
     });
-    if (paymentJob !== id) return;
+    if (paymentJob !== id) { closePayWindow(win); return; }
     paymentOrder = result.order_id;
     sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:id,orderId:paymentOrder,couponCode:result.coupon_code}));
     button.hidden = true;
-    $('paymentCheckout').href = result.checkout_url;
-    $('paymentCheckout').hidden = result.status === 'TRADE_SUCCESS';
     $('couponCode').disabled = true; $('applyCoupon').disabled = true;
-    const priceText = result.discount_cents
-      ? `原价 ¥${(result.list_price_cents / 100).toFixed(2)}，优惠 -¥${(result.discount_cents / 100).toFixed(2)}，应付 ¥${(result.amount_cents / 100).toFixed(2)}`
-      : `应付 ¥${(result.amount_cents / 100).toFixed(2)}`;
-    $('paymentInfo').textContent = `点击“前往支付宝付款”打开收银台，付款后回到本页下载。${priceText}`;
     if (result.coupon_code) $('couponInfo').textContent = `已使用优惠码 ${result.coupon_code}`;
+    const amount = `应付 ¥${(result.amount_cents / 100).toFixed(2)}`;
+    if (result.status === 'TRADE_SUCCESS') closePayWindow(win);
+    else $('paymentInfo').textContent = sendToCheckout(win, result.checkout_url, $('paymentCheckout'))
+      ? `已打开支付宝收银台（${amount}）。付款后回到本页，会自动出现下载按钮。`
+      : `浏览器拦截了付款页（${amount}），请点下面的按钮打开支付宝。`;
     checkPayment(id, paymentOrder);
-  } catch (error) { if (paymentJob === id) $('paymentInfo').textContent = error.message; }
+  } catch (error) { closePayWindow(win); if (paymentJob === id) $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
 }
 async function checkPayment(id, order) {
@@ -181,7 +230,7 @@ async function checkPayment(id, order) {
     if (state.expired) {
       $('paymentCheckout').hidden = true; $('createPayment').hidden = false;
       $('couponCode').disabled = false; $('applyCoupon').disabled = false;
-      $('paymentInfo').textContent = '订单已过期或支付方式已更新，请重新创建支付订单。';
+      $('paymentInfo').textContent = '付款页已超时，请重新点「支付宝付款」。';
       sessionStorage.removeItem('thesisPaymentOrder'); paymentOrder = null; return;
     }
   } catch (error) {
@@ -198,7 +247,11 @@ async function downloadPaid() {
     const response = await fetch(url);
     if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.detail || '下载失败，请稍后重试。'); }
     const blob = await response.blob(), objectUrl = URL.createObjectURL(blob);
-    const link = document.createElement('a'); link.href = objectUrl; link.download = '排版论文.docx'; link.click();
+    const disposition = response.headers.get('content-disposition') || '';
+    const encoded = /filename\*=utf-8''([^;]+)/i.exec(disposition), plain = /filename="([^"]+)"/i.exec(disposition);
+    let filename = ($('title').value.trim() || '排版论文') + '.docx';
+    try { if (encoded) filename = decodeURIComponent(encoded[1]); else if (plain) filename = plain[1]; } catch {}
+    const link = document.createElement('a'); link.href = objectUrl; link.download = filename; link.click();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
   } catch (error) { $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
@@ -214,6 +267,7 @@ async function applyCoupon() {
       body:JSON.stringify({code:$('couponCode').value.trim()}),
     });
     $('couponInfo').textContent = `${quote.coupon_code} 已应用：优惠 ¥${(quote.discount_cents / 100).toFixed(2)}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。`;
+    formatPayLabel(quote.amount_cents);
   } catch (error) { $('couponInfo').textContent = error.message; }
   finally { button.disabled = false; }
 }
@@ -226,8 +280,10 @@ async function poll() {
       timer = setTimeout(poll, 2000); return;
     }
     if (!['done','error'].includes(data.state)) throw new Error('任务状态异常。');
-    busy = false; controls(); $('resume').hidden = true; sessionStorage.removeItem('thesisJob');
-    if (data.state === 'error') { $('state').textContent = '排版失败'; message(data.stage || '稿件排版失败，请检查 Word 原稿或稍后重试。', 'error'); return; }
+    busy = false; controls(); $('resume').hidden = true;
+    if (data.state === 'error') { sessionStorage.removeItem('thesisJob'); $('state').textContent = '排版失败'; message(data.stage || '稿件排版失败，请检查 Word 原稿或稍后重试。', 'error'); return; }
+    // Keep thesisJob: after paying, a refresh or the Alipay return page must find this job again.
+    finished = true;
     $('state').textContent = '已完成'; message('排版完成，请先预览并核对建议，再导出 Word。', 'ok');
     $('files').replaceChildren();
     if (data.preview) {
@@ -253,7 +309,26 @@ async function poll() {
       $('summary').append(item);
     }
     $('summary').hidden = !suggestions.length;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('thesisPaymentOrder') || 'null');
+      if (saved?.job === completedJob) setupPayment(completedJob);
+    } catch { sessionStorage.removeItem('thesisPaymentOrder'); }
   } catch (e) {
+    if (e.status === 410) {
+      // Paid more than 24 hours ago: the server deleted the result by design.
+      busy = false; finished = false; job = null; controls();
+      for (const key of ['thesisJob','thesisPaymentOrder']) sessionStorage.removeItem(key);
+      $('resume').hidden = true; $('state').textContent = '已过期'; message(e.message, 'error');
+      return;
+    }
+    if (e.status === 404) {
+      // The server no longer has this job; unlock the page instead of retrying forever.
+      const order = (() => { try { return JSON.parse(sessionStorage.getItem('thesisPaymentOrder') || 'null')?.orderId; } catch { return null; } })();
+      busy = false; finished = false; job = null; sessionStorage.removeItem('thesisJob'); controls();
+      $('resume').hidden = true; $('state').textContent = '任务已失效';
+      message('服务器上已找不到这个排版任务。' + (order ? `如已付款，请保留订单号 ${order} 联系客服处理，` : '') + '可以重新上传排版。', 'error');
+      return;
+    }
     $('bar').hidden = true; $('result').setAttribute('aria-busy','false'); $('state').textContent = '进度待确认'; $('resume').hidden = false;
     message(e.message + ' 点击继续查询进度，避免重复提交。', 'error');
   }
@@ -267,18 +342,36 @@ function routeHint() {
     ? '该规范由大以论文 API 提供，稿件将提交给服务方处理；导出计费前会单独确认。'
     : '请先选择院校规范。';
 }
-for (const id of fields) $(id).oninput = () => { if (!busy) clearResult(); controls(); };
-$('drop').onclick = () => $('file').click();
+for (const id of fields) $(id).oninput = () => { if (!busy && !finished) clearResult(); controls(); };
+$('drop').onclick = () => { if (requireLogin(() => $('file').click())) $('file').click(); };
 $('file').onchange = e => { if (e.target.files[0]) selectFile(e.target.files[0]); };
 for (const event of ['dragenter','dragover']) $('drop').addEventListener(event, e => { e.preventDefault(); if (!busy) $('drop').classList.add('over'); });
 for (const event of ['dragleave','drop']) $('drop').addEventListener(event, e => { e.preventDefault(); $('drop').classList.remove('over'); });
-$('drop').addEventListener('drop', e => { if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]); });
+$('drop').addEventListener('drop', e => {
+  const file = e.dataTransfer.files[0];
+  if (file && requireLogin(() => selectFile(file))) selectFile(file);
+});
 $('go').onclick = submit;
 $('createPayment').onclick = createPayment;
 $('paidDownload').onclick = downloadPaid;
 $('applyCoupon').onclick = applyCoupon;
-$('couponCode').addEventListener('input', () => { $('couponInfo').textContent = ''; });
+$('couponCode').addEventListener('input', () => { $('couponInfo').textContent = ''; formatPayLabel(); });
 $('resume').onclick = () => { $('resume').hidden = true; controls(); poll(); };
+{
+  // Alipay returns to return_url?job=...&order=... in a new tab with empty sessionStorage.
+  const params = new URLSearchParams(location.search);
+  const returnedJob = params.get('job'), returnedOrder = params.get('order');
+  if (/^j[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')) {
+    sessionStorage.setItem('thesisJob', returnedJob);
+    sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:returnedJob, orderId:returnedOrder}));
+  }
+  // API service orders: the paid text/file lives in the tab that created the order.
+  if (/^TW-[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')
+      && sessionStorage.getItem('twPayment') === null) {
+    sessionStorage.setItem('twReturned', JSON.stringify({quote_id:returnedJob, order_id:returnedOrder}));
+  }
+  if (params.has('job') || params.has('out_trade_no')) history.replaceState(null, '', location.pathname);
+}
 job = sessionStorage.getItem('thesisJob');
 if (job) {
   let draft = null;
@@ -295,7 +388,7 @@ if (job) {
 
 // Tabword requests are sent upstream only after an explicit user action.
 let twConfig = null, twBusy = false;
-let twMode = 'reduce_ai', twInput = 'text', twLanguage = 'zh', twPlatform = '知网_zh';
+let twMode = 'reduce_ai', twLastRewrite = 'reduce_ai', twInput = 'text', twLanguage = 'zh', twPlatform = '知网_zh';
 const twPresetCache = new Map();
 const twModeDefaults = {
   reduce_duplicate: {
@@ -340,6 +433,12 @@ function twRenderModeCards() {
     const active = card.dataset.twMode === twMode;
     card.classList.toggle('selected', active);
     card.setAttribute('aria-pressed', String(active));
+    // The ✓ badge follows the selected card.
+    let check = card.querySelector('.tw-check');
+    if (active && !check) {
+      check = document.createElement('b'); check.className = 'tw-check'; check.setAttribute('aria-hidden', 'true');
+      check.textContent = '✓'; card.append(check);
+    } else if (!active && check) check.remove();
   }
 }
 function twRenderPlatformLanguage() {
@@ -359,6 +458,7 @@ function twRenderPlatformLanguage() {
 }
 function twSetMode(mode) {
   twMode = twModeDefaults[mode] ? mode : 'reduce_ai';
+  if (twMode !== 'detect') twLastRewrite = twMode;
   $('twMode').value = twMode;
   $('twService').value = twServiceForState();
   twRenderModeCards(); twPopulatePresets(); twChange();
@@ -389,12 +489,12 @@ function twChange() {
     const active = button.dataset.twInput === twInput;
     button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active));
   }
-  $('twPrepare').innerHTML = '计价并创建付款订单 <span aria-hidden="true">↗</span>';
   $('twSubmit').hidden = true;
   $('twEstimate').hidden = true;
   $('twTaskWrap').hidden = !$('twTask').value;
   twRenderModeCards(); twRenderPlatformLanguage();
   if (!twBusy) twSetOutputEmpty();
+  twRefresh();
 }
 function twPayload() {
   const service = $('twService').value;
@@ -485,72 +585,176 @@ async function twAction(submit, polling = false) {
   if (!polling) twSetOutputEmpty();
   try {
     const service = $('twService').value;
-    const operation = polling ? (twPending?.operation === 'document_async' ? 'document_task' : 'paraphrase_task') : service;
+    const operation = polling ? twTask?.task_operation || 'paraphrase_task' : service;
     const values = polling ? {task_id:$('twTask').value} : twPayload();
-    await twRequest(operation, values, submit, !polling, twPending?.order_id || '');
+    await twRequest(operation, values, submit, !polling, twTask?.order_id || '');
   } catch (error) { $('twMessage').textContent = error.message; }
   finally { twBusy = false; for (const id of ['twPrepare','twSubmit','twPoll','twEstimate']) $(id).disabled = false; }
 }
-let twPending = null, twPurchase = null;
-try { twPending = JSON.parse(sessionStorage.getItem('twPayment') || 'null'); } catch {}
-if (twPending) {
-  $('twBilling').hidden = false;
-  $('twBillInfo').textContent = '有待处理的服务订单。页面刷新后请恢复原文、文件和选项，再确认付款状态。';
-  if (twPending.checkout_url) { $('twCheckout').href = twPending.checkout_url; $('twCheckout').hidden = false; }
+// Orders follow the content: whatever the user selects, the next 「付款并开始」 creates
+// (or reuses) the matching order. An unpaid order is never deleted early: its Alipay
+// tab may still be open, so it is watched until Alipay expires it and, if paid, runs
+// with the content it was bought for.
+const TW_ORDER_LIFETIME = 15 * 60 * 1000, TW_ORDER_GRACE = 5 * 60 * 1000;
+let twOrders = [], twTask = null, twWatchTimer = null;
+const twFiles = new Map();
+try { twOrders = JSON.parse(sessionStorage.getItem('twOrders') || '[]').filter(o => o?.order_id); } catch {}
+function twSaveOrders() { sessionStorage.setItem('twOrders', JSON.stringify(twOrders)); }
+function twKey() {
+  const operation = $('twService').value, file = !$('twFileWrap').hidden ? $('twFile').files[0] || null : null;
+  return JSON.stringify([operation, twPayload(), file ? [file.name, file.size, file.lastModified] : null]);
+}
+function twOpen(order) { return !order.done && (order.paid || Date.now() - order.created < TW_ORDER_LIFETIME + TW_ORDER_GRACE); }
+function twCurrentOrder() {
+  const key = twKey();
+  return twOrders.find(order => order.key === key && twOpen(order) && (order.paid || Date.now() - order.created < TW_ORDER_LIFETIME)) || null;
+}
+function twShowOrder(order) {
+  $('twBilling').hidden = !order;
+  if (!order) return;
+  $('twBillInfo').textContent = order.paid
+    ? `订单 ${order.order_id} 已付款，正在处理。`
+    : `应付 ¥${(order.amount_cents / 100).toFixed(2)} · 订单 ${order.order_id}。在支付宝付款后，这里会自动开始处理。`;
+  // The cashier opens by itself; this link is only for a closed or blocked tab.
+  $('twCheckout').href = order.checkout_url || '#'; $('twCheckout').hidden = order.paid || !order.checkout_url;
+  if (!order.blocked) { $('twCheckout').classList.remove('blocked'); $('twCheckout').textContent = '没看到付款页？重新打开'; }
+  $('twPaidRun').hidden = !order.paid && !order.waiting;
+}
+function twRefresh() {
+  const p = twConfig?.prices, service = $('twService').value;
+  let price = '';
+  if (p && service === 'detect_text') price = ` ¥${(p.detect_text_cents / 100).toFixed(2)}`;
+  else if (p && service === 'detect_file') price = ` ¥${(p.detect_file_cents / 100).toFixed(2)}`;
+  else if (p && service === 'paraphrase_stream') {
+    const count = [...$('twText').value].filter(char => !/\s/.test(char)).length;
+    if (count) price = ` ¥${(Math.max(1, Math.ceil(count * p.rewrite_per_1000_cents / 1000)) / 100).toFixed(2)}`;
+  }
+  $('twPrepare').innerHTML = `付款${price}并开始 <span aria-hidden="true">↗</span>`;
+  if (!twBusy) twShowOrder(twCurrentOrder());
+}
+function twSendToCheckout(order, win) {
+  order.blocked = !sendToCheckout(win, order.checkout_url, $('twCheckout'));
+  twShowOrder(order);
+  if (order.blocked) { $('twCheckout').classList.add('blocked'); $('twCheckout').textContent = '打开支付宝付款'; }
+  $('twMessage').textContent = order.blocked
+    ? '浏览器拦截了付款页，请点「打开支付宝付款」。'
+    : '已打开支付宝收银台。付款后本页会自动开始处理，请不要关闭本页。';
 }
 async function twBuy() {
-  if (twBusy) return;
-  if (twPending) { $('twBilling').hidden = false; $('twMessage').textContent = '请先处理已有订单，或点击“另建新任务”。'; return; }
-  twBusy = true; $('twPrepare').disabled = true;
+  if (twBusy || !requireLogin(twBuy)) return;
+  const existing = twCurrentOrder();
+  if (existing) {
+    if (existing.paid) { twShowOrder(existing); $('twMessage').textContent = '这份内容已付款，正在处理。'; twRunPaid(existing); }
+    else twSendToCheckout(existing, openPayWindow());
+    return;
+  }
+  const operation = $('twService').value, values = twPayload();
+  const file = !$('twFileWrap').hidden ? $('twFile').files[0] || null : null;
+  const needsFile = operation === 'document_async' || operation === 'detect_file';
+  if (needsFile ? !file : !String(values.text || '').trim()) {
+    $('twMessage').textContent = needsFile ? '请先选择 Word 文档。' : '请先输入或粘贴要处理的文本。'; return;
+  }
+  const win = openPayWindow();
+  twBusy = true; $('twPrepare').disabled = true; $('twMessage').textContent = '正在打开支付宝…';
   try {
-    const operation = $('twService').value, values = twPayload();
-    const file = !$('twFileWrap').hidden ? $('twFile').files[0] || null : null;
+    const key = twKey();
     const body = new FormData(); body.append('operation', operation); body.append('params', JSON.stringify(values));
     if (file) body.append('file', file);
-    const response = await fetch('/api/tabword/billing/quote', {method:'POST', body});
-    const quote = await response.json(); if (!response.ok) throw new Error(quote.detail || '计价失败');
+    const quote = await request('/api/tabword/billing/quote', {method:'POST', body});
     const payment = await request(`/api/tabword/billing/${quote.quote_id}/payment`, {method:'POST'});
-    twPurchase = {operation, values, file};
-    twPending = {...payment, quote_id:quote.quote_id, operation};
-    sessionStorage.setItem('twPayment', JSON.stringify(twPending));
-    $('twBilling').hidden = false;
-    $('twBillInfo').textContent = `${operation.startsWith('detect') ? '检测' : '改写'}${quote.characters ? ` · ${quote.characters} 字符` : ''}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。订单号：${payment.order_id}。付款后点击“我已付款，开始处理”。`;
-    $('twCheckout').href = payment.checkout_url; $('twCheckout').hidden = false;
-    $('twMessage').textContent = '订单已创建，尚未调用处理服务。';
-  } catch (error) { $('twMessage').textContent = error.message; }
+    const order = {quote_id:quote.quote_id, order_id:payment.order_id, checkout_url:payment.checkout_url,
+      amount_cents:quote.amount_cents, operation, values, key, fileName:file ? file.name : '', created:Date.now(), paid:false, done:false};
+    if (file) twFiles.set(order.order_id, file);
+    twOrders = [...twOrders.filter(twOpen), order]; twSaveOrders();
+    twSendToCheckout(order, win);
+    twWatchPayment();
+  } catch (error) { closePayWindow(win); $('twMessage').textContent = error.message; }
   finally { twBusy = false; $('twPrepare').disabled = false; }
 }
-async function twRunPaid() {
-  if (twBusy || !twPending) return;
+function twWatchPayment() {
+  clearTimeout(twWatchTimer);
+  const before = twOrders.length;
+  twOrders = twOrders.filter(twOpen);
+  if (twOrders.length !== before) { twSaveOrders(); twRefresh(); }
+  const waiting = twOrders.filter(order => !order.paid || !order.waiting);
+  if (!waiting.length) return;
+  twWatchTimer = setTimeout(async () => {
+    for (const order of waiting) {
+      if (order.waiting) continue;
+      try {
+        const state = await request(`/api/tabword/billing/${order.quote_id}/${order.order_id}`);
+        if (state.status === 'TRADE_SUCCESS' && !twBusy) await twRunPaid(order);
+      } catch (error) {
+        if (error.status === 404) { order.done = true; twSaveOrders(); }
+      }
+    }
+    twWatchPayment();
+  }, 3000);
+}
+async function twRunPaid(order) {
+  if (twBusy || !order) return;
   twBusy = true; $('twPaidRun').disabled = true;
   try {
-    const state = await request(`/api/tabword/billing/${twPending.quote_id}/${twPending.order_id}`);
-    if (state.status !== 'TRADE_SUCCESS') throw new Error('尚未收到支付宝付款确认，请稍后重试。');
-    $('twCheckout').hidden = true;
+    const state = await request(`/api/tabword/billing/${order.quote_id}/${order.order_id}`);
+    if (state.status !== 'TRADE_SUCCESS') throw new Error('尚未收到支付宝付款确认，请稍后再点。');
+    order.paid = true; order.waiting = false; twSaveOrders();
+    // Show the page the order belongs to, even if the user has moved on.
+    const view = order.operation.startsWith('detect') ? 'detect' : 'rewrite';
+    if ($('onlinePanel').hidden || (view === 'detect') !== (twMode === 'detect')) showWorkspace(view);
+    twShowOrder(order);
+    if (state.service_state === 'expired') {
+      order.done = true; twSaveOrders(); $('twBilling').hidden = true;
+      throw new Error('付款已超过 24 小时，结果已按规定删除。');
+    }
     if (state.service_state === 'complete') {
       twSetOutputEmpty();
-      await twConsume(await fetch(`/api/tabword/billing/${twPending.quote_id}/${twPending.order_id}/result`));
-      $('twMessage').textContent = '已恢复已付款订单的结果，未重复调用处理服务。';
+      await twConsume(await fetch(`/api/tabword/billing/${order.quote_id}/${order.order_id}/result`));
+      order.done = true; twSaveOrders();
+      $('twBilling').hidden = true; $('twMessage').textContent = '已付款订单的结果已打开。';
       return;
     }
-    if (state.task_id) { $('twTask').value = state.task_id; $('twTaskWrap').hidden = false; $('twMessage').textContent = '已提交，请查询任务结果。'; return; }
-    if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请联系管理员核查。');
-    const purchase = twPurchase || {operation:$('twService').value, values:twPayload(), file:!$('twFileWrap').hidden ? $('twFile').files[0] || null : null};
-    if (purchase.operation !== twPending.operation) throw new Error('请恢复购买时的处理类型和选项。');
-    $('twMessage').textContent = '付款已确认，正在处理，请勿关闭页面或重复提交…';
-    twSetOutputEmpty();
-    await twRequest(purchase.operation, purchase.values, true, true, twPending.order_id, purchase.file);
-    $('twBillInfo').textContent = `订单 ${twPending.order_id} 已提交处理；新内容请另建新任务。`;
-  } catch (error) { $('twMessage').textContent = error.message; }
-  finally { twBusy = false; $('twPaidRun').disabled = false; }
+    if (state.task_id) {
+      twTask = {order_id:order.order_id, task_operation:state.task_operation || (order.operation === 'document_async' ? 'document_task' : 'paraphrase_task')};
+      $('twTask').value = state.task_id; $('twTaskWrap').hidden = false;
+      order.done = true; twSaveOrders();
+      $('twBilling').hidden = true; $('twMessage').textContent = '已提交处理，点「查询任务结果」查看进度。';
+      return;
+    }
+    if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请保留订单号联系客服。');
+    if (!order.values) throw new Error('付款已确认，但这个页面没有保存下单时的内容。请回到下单的页面，或保留订单号联系客服。');
+    let file = null;
+    if (order.fileName) {
+      file = twFiles.get(order.order_id) || null;
+      const chosen = $('twFile').files[0];
+      if (!file && chosen?.name === order.fileName) file = chosen;
+      if (!file) { order.waiting = true; throw new Error(`付款已确认。页面刷新过，请重新选择购买时的文件「${order.fileName}」，再点「已付款但没有开始？点这里」。`); }
+    }
+    $('twMessage').textContent = '付款已确认，正在处理，请勿关闭页面…';
+    twSetOutputEmpty(); $('twTask').value = ''; $('twTaskWrap').hidden = true;
+    order.waiting = true; twSaveOrders();     // the server marks it as processing now: never auto-retry
+    await twRequest(order.operation, order.values, true, true, order.order_id, file);
+    if (twTaskFrom(order)) return;
+    order.done = true; twSaveOrders();
+    $('twBilling').hidden = true;
+  } catch (error) {
+    // A paid order that failed waits for the user's click instead of retrying every 3 s.
+    if (order.paid) { order.waiting = true; twShowOrder(order); }
+    $('twMessage').textContent = error.message;
+  }
+  finally { twBusy = false; $('twPaidRun').disabled = false; twSaveOrders(); }
 }
-$('twPaidRun').addEventListener('click', twRunPaid);
-$('twNewOrder').addEventListener('click', () => {
-  if (twBusy) return;
-  if (!confirm('另建新任务需重新付款。请确认已有订单已处理完毕；未完成的订单请保留订单号以便核查。')) return;
-  twPending = null; twPurchase = null; sessionStorage.removeItem('twPayment');
-  $('twBilling').hidden = true; $('twMessage').textContent = '可以创建新任务。';
+function twTaskFrom(order) {
+  // Async document jobs return a task id; polling needs the order that paid for it.
+  if (!$('twTask').value) return false;
+  twTask = {order_id:order.order_id, task_operation:order.operation === 'document_async' ? 'document_task' : 'paraphrase_task'};
+  order.done = true; twSaveOrders(); $('twBilling').hidden = true;
+  return true;
+}
+$('twPaidRun').addEventListener('click', () => {
+  const order = twCurrentOrder() || twOrders.find(item => item.paid && !item.done) || twOrders[twOrders.length - 1];
+  if (order) { order.waiting = false; twRunPaid(order); }
 });
+if (twOrders.length) twWatchPayment();
 async function twEstimate() {
   if (twBusy || $('twFile').files.length === 0) { $('twMessage').textContent = '请先选择 Word 文档。'; return; }
   twBusy = true; $('twEstimate').disabled = true; $('twMessage').textContent = '正在本地准备费用估算请求…';
@@ -625,14 +829,32 @@ fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); re
   const p = data.prices;
   $('twPriceInfo').textContent = `文本检测 ¥${(p.detect_text_cents/100).toFixed(2)}/次 · 文件检测 ¥${(p.detect_file_cents/100).toFixed(2)}/次 · 改写 ¥${(p.rewrite_per_1000_cents/100).toFixed(2)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。`;
 }).catch(() => { $('twMessage').textContent = '服务配置加载失败。'; });
+// Any change to what will be bought updates the price and which order is shown.
+$('twText').addEventListener('input', twRefresh);
+for (const id of ['twFile','twPreset','twDetectionMode','twEnglish','twDiff','twDetectTitle','twDetectAuthor','twBrandTitle','twBrandSubtitle'])
+  $(id).addEventListener(id === 'twFile' || id === 'twPreset' || id === 'twDetectionMode' || id === 'twDiff' ? 'change' : 'input', twRefresh);
+for (const id of ['twPlatforms','twLanguage']) $(id).addEventListener('click', twRefresh);
+document.querySelector('label[for="twFile"]').addEventListener('click', event => {
+  if (!requireLogin(() => $('twFile').click())) event.preventDefault();
+});
 function showWorkspace(view) {
-  const format = view === 'format', detect = view === 'detect';
-  $('formatPanel').hidden = !format; $('onlinePanel').hidden = format;
-  const title = format ? '论文排版' : detect ? 'AIGC 检测' : '降重 / 降 AI';
+  const format = view === 'format', detect = view === 'detect', history = view === 'history';
+  $('formatPanel').hidden = !format; $('onlinePanel').hidden = format || history; $('historyPanel').hidden = !history;
+  // The Word payment panel belongs to the formatting view only.
+  $('paymentPanel').hidden = !format || !paymentJob;
+  const title = format ? '论文排版' : detect ? 'AIGC 检测' : history ? '我的记录' : '降重 / 降 AI';
   $('pageTitle').textContent = title; $('pageCrumb').textContent = title;
-  $('pageLede').textContent = format ? '匹配院校规范，从初稿到成稿。' : detect ? '选择检测平台，查看论文的 AI 率报告。' : '按需选择降重或降 AI 模型，保留原意，整理表达。';
+  $('pageLede').textContent = format ? '匹配院校规范，从初稿到成稿。' : detect ? '选择检测平台，查看论文的 AI 率报告。'
+    : history ? '登录后上传的论文和已付款的服务都在这里。' : '按需选择降重或降 AI 模型，保留原意，整理表达。';
   for (const button of document.querySelectorAll('[data-view]')) { const active = button.dataset.view === view; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current','page'); else button.removeAttribute('aria-current'); }
-  if (!format) { if (detect) twSetMode('detect'); else if (twMode === 'detect') twSetMode('reduce_ai'); else twChange(); }
+  if (history) { loadHistory(); return; }
+  if (format) return;
+  // AIGC 检测 and 降重 / 降 AI are separate pages: detection has no rewrite cards.
+  $('onlineTitle').textContent = detect ? 'AIGC 检测' : '降重 / 降 AI';
+  $('onlineSub').textContent = detect ? '选择检测平台，粘贴文本或上传 Word，付款后生成 AI 率报告' : '选择处理方式和模型，付款后开始改写';
+  $('twModeCards').hidden = detect;
+  if (!twBusy) $('twMessage').textContent = '';
+  twSetMode(detect ? 'detect' : twLastRewrite);
 }
 for (const button of document.querySelectorAll('[data-view]')) button.addEventListener('click', () => showWorkspace(button.dataset.view));
 for (const button of document.querySelectorAll('[data-school]')) button.addEventListener('click', () => {
@@ -641,6 +863,105 @@ for (const button of document.querySelectorAll('[data-school]')) button.addEvent
 for (const link of document.querySelectorAll('.flow-step')) link.addEventListener('click', () => {
   for (const item of document.querySelectorAll('.flow-step')) item.classList.toggle('active', item === link);
 });
-twSetMode('reduce_ai');
-showWorkspace('format');
 
+// ---- 账号 ----
+let currentUser = null, afterLogin = null;
+function renderAccount() {
+  $('accountName').hidden = !currentUser; $('accountName').textContent = currentUser ? currentUser.username : '';
+  $('loginOpen').hidden = !!currentUser; $('logout').hidden = !currentUser; $('historyNav').hidden = !currentUser;
+}
+function openLogin(then = null) {
+  afterLogin = then; $('loginMsg').textContent = '';
+  if (!$('loginDialog').open) $('loginDialog').showModal();
+  $('loginUser').focus();
+}
+// Uploading needs an account so the work shows up in 我的记录.
+function requireLogin(then) {
+  if (currentUser) return true;
+  openLogin(then); return false;
+}
+$('loginOpen').onclick = () => openLogin();
+$('loginCancel').onclick = () => { afterLogin = null; $('loginDialog').close(); };
+$('loginForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const mode = event.submitter?.value === 'register' ? 'register' : 'login';
+  for (const id of ['loginSubmit','registerSubmit']) $(id).disabled = true;
+  $('loginMsg').textContent = '';
+  try {
+    const result = await request('/api/account/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:$('loginUser').value.trim(), password:$('loginPass').value})});
+    currentUser = result.user; renderAccount();
+    $('loginPass').value = ''; $('loginDialog').close();
+    const then = afterLogin; afterLogin = null;
+    if (then) then();
+  } catch (error) { $('loginMsg').textContent = error.message; }
+  finally { for (const id of ['loginSubmit','registerSubmit']) $(id).disabled = false; }
+});
+$('logout').onclick = async () => {
+  await request('/api/account/logout', {method:'POST'}).catch(() => {});
+  // The next person on this computer must not see this account's orders.
+  for (const key of ['twOrders','thesisJob','thesisPaymentOrder','thesisDraft']) sessionStorage.removeItem(key);
+  location.reload();
+};
+
+// ---- 我的记录 ----
+const historyServices = {detect_text:'AIGC 检测 · 文本', detect_file:'AIGC 检测 · 文件', paraphrase_stream:'降重 / 降 AI · 文本', document_async:'降重 / 降 AI · Word'};
+const historyStates = {running:'排版中', done:'已完成', error:'排版失败', expired:'已过期，文件已删除',
+  ready:'待处理', processing:'处理中', submitted:'已提交', complete:'已完成', failed:'异常，请联系客服'};
+async function loadHistory() {
+  if (!requireLogin(loadHistory)) { $('historyList').replaceChildren(); $('historyMsg').textContent = '登录后查看记录。'; return; }
+  $('historyMsg').textContent = '正在读取…';
+  try {
+    const {items} = await request('/api/account/history');
+    $('historyMsg').textContent = '';
+    $('historyList').replaceChildren(...(items.length ? items.map(historyRow) : [historyEmpty()]));
+  } catch (error) { $('historyMsg').textContent = error.message; }
+}
+function historyEmpty() {
+  const li = document.createElement('li'); li.className = 'h-empty'; li.textContent = '还没有记录。付款后的排版、降重和检测会出现在这里。'; return li;
+}
+const historyTime = seconds => new Date(seconds * 1000).toLocaleString('zh-CN', {hour12:false, month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+function historyRow(item) {
+  // Only paid work is listed; files and results are deleted 24 hours after payment.
+  const li = document.createElement('li'), main = document.createElement('div'), title = document.createElement('b'), info = document.createElement('small');
+  main.className = 'h-main';
+  title.textContent = item.name;
+  const service = item.kind === 'format' ? '论文排版' + (item.detail ? ' · ' + item.detail : '') : historyServices[item.detail] || '降重 / 检测';
+  const expired = item.state === 'expired';
+  info.textContent = `${service} · 付款 ${historyTime(item.paid_at)}` + (expired ? '' : ` · ${historyTime(item.expires_at)} 前可下载`);
+  main.append(title, info);
+  const tag = document.createElement('span'); tag.className = 'h-tag'; tag.textContent = historyStates[item.state] || item.state;
+  if (!expired) tag.classList.add('paid');
+  li.append(main, tag);
+  const button = (text, onclick) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'secondary'; b.textContent = text; b.onclick = onclick; return b; };
+  if (item.kind === 'format' && ['running','done'].includes(item.state)) li.append(button('查看 / 下载', () => openFormatJob(item)));
+  if (item.kind === 'tabword' && !expired) li.append(button('查看结果', () => {
+    const order = twOrders.find(o => o.order_id === item.order_id) || {quote_id:item.ref, order_id:item.order_id, operation:item.detail, paid:true};
+    if (!twOrders.includes(order)) twOrders.push(order);
+    twRunPaid(order);
+  }));
+  return li;
+}
+function openFormatJob(item) {
+  showWorkspace('format');
+  clearTimeout(timer); clearResult(true);
+  job = item.ref; sessionStorage.setItem('thesisJob', job);
+  if (item.order_id) sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job, orderId:item.order_id}));
+  $('title').value = item.name;
+  busy = true; controls(); message('正在打开记录…'); poll();
+  $('result').scrollIntoView({behavior:'smooth', block:'center'});
+}
+$('historyRefresh').onclick = loadHistory;
+
+{
+  const returned = (() => { try { return JSON.parse(sessionStorage.getItem('twReturned') || 'null'); } catch { return null; } })();
+  sessionStorage.removeItem('twReturned');
+  const open = twOrders.filter(twOpen);
+  if (open.length && !sessionStorage.getItem('thesisJob')) {
+    showWorkspace(open[open.length - 1].operation.startsWith('detect') ? 'detect' : 'rewrite');
+  } else if (returned && !sessionStorage.getItem('thesisJob')) {
+    showWorkspace('history');
+    $('historyMsg').textContent = `订单 ${returned.order_id} 已从支付宝返回。付款确认后，下单的那个页面会自动开始处理；处理完的结果也可以在下面打开。`;
+  } else showWorkspace('format');
+}
+request('/api/account/me').then(data => { currentUser = data.user; renderAccount(); }).catch(() => renderAccount());

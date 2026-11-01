@@ -1,8 +1,9 @@
 """Local preparation and gated execution for the allowlisted Tabword API."""
 import json
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, Response
-from core import tabword, alipay, service_billing as billing
+from core import accounts, tabword, alipay, service_billing as billing
+from web.account_routes import current_user
 
 router = APIRouter(prefix='/api/tabword')
 
@@ -13,24 +14,32 @@ def status():
 
 
 @router.post('/billing/quote')
-def price_quote(operation: str = Form(...), params: str = Form('{}'), file: UploadFile | None = File(None)):
+def price_quote(operation: str = Form(...), params: str = Form('{}'), file: UploadFile | None = File(None),
+                user=Depends(current_user)):
     try:
         try:
             values = json.loads(params)
         except ValueError:
             raise tabword.TabwordError('参数不是有效 JSON', 422)
         content = (file.filename or '', file.file.read(20*1024*1024+1)) if file else None
-        return billing.quote(operation, values, content)
+        quote = billing.quote(operation, values, content)
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
+    text = values.get('text') if isinstance(values, dict) else ''
+    name = content[0] if content else ' '.join(str(text or '').split())[:30] or '文本'
+    accounts.record_upload(user['id'], 'tabword', quote['quote_id'], name, operation)
+    return quote
 
 
 @router.post('/billing/{quote_id}/payment')
-def create_payment(quote_id: str, request: Request):
+def create_payment(quote_id: str, request: Request, user=Depends(current_user)):
+    if not accounts.get_upload(user['id'], quote_id):
+        raise HTTPException(404, '服务订单不存在')
     try:
         if not tabword.enabled('TABWORD_ENABLE_CALLS') or not tabword.api_key():
             raise tabword.TabwordError('处理服务暂未启用，暂不接受付款', 503)
-        order = billing.create_payment(quote_id, request.cookies.get('affiliate_ref'), request.cookies.get('affiliate_campaign', ''))
+        order = billing.create_payment(quote_id, request.cookies.get('affiliate_ref'), request.cookies.get('affiliate_campaign', ''),
+                                       resume_return=True)
         return {'order_id': order['out_trade_no'], 'amount_cents': order['amount_cents'],
                 'status': order['status'], 'checkout_url': f"/api/tabword/billing/{quote_id}/{order['out_trade_no']}/checkout"}
     except tabword.TabwordError as exc:
@@ -41,7 +50,7 @@ def create_payment(quote_id: str, request: Request):
 
 @router.get('/billing/{quote_id}/{order_id}')
 def payment_status(quote_id: str, order_id: str):
-    order = alipay.get_order(order_id, quote_id)
+    order = alipay.sync_order(order_id, quote_id)
     if not order or not quote_id.startswith('TW-'):
         raise HTTPException(404, '订单不存在')
     q = billing.get_quote(quote_id)
@@ -58,6 +67,8 @@ def saved_result(quote_id: str, order_id: str):
         q = billing.get_quote(quote_id)
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
+    if q['state'] == 'expired':
+        raise HTTPException(410, billing.EXPIRED)
     headers = {'Cache-Control': 'no-store'}
     if q['result_sse']:
         return Response(q['result_sse'], media_type='text/event-stream', headers=headers)

@@ -41,7 +41,12 @@ def config():
     private_path = Path(_setting("ALIPAY_APP_PRIVATE_KEY_FILE")) if _setting("ALIPAY_APP_PRIVATE_KEY_FILE") else None
     alipay_public_path = Path(_setting("ALIPAY_PUBLIC_KEY_FILE")) if _setting("ALIPAY_PUBLIC_KEY_FILE") else None
     notify_url = _setting("ALIPAY_NOTIFY_URL")
+    # Without a return URL the buyer stays on Alipay's page after paying and never
+    # sees the download; default to the site home taken from the notify URL.
     return_url = _setting("ALIPAY_RETURN_URL")
+    if not return_url and notify_url.startswith("https://"):
+        parts = urllib.parse.urlsplit(notify_url)
+        return_url = f"{parts.scheme}://{parts.netloc}/"
     seller_id = _setting("ALIPAY_SELLER_ID")
     from core import service_billing
     price = str(service_billing.prices()['format_export_cents'])
@@ -114,12 +119,24 @@ def sign(params, private_path):
     return base64.b64encode(raw).decode("ascii")
 
 
+def _public_key(path):
+    # The Alipay console shows the platform public key as one bare Base64 line;
+    # accept that as well as a full PEM file.
+    raw = path.read_bytes().strip()
+    if not raw.startswith(b"-----BEGIN"):
+        body = b"".join(raw.split())
+        raw = (b"-----BEGIN PUBLIC KEY-----\n"
+               + b"\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+               + b"\n-----END PUBLIC KEY-----\n")
+    return serialization.load_pem_public_key(raw)
+
+
 def verify(params, public_path):
     signature = params.get("sign")
     if not signature:
         return False
     try:
-        key = serialization.load_pem_public_key(public_path.read_bytes())
+        key = _public_key(public_path)
         key.verify(base64.b64decode(signature, validate=True),
                    _signature_source(params).encode("utf-8"),
                    padding.PKCS1v15(), hashes.SHA256())
@@ -145,7 +162,7 @@ def _signed_params(method, biz_content, cfg):
     return params
 
 
-def _request(method, biz_content, cfg=None):
+def _request(method, biz_content, cfg=None, *, check=True):
     cfg = cfg or config()
     params = _signed_params(method, biz_content, cfg)
     request = urllib.request.Request(_gateway(cfg), data=urllib.parse.urlencode(params).encode("utf-8"),
@@ -156,13 +173,14 @@ def _request(method, biz_content, cfg=None):
     except Exception as exc:
         raise AlipayError("支付宝接口暂不可用，请稍后重试") from exc
     result = data.get(method.replace(".", "_") + "_response", {})
-    if result.get("code") != "10000":
+    if check and result.get("code") != "10000":
         raise AlipayError("支付宝未能创建支付订单，请核对产品开通状态和应用配置")
     return result
 
 
 def create_order(job_id, title, affiliate_code=None, affiliate_campaign="",
-                coupon_code=None, school_key="", *, amount_cents=None, subject_prefix="论文排版成品导出："):
+                coupon_code=None, school_key="", *, amount_cents=None, subject_prefix="论文排版成品导出：",
+                resume_return=False):
     cfg = config()
     if amount_cents is not None:
         if type(amount_cents) is not int or not 1 <= amount_cents <= 10000000:
@@ -195,6 +213,12 @@ def create_order(job_id, title, affiliate_code=None, affiliate_campaign="",
     except ValueError:
         raise
     created_at = int(time.time())
+    if resume_return and cfg.get("return_url"):
+        # Alipay appends its own query; ours lets the returning tab find the paid job.
+        parts = urllib.parse.urlsplit(cfg["return_url"])
+        query = urllib.parse.urlencode({"job": job_id, "order": order_no})
+        cfg = {**cfg, "return_url": urllib.parse.urlunsplit(
+            parts._replace(query=(parts.query + "&" if parts.query else "") + query))}
     try:
         params = _signed_params("alipay.trade.page.pay", {
             "out_trade_no": order_no,
@@ -241,6 +265,29 @@ def get_order(order_no, job_id=None):
     return dict(row)
 
 
+def job_paid(job_id):
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT 1 FROM payment_orders WHERE job_id=? AND status='TRADE_SUCCESS' LIMIT 1",
+                            (job_id,)).fetchone() is not None
+
+
+# 付款后的成品和处理结果只保存这么久，到期删除（用户隐私，也省磁盘）。订单本身一直保留。
+RESULT_TTL = 24 * 3600
+
+
+def paid_at(job_id):
+    """任务最早一笔付款的时间；没付款返回 None"""
+    with closing(_connect()) as conn:
+        row = conn.execute("""SELECT MIN(COALESCE(paid_at, created_at)) AS t FROM payment_orders
+                              WHERE job_id=? AND status='TRADE_SUCCESS'""", (job_id,)).fetchone()
+    return row["t"] if row else None
+
+
+def result_expired(job_id):
+    t = paid_at(job_id)
+    return t is not None and time.time() >= t + RESULT_TTL
+
+
 def checkout_url(order_no, job_id):
     order = get_order(order_no, job_id)
     if not config()["enabled"]:
@@ -276,15 +323,52 @@ def apply_notification(params):
         return False
     if params.get("trade_status") not in ("TRADE_SUCCESS", "TRADE_FINISHED"):
         return True
+    _mark_paid(order["out_trade_no"], params.get("trade_no"))
+    return True
+
+
+def _mark_paid(order_no, trade_no):
     with closing(_connect()) as conn, conn:
         conn.execute("UPDATE payment_orders SET status='TRADE_SUCCESS', trade_no=?, paid_at=? WHERE out_trade_no=? AND status!='TRADE_SUCCESS'",
-                     (params.get("trade_no"), int(time.time()), order["out_trade_no"]))
+                     (trade_no, int(time.time()), order_no))
         from core import affiliates
         paid_order = conn.execute("SELECT * FROM payment_orders WHERE out_trade_no=?",
-                                  (order["out_trade_no"],)).fetchone()
-        affiliates.redeem_coupon(conn, order["out_trade_no"])
+                                  (order_no,)).fetchone()
+        affiliates.redeem_coupon(conn, order_no)
         affiliates.settle_paid_order(conn, paid_order)
-    return True
+
+
+# The asynchronous notification can be lost (unreachable notify URL, proxy or
+# key misconfiguration). Pending orders are therefore also confirmed by an
+# active alipay.trade.query, rate-limited per order.
+QUERY_INTERVAL = 5
+_LAST_QUERY = {}
+
+
+def sync_order(order_no, job_id=None):
+    """Return the order, first confirming a pending payment with Alipay if needed."""
+    order = get_order(order_no, job_id)
+    if not order or order.get("status") != "WAIT_BUYER_PAY" or order.get("payment_product") != "page_pay":
+        return order
+    now = time.time()
+    if now - _LAST_QUERY.get(order_no, 0) < QUERY_INTERVAL:
+        return order
+    _LAST_QUERY[order_no] = now
+    cfg = config()
+    if not cfg["enabled"]:
+        return order
+    try:
+        result = _request("alipay.trade.query", {"out_trade_no": order_no}, cfg, check=False)
+    except AlipayError:
+        return order
+    expected_amount = f"{Decimal(order['amount_cents']) / 100:.2f}"
+    if (result.get("code") == "10000" and result.get("out_trade_no") == order_no
+            and result.get("trade_status") in ("TRADE_SUCCESS", "TRADE_FINISHED")
+            and result.get("total_amount") == expected_amount):
+        _mark_paid(order_no, result.get("trade_no"))
+        _LAST_QUERY.pop(order_no, None)
+        return get_order(order_no, job_id)
+    return order
 
 
 def qr_png(order_no, job_id):
