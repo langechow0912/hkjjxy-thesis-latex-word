@@ -4,6 +4,7 @@ from pathlib import Path
 
 import fitz
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from core import docx2tex, texparse, docxbuild, profile, toc
@@ -84,6 +85,104 @@ class FormatIntegrity(unittest.TestCase):
             doc.add_paragraph('数据来源：年度报告。')
             result, _ = self.convert(doc, work)
             self.assertEqual(result['tables'][0]['note'], '数据来源：年度报告。')
+
+    def test_seq_field_number_in_table_caption_is_read(self):
+        """Word 的 SEQ 域编号在 w:fldSimple 里，Paragraph.text 会漏掉。
+
+        漏掉后「表　资产负债率分析表」既不匹配表题，表就拿不到题名，
+        还会被当成正文多排一段。这里按真实稿子的写法构造。
+        """
+        with tempfile.TemporaryDirectory() as work:
+            doc = Document()
+            doc.add_paragraph('1 正文')
+            caption = doc.add_paragraph()
+            caption.add_run('表')
+            fld = OxmlElement('w:fldSimple')
+            fld.set(qn('w:instr'), r' SEQ 表 \* ARABIC ')
+            run = OxmlElement('w:r')
+            text = OxmlElement('w:t')
+            text.text = '1'
+            run.append(text)
+            fld.append(run)
+            caption._p.append(fld)
+            caption.add_run('　资产负债率分析表')
+            doc.add_table(rows=1, cols=2)
+            result, stats = self.convert(doc, work)
+            self.assertEqual(stats['tables'], 1)
+            self.assertEqual(result['tables'][0]['name'], '资产负债率分析表')
+            self.assertNotIn('资产负债率分析表',
+                             [b.get('text') for b in result['blocks']])
+
+    def test_single_segment_table_number_and_cross_reference(self):
+        """全文连续编号「表1」也要认，正文「如表 表1 所示」换成 \\ref。
+
+        断言在原始 tex 上做：texparse 会把 \\ref 再解析回「表1」，
+        在解析后的 block 里看不到反斜杠。
+        """
+        with tempfile.TemporaryDirectory() as work:
+            doc = Document()
+            doc.add_paragraph('1 正文')
+            doc.add_paragraph('具体数据 如表 表1 所示。')
+            doc.add_paragraph('表1　资产负债率分析表')
+            doc.add_table(rows=1, cols=2)
+            path = Path(work) / 'source.docx'
+            doc.save(path)
+            tex, stats = docx2tex.convert(str(path), work, profile.load('hkjjxy'),
+                                          log=lambda *a: None)
+            self.assertEqual(stats['tables'], 1)
+            self.assertIn(r'\label{tab:t1}}{', tex)
+            self.assertIn(r'\ref{tab:t1}', tex)
+            self.assertNotIn('表 表1', tex)
+
+    def test_chinese_chapter_numbering_is_recognised(self):
+        """「第一章」「一、」这类中文编号很多学校模板在用，要能认出来。"""
+        cases = [
+            (['第一章 绪论', '正文。', '第二章 文献综述', '正文。'],
+             ['绪论', '文献综述']),
+            (['一、绪论', '正文。', '二、文献综述', '正文。'],
+             ['绪论', '文献综述']),
+        ]
+        for lines, want in cases:
+            with tempfile.TemporaryDirectory() as work:
+                doc = Document()
+                for line in lines:
+                    doc.add_paragraph(line)
+                result, _ = self.convert(doc, work)
+                heads = [b['text'] for b in result['blocks'] if b['kind'] == 'heading']
+                # 解析层会把自动编号拼回标题前面（「1　绪论」），只断言题名部分
+                names = [h.split('　')[-1] for h in heads]
+                self.assertEqual(names, want, lines)
+
+    def test_caption_below_table_is_attached(self):
+        """题注写在表下面的稿子也要认，不能丢给下一张表。"""
+        with tempfile.TemporaryDirectory() as work:
+            doc = Document()
+            doc.add_paragraph('1 正文')
+            doc.add_table(rows=1, cols=2)
+            doc.add_paragraph('表1　资产负债率分析表')
+            result, _ = self.convert(doc, work)
+            self.assertEqual(result['tables'][0]['name'], '资产负债率分析表')
+
+    def test_english_table_caption_is_recognised(self):
+        with tempfile.TemporaryDirectory() as work:
+            doc = Document()
+            doc.add_paragraph('1 正文')
+            doc.add_paragraph('Table 1 Asset analysis')
+            doc.add_table(rows=1, cols=2)
+            result, _ = self.convert(doc, work)
+            self.assertEqual(result['tables'][0]['name'], 'Asset analysis')
+
+    def test_untitled_table_is_reported_not_swallowed(self):
+        """识别不到题名要报出来，而不是静默出一张没有表题的表。"""
+        with tempfile.TemporaryDirectory() as work:
+            doc = Document()
+            doc.add_paragraph('1 正文')
+            doc.add_table(rows=1, cols=2)
+            path = Path(work) / 'source.docx'
+            doc.save(path)
+            _tex, stats = docx2tex.convert(str(path), work, profile.load('hkjjxy'),
+                                           log=lambda *a: None)
+            self.assertTrue(any('题名' in n for n in stats['notes']), stats['notes'])
 
     def test_generated_word_has_spacing_action_and_no_body_grid(self):
         with tempfile.TemporaryDirectory() as work:

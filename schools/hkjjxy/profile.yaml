@@ -124,26 +124,27 @@ output:
 
 # ---------------- DeepSeek Harness ----------------
 # 智能文档处理与质量检查（需要 DEEPSEEK_API_KEY 环境变量）
+# 开关可用环境变量 DSH_ENABLED=false 临时关掉，不必改文件。
+# 没有 key 时自动跳过，不会让排版失败。
 dsh:
-  enabled: false  # 总开关
-  
-  # 启用的检查点
+  enabled: true  # 总开关
+
+  # 启用的检查点（只跑实现了的；cp4_quality 还是占位，别开）
   checkpoints:
     - cp1_preprocess  # 文档预处理
-    - cp4_quality     # 最终质检
-  
+
   # API 配置
   api:
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
     timeout: 30
-  
+
   # 成本控制
   cost_control:
     daily_quota: 1000
     per_job_limit: 5
     cache_ttl: 3600
-  
+
   # 降级策略
   fallback:
     on_error: "warn"

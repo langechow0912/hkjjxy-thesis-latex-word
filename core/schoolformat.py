@@ -42,9 +42,30 @@ def run(job, payload, cfg, meta):
         else:
             source.write_bytes(payload)
         job['stage'] = '识别论文结构'
-        tex, _ = docx2tex.convert(str(source), str(work), cfg,
-                                log=feedback)
+        tex, stat = docx2tex.convert(str(source), str(work), cfg,
+                                     log=feedback)
         struct = texparse.parse(tex)
+        # 规则层能认定「这张表/这张图没有题名」时直接告诉用户，
+        # 不要等到看 PDF 才发现少了个表题。
+        for note in (stat or {}).get('notes', []):
+            feedback(note)
+
+        # 规则层拿不准的地方（没有编号的短行是不是标题、层级是否跳级）
+        # 交给 DSH 判断；它只返回建议，不改原稿，失败也不影响排版。
+        from .dsh import runner as dsh_runner
+        stat = stat or {}
+        suspicious = bool((stat.get('numbering') or (None, None))[1])
+        report = dsh_runner.run_preprocess(cfg, {
+            'source': str(source),
+            'work_dir': str(work),
+            'meta': meta,
+            'suspicious': suspicious,
+            'items': stat.get('items') or [],
+            'body_start': stat.get('body_start', 0),
+            'resolved_levels': stat.get('resolved_levels') or {},
+        }, job_id=job.get('id'))
+        for message in dsh_runner.to_messages(report):
+            feedback(message)
         if not struct['blocks']:
             feedback('未识别到章节结构，已继续生成，请核对正文内容。')
         if struct['meta'].get('cn_title', '') in ('', '（在此填写中文题目）'):

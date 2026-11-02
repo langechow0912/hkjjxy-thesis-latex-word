@@ -30,8 +30,13 @@ RE_ABS_EN = re.compile(r"^Abstract[:：]\s*(.*)$", re.I)
 RE_KEY_EN = re.compile(r"^Key\s*words?[:：]\s*(.*)$", re.I)
 RE_REF_HEAD = re.compile(r"^参考文献\s*$")
 RE_ACK_HEAD = re.compile(r"^致\s*谢\s*$")
-RE_TABTITLE = re.compile(r"^表\s*(\d+)\s*[-—－]\s*(\d+)\s*[:：]?\s*(.*)$")
-RE_FIGTITLE = re.compile(r"^图\s*(\d+)\s*[-—－]\s*(\d+)\s*[:：]?\s*(.*)$")
+# 编号可以是「1-1」两段式，也可以是全文连续的「1」。不做 \d+ 直接吃下去，
+# 是因为按位置配题名/正文判断，不会因为放宽编号而误收正文。
+# 英文稿常见 Table 1 / Figure 2，同样收进来。
+RE_TABTITLE = re.compile(r"^表\s*(\d+)(?:\s*[-—－]\s*(\d+))?\s*[:：]?\s*(.*)$")
+RE_FIGTITLE = re.compile(r"^图\s*(\d+)(?:\s*[-—－]\s*(\d+))?\s*[:：]?\s*(.*)$")
+RE_TABTITLE_EN = re.compile(r"^Table\s*(\d+)(?:\.(\d+))?\s*[:：.]?\s*(.*)$", re.I)
+RE_FIGTITLE_EN = re.compile(r"^Figure\s*(\d+)(?:\.(\d+))?\s*[:：.]?\s*(.*)$", re.I)
 RE_NOTE = re.compile(r"^(数据来源|资料来源|注)[:：]")
 RE_H1 = re.compile(r"^(\d{1,2})(?![\d\-.])[\s\u3000]*(\S.*)$")
 RE_H2 = re.compile(r"^(\d{1,2})\.(\d{1,2})[\s\u3000]*(\S.*)$")
@@ -39,7 +44,36 @@ RE_H3 = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})[\s\u3000]*(\S.*)$")
 RE_H4 = re.compile(r"^[（(](\d+)[)）]\s*(.+)$")
 RE_CITE = re.compile(r"\[(\d+(?:\s*[,，]\s*\d+)*)\]")
 
+# 中文数字编号：第一章 / 第 2 章 / 一、/ （一）。很多学校模板用这套，
+# 而 Word 大纲级别并不总是可靠，所以单独认。
+_CN_NUM = "〇零一二三四五六七八九十"
+RE_H1_CN = re.compile(r"^第\s*([%s\d]{1,3})\s*[章篇]\s*([\s　]*\S.*)?$" % _CN_NUM)
+RE_H1_CN_DUN = re.compile(r"^([%s]{1,3})\s*[、．.]\s*(\S.*)$" % _CN_NUM)
+RE_H2_CN_PAREN = re.compile(r"^[（(]([%s]{1,3})[)）]\s*(\S.*)$" % _CN_NUM)
+
+_CN_DIGITS = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
 MAX_HEADING_LEN = 32
+
+
+def cn2int(s):
+    """中文数字转整数，够用到 99。转不出来返回 None（宁可当正文，不猜）。"""
+    s = (s or "").strip()
+    if s.isdigit():
+        return int(s)
+    if not s or "百" in s:
+        return None
+    if "十" in s:
+        head, _, tail = s.partition("十")
+        tens = 1 if not head else _CN_DIGITS.get(head)
+        ones = 0 if not tail else _CN_DIGITS.get(tail)
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+    if len(s) == 1:
+        return _CN_DIGITS.get(s)
+    return None
 
 
 def esc(s):
@@ -50,6 +84,31 @@ def esc(s):
                  ("^", r"\textasciicircum{}")):
         s = s.replace(a, b)
     return s
+
+
+def _para_text(p_el):
+    """段落的完整文本，含域（w:fldSimple）里的缓存结果。
+
+    python-docx 的 Paragraph.text 只拼 w:r/w:t，Word 的 SEQ 域编号（「表」后面
+    那个 1）装在 w:fldSimple 里，会被整段丢掉，于是表题变成「表　资产负债率分析表」
+    而认不出来。这里按文档顺序遍历所有 w:t，跳过修订删除的内容。
+    """
+    out = []
+    for el in p_el.iter():
+        tag = el.tag.split("}")[-1]
+        if tag == "t":
+            parent = el.getparent()
+            while parent is not None:
+                if parent.tag.split("}")[-1] == "del":
+                    break
+                parent = parent.getparent()
+            else:
+                out.append(el.text or "")
+        elif tag == "tab":
+            out.append("\t")
+        elif tag in ("br", "cr"):
+            out.append("\n")
+    return "".join(out)
 
 
 def read_items(doc):
@@ -79,7 +138,7 @@ def read_items(doc):
             if direct:
                 level = int(direct[0]) + 1
             items.append({"kind": "p", "pno": pno,
-                          "text": p.text.strip(), "imgs": imgs,
+                          "text": _para_text(child).strip(), "imgs": imgs,
                           "style": p.style.name if p.style is not None else "",
                           "heading_level": level if level in (1, 2, 3, 4) else None})
             pno += 1
@@ -151,6 +210,26 @@ def _is_heading_line(s):
     return len(s) <= MAX_HEADING_LEN and "。" not in s and "；" not in s
 
 
+def _cn_chapter(t):
+    """「第一章 绪论」「第十二章 …」「一、研究背景」→ (章号, 题名) 或 None。
+
+    只认一级；「（一）」在中文模板里既可能是一级也可能是二级，
+    交给调用方按上下文判断，这里不猜。
+    """
+    m = RE_H1_CN.match(t)
+    if m:
+        num = cn2int(m.group(1))
+        if num is not None:
+            return num, (m.group(2) or "").strip()
+        return None
+    m = RE_H1_CN_DUN.match(t)
+    if m:
+        num = cn2int(m.group(1))
+        if num is not None and _is_heading_line(t):
+            return num, m.group(2).strip()
+    return None
+
+
 _SEC_LEVEL = {"sec1": 1, "sec2": 2, "sec3": 3}
 
 
@@ -219,29 +298,71 @@ def _superscripts(s):
     return RE_CITE.sub(lambda m: r"\textsuperscript{[%s]}" % m.group(1), s)
 
 
+def _label_key(first, second):
+    """表/图编号的两段式或单段式都归一成同一个键，供正文交叉引用查表"""
+    return "%s-%s" % (first, second) if second else str(first)
+
+
+def _caption_match(text, kind):
+    """识别表题/图题，返回 (编号键, 题名) 或 None。
+
+    中文「表1 / 表1-1 / 表 1：」和英文「Table 1 / Figure 2」都认。
+    两段式编号优先，避免把「表1-1」拆成「表1」加题名「-1 …」。
+    """
+    pats = ((RE_TABTITLE, RE_TABTITLE_EN) if kind == "table"
+            else (RE_FIGTITLE, RE_FIGTITLE_EN))
+    for pat in pats:
+        m = pat.match(text)
+        if m:
+            # 中文正则组 3 是题名，英文正则也是组 3
+            title = (m.group(3) or "").strip()
+            return _label_key(m.group(1), m.group(2)), title
+    return None
+
+
+# \ref 占位符：要先过 esc() 再还原成命令，否则反斜杠会被转义成字面文本。
+# 用私用区字符，正文里不会自然出现。
+_PH = {"tab": "\ue000", "fig": "\ue001"}
+
+
+def _ph(kind, num):
+    return "%s%d\ue002" % (_PH[kind], num)
+
+
+def _unph(s):
+    """占位符 → \\ref{tab:tN} / \\ref{fig:fN}"""
+    s = re.sub(r"\ue000(\d+)\ue002", r"\\ref{tab:t\1}", s)
+    return re.sub(r"\ue001(\d+)\ue002", r"\\ref{fig:f\1}", s)
+
+
 def scan(items, marks, figmap):
     """扫描文档流，产出 blocks / refs / ack"""
     body_start = marks["body_start"]
     ref_pno = items[marks["ref"]]["pno"] if marks["ref"] is not None else None
     ack_pno = items[marks["ack"]]["pno"] if marks["ack"] is not None else None
 
-    # ---- 先建「表 X-Y → 全文序号」映射（按表出现顺序）----
+    # ---- 先建「表 X-Y / 表 X → 全文序号」映射（按表出现顺序）----
     tabmap, keys = {}, []
     for it in items:
         if it["kind"] == "p":
-            m = RE_TABTITLE.match(it["text"])
+            m = _caption_match(it["text"], "table")
             if m and it["pno"] >= body_start:
-                keys.append("%s-%s" % (m.group(1), m.group(2)))
+                keys.append(m[0])
     for i, k in enumerate(keys, 1):
         tabmap.setdefault(k, i)
 
     def resolve(s):
-        s = re.sub(r"表\s*(\d+)\s*[-—－]\s*(\d+)",
-                   lambda m: r"表~\ref{tab:t%d}"
-                   % tabmap.get("%s-%s" % (m.group(1), m.group(2)), 1), s)
-        s = re.sub(r"图\s*(\d+)\s*[-—－]\s*(\d+)",
-                   lambda m: r"图~\ref{fig:f%d}"
-                   % tabmap.get("%s-%s" % (m.group(1), m.group(2)), 1), s)
+        # 正文里的「如表 1-1 / 如表 1 所示」换成 \ref。编号两段式优先，其次是单段。
+        # 原稿常写成「如表 表1 所示」，重复的「表」一并收掉。
+        # 这里只放占位符：正文后面还要过 esc()，直接写反斜杠会被转义成字面文本。
+        s = re.sub(r"表\s*(?:表\s*)?(\d+)\s*[-—－]\s*(\d+)",
+                   lambda m: _ph("tab", tabmap.get(_label_key(m.group(1), m.group(2)), 1)), s)
+        s = re.sub(r"表\s*(?:表\s*)?(\d+)(?![\d\-—－.])",
+                   lambda m: _ph("tab", tabmap.get(_label_key(m.group(1), None), 1)), s)
+        s = re.sub(r"图\s*(?:图\s*)?(\d+)\s*[-—－]\s*(\d+)",
+                   lambda m: _ph("fig", tabmap.get(_label_key(m.group(1), m.group(2)), 1)), s)
+        s = re.sub(r"图\s*(?:图\s*)?(\d+)(?![\d\-—－.])",
+                   lambda m: _ph("fig", tabmap.get(_label_key(m.group(1), None), 1)), s)
         return s
 
     blocks, refs, ack = [], [], []
@@ -278,9 +399,9 @@ def scan(items, marks, figmap):
             # and has no images of its own (to avoid taking another figure's paragraph)
             if (end < len(items) and items[end]["kind"] == "p"
                     and not items[end].get("imgs")):
-                match = RE_FIGTITLE.match(items[end]["text"])
-                if match:
-                    captions.append(match.group(3).strip())
+                match = _caption_match(items[end]["text"], "figure")
+                if match and match[1]:
+                    captions.append(match[1])
                     end += 1
                 else:
                     # Not a figure caption, don't consume it
@@ -318,9 +439,16 @@ def scan(items, marks, figmap):
             continue
 
         # ---------- 表题 / 表注 ----------
-        mt = RE_TABTITLE.match(t)
-        if mt and pno >= body_start:
-            pending_title = mt.group(3).strip()
+        # 题名不能为空，否则宁可当正文留着，不要吞掉一句话。
+        mt = _caption_match(t, "table")
+        if mt and pno >= body_start and mt[1].strip():
+            # 题注在表上方的稿子占多数；但如果这张表已经在上面出现、且还没有题名，
+            # 说明原稿是「表 + 题注在下方」，回填给它，而不是丢给下一张表。
+            if (blocks and blocks[-1]["t"] == "table"
+                    and not blocks[-1].get("title") and not pending_title):
+                blocks[-1]["title"] = mt[1].strip()
+            else:
+                pending_title = mt[1].strip()
             i += 1
             continue
         if RE_NOTE.match(t) and pno >= body_start:
@@ -340,7 +468,12 @@ def scan(items, marks, figmap):
             m2 = RE_H2.match(t)
             m1 = RE_H1.match(t)
             m4 = RE_H4.match(t)
-            if m3:
+            cn1 = _cn_chapter(t)
+            if cn1 is not None and _is_heading_line(t):
+                # 「第一章 绪论」「一、研究背景」。编号形态本身说明了层级，
+                # 比 Word 大纲级别可靠，所以排在前面判。
+                blocks.append({"t": "sec1", "text": cn1[1], "src": (cn1[0],)})
+            elif m3:
                 src = tuple(int(x) for x in m3.group(1, 2, 3))
                 _promote_chapter_title(blocks, src[0])
                 blocks.append({"t": "sec3", "text": m3.group(4), "src": src})
@@ -394,7 +527,38 @@ def scan(items, marks, figmap):
                 blocks.append({"t": "body", "text": t})
         i += 1
 
+    # 正文里的「如表 1 所示」「见图 2-1」统一换成 \ref，编号跟着重排而非硬编码。
+    # 标题不动：标题里的「1」「2.1」是章节号，不是图表号。
+    for b in blocks:
+        if b["t"] == "body":
+            b["text"] = resolve(b["text"])
+
     return blocks, refs, ack
+
+
+def audit(blocks):
+    """识别不出来的东西要显式报出来，不能静默降级。
+
+    返回给人看的中文提示列表。这里只报告、不改内容——改不改由用户决定。
+    """
+    notes = []
+    unnamed = [b["no"] for b in blocks if b["t"] == "table" and not b.get("title")]
+    if unnamed:
+        notes.append("第 %s 张表没识别到题名（原稿可能没写题注，或题注不在表的上方/紧邻位置），"
+                     "已按无题名表格排版，请补题注后重新生成。"
+                     % "、".join(map(str, unnamed)))
+
+    unnamed_fig = [b["no"] for b in blocks if b["t"] == "figure" and not b.get("cap")]
+    if unnamed_fig:
+        notes.append("第 %s 张图没识别到图题（原稿可能没写，或图题不在图片紧下方），"
+                     "已按无图题排版，请补图题后重新生成。" % "、".join(map(str, unnamed_fig)))
+
+    missing = sum(1 for b in blocks
+                  if b["t"] == "body" and b["text"].startswith("［图片无法提取"))
+    if missing:
+        notes.append("有 %d 张图片无法从原稿提取（可能是链接图片或裁剪异常），"
+                     "结果中已用占位文字标出，请核对原稿。" % missing)
+    return notes
 
 
 def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
@@ -464,7 +628,7 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
         elif k == "sec4":
             out.append(r"\paragraph{%s}" % E(b["text"]))
         elif k == "body":
-            out.append(_superscripts(E(b["text"])))
+            out.append(_unph(_superscripts(E(b["text"]))))
             out.append("")
         elif k == "table":
             rows = b["rows"]
@@ -530,8 +694,29 @@ def convert(docx_path, out_dir, cfg=None, log=print):
         "sec4": sum(1 for b in blocks if b["t"] == "sec4"),
         "numbering": numbering,
         "title": meta["cn_title"],
+        # 识别不出题名/图片的提示，供 web 流程直接展示给用户。
+        "notes": audit(blocks),
+        # 原文条目与正文起点，给 DSH 生成结构清单用（免得再解析一遍 docx）。
+        "items": items,
+        "body_start": marks["body_start"],
+        # 流水线实际判定的标题层级（文字 → 级别）。DSH 不看这个就会把
+        # 已经按编号识别好的标题误报成「缺失」。
+        "resolved_levels": _resolved_levels(blocks),
     }
     return tex, stat
+
+
+_SEC_LEVEL_NAME = {"sec1": 1, "sec2": 2, "sec3": 3, "sec4": 4}
+
+
+def _resolved_levels(blocks):
+    """{标题原文: 流水线判定的层级}，只收标题块。"""
+    out = {}
+    for b in blocks:
+        level = _SEC_LEVEL_NAME.get(b["t"])
+        if level:
+            out[b["text"]] = level
+    return out
 
 
 def _body_start(items, marks):

@@ -25,10 +25,26 @@ class DeepSeekClient:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.api_config = config.get('api', {})
-        self.api_key = os.getenv('DEEPSEEK_API_KEY', '')
-        self.base_url = self.api_config.get('base_url', 'https://api.deepseek.com')
-        self.model = self.api_config.get('model', 'deepseek-chat')
-        self.timeout = self.api_config.get('timeout', 30)
+        self.api_key = self._resolve_api_key()
+        self.base_url = (
+            os.getenv('DEEPSEEK_BASE_URL')
+            or self.api_config.get('base_url')
+            or 'https://api.deepseek.com'
+        ).rstrip('/')
+        self.model = (
+            os.getenv('DEEPSEEK_MODEL')
+            or self.api_config.get('model')
+            or 'deepseek-chat'
+        )
+        self.timeout = self.api_config.get('timeout', 60)
+        # 思考深度：off | low | medium | high
+        self.reasoning_effort = (
+            os.getenv('DEEPSEEK_REASONING_EFFORT')
+            or self.api_config.get('reasoning_effort')
+            or 'medium'
+        ).strip().lower()
+        if self.reasoning_effort not in ('off', 'low', 'medium', 'high'):
+            self.reasoning_effort = 'medium'
 
         # 缓存配置
         cache_config = config.get('cost_control', {})
@@ -38,11 +54,58 @@ class DeepSeekClient:
 
         if not self.api_key:
             logger.warning("DEEPSEEK_API_KEY not set, DSH will be disabled")
+        else:
+            logger.info(
+                "DeepSeek client ready: model=%s base_url=%s reasoning_effort=%s",
+                self.model, self.base_url, self.reasoning_effort)
+
+    def _resolve_api_key(self) -> str:
+        """按优先级解析 API Key：环境变量 > key 文件 > 配置内联"""
+        key = os.getenv('DEEPSEEK_API_KEY', '').strip()
+        if key:
+            return key
+
+        # 支持文件挂载（生产环境推荐）
+        key_file = os.getenv('DEEPSEEK_API_KEY_FILE', '').strip()
+        if not key_file:
+            key_file = self.api_config.get('api_key_file', '').strip()
+        if key_file:
+            try:
+                p = Path(key_file)
+                if p.exists():
+                    return p.read_text(encoding='utf-8').strip()
+                logger.warning("DEEPSEEK_API_KEY_FILE not found: %s", key_file)
+            except Exception as e:
+                logger.warning("Failed to read API key file %s: %s", key_file, e)
+
+        return self.api_config.get('api_key', '').strip()
 
     def _cache_key(self, prompt: str, **kwargs) -> str:
         """生成缓存键"""
         content = json.dumps({'prompt': prompt, 'model': self.model, **kwargs}, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def _thinking_params(self) -> Dict[str, Any]:
+        """根据思考深度生成请求参数。
+
+        DeepSeek 不同模型对"思考深度"的表达方式不同：
+        - deepseek-reasoner：固定开启思考，用 max_tokens 控制思考预算
+        - deepseek-chat：支持 thinking 参数（type=enabled + budget_tokens）
+        这里做兼容性处理：先按模型推荐方式构造，若 API 拒绝参数则降级重试。
+        """
+        effort = self.reasoning_effort
+        if effort == 'off':
+            return {'thinking': {'type': 'disabled'}}
+
+        # 思考预算：off < low < medium < high
+        budget = {'low': 2000, 'medium': 8000, 'high': 16000}[effort]
+        params: Dict[str, Any] = {}
+        if 'reasoner' in self.model:
+            # reasoner 模型始终思考，用 max_tokens 预留思考空间
+            params['max_tokens'] = budget + 4000
+        else:
+            params['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+        return params
 
     def _get_cache(self, key: str) -> Optional[Dict[str, Any]]:
         """读取缓存"""
@@ -113,40 +176,54 @@ class DeepSeekClient:
             'temperature': temperature,
             **kwargs
         }
+        payload.update(self._thinking_params())
 
         try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={
-                        'Authorization': f'Bearer {self.api_key}',
-                        'Content-Type': 'application/json'
-                    },
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout)
-                ) as response:
-                    if response.status != 200:
-                        text = await response.text()
-                        raise RuntimeError(f"DeepSeek API error {response.status}: {text}")
+            # 标准库 urllib 放进线程里跑。项目其余模块（dayipaper/tabword）也是 urllib，
+            # 不为 DSH 单独给生产镜像加 aiohttp 依赖。
+            status, body = await asyncio.to_thread(self._post, payload)
+            if status == 400 and 'thinking' in payload:
+                # 模型不支持思考参数时降级重试一次
+                logger.warning("API rejected thinking params, retrying without them")
+                payload.pop('thinking', None)
+                payload.pop('max_tokens', None)
+                status, body = await asyncio.to_thread(self._post, payload)
+            if status != 200:
+                raise RuntimeError(f"DeepSeek API error {status}: {body[:300]}")
 
-                    data = await response.json()
-                    result = {
-                        'content': data['choices'][0]['message']['content'],
-                        'usage': data.get('usage', {})
-                    }
-
-                    # 写入缓存
-                    if use_cache:
-                        self._set_cache(cache_key, result)
-
-                    return result
+            data = json.loads(body)
+            result = {
+                'content': data['choices'][0]['message']['content'],
+                'usage': data.get('usage', {})
+            }
+            if use_cache:
+                self._set_cache(cache_key, result)
+            return result
 
         except asyncio.TimeoutError:
             raise RuntimeError(f"DeepSeek API timeout after {self.timeout}s")
         except Exception as e:
             logger.error(f"DeepSeek API call failed: {e}")
             raise
+
+    def _post(self, payload):
+        """同步 POST，返回 (状态码, 响应文本)。网络层错误直接抛出，由调用方降级。"""
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.status, resp.read().decode('utf-8', 'replace')
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode('utf-8', 'replace')
 
     async def analyze_document(
         self,

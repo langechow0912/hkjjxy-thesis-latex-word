@@ -29,11 +29,16 @@ def test_load_config():
 
 
 def test_dsh_manager_init():
-    """测试 DSHManager 初始化"""
+    """测试 DSHManager 初始化。
+
+    不依赖 profile.yaml 里开关当前是开还是关——那只反映部署选择，
+    不是这段代码的契约。
+    """
     import yaml
     cfg = yaml.safe_load(Path('schools/hkjjxy/profile.yaml').read_text(encoding='utf-8'))
 
     # DSH 关闭时
+    cfg['dsh']['enabled'] = False
     manager = DSHManager(cfg)
     assert not manager.enabled
     assert manager.client is None
@@ -45,7 +50,7 @@ def test_dsh_manager_init():
         manager = DSHManager(cfg)
         # 如果没有 API key，client 会初始化但不可用
         assert manager.enabled
-        assert len(manager.checkpoints) >= 2  # cp1, cp4
+        assert len(manager.checkpoints) >= 1  # 至少 cp1
     except Exception as e:
         pytest.skip(f"DSH init failed (expected without API key): {e}")
 
@@ -112,6 +117,7 @@ async def test_checkpoint_run_placeholder():
 def test_cost_controller():
     """测试成本控制器"""
     from core.dsh.cost_control import CostController
+    import tempfile
 
     config = {
         'cost_control': {
@@ -121,6 +127,12 @@ def test_cost_controller():
     }
 
     cost = CostController(config)
+
+    # 使用临时状态文件，避免与实际运行的状态冲突
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+        cost.state_file = Path(tmp.name)
+        cost.state = cost._init_state()
+        cost._save_state()
 
     # 未超配额
     assert cost.can_run('cp1', 'job1')
@@ -140,6 +152,9 @@ def test_cost_controller():
     stats = cost.get_stats()
     assert stats['today']['calls'] >= 10
     assert stats['total']['tokens'] > 0
+
+    # 清理临时文件
+    cost.state_file.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
