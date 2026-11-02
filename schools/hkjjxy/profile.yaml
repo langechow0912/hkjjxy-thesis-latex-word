@@ -121,3 +121,31 @@ cover:
 # ---------------- 输出 ----------------
 output:
   docx_name: "{sample}-毕业论文（可编辑）{suffix}.docx"
+
+# ---------------- DeepSeek Harness ----------------
+# 智能文档处理与质量检查（需要 DEEPSEEK_API_KEY 环境变量）
+dsh:
+  enabled: false  # 总开关
+  
+  # 启用的检查点
+  checkpoints:
+    - cp1_preprocess  # 文档预处理
+    - cp4_quality     # 最终质检
+  
+  # API 配置
+  api:
+    base_url: "https://api.deepseek.com"
+    model: "deepseek-chat"
+    timeout: 30
+  
+  # 成本控制
+  cost_control:
+    daily_quota: 1000
+    per_job_limit: 5
+    cache_ttl: 3600
+  
+  # 降级策略
+  fallback:
+    on_error: "warn"
+    on_quota: "disable"
+    timeout: 30
