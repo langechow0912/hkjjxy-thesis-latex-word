@@ -30,3 +30,5 @@ deploy/Dockerfile.local
 deploy/dsh-workspace/
 docs/deepseek-harness.md
 AGENTS.md
+.dsh_cost.json
+.dsh_cache/
