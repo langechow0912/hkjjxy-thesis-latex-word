@@ -45,6 +45,10 @@ COPY --chown=thesis:thesis core/ ./core/
 COPY --chown=thesis:thesis web/ ./web/
 COPY --chown=thesis:thesis schools/ ./schools/
 
+# Include supplied cover/body fonts in the image, including FZSTK.TTF.
+COPY deploy/fonts/ /usr/share/fonts/windows/
+RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f; fi
+
 USER thesis:thesis
 EXPOSE 8000
 

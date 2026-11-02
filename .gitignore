@@ -9,3 +9,24 @@ __pycache__/
 out/
 .test-tmp/
 /data/
+
+/deploy/fonts/*
+!/deploy/fonts/README.md
+
+# Local test environment
+test-local.bat
+test-local.sh
+docker-compose.test.yml
+.env.local
+TEST_LOCAL.md
+CHECKLIST.md
+scripts/test_thesis.docx
+scripts/generate_test_thesis.py
+check-docker.*
+docker-compose.dsh.yml
+docker-compose.local.yml
+deploy/Dockerfile.dsh
+deploy/Dockerfile.local
+deploy/dsh-workspace/
+docs/deepseek-harness.md
+AGENTS.md

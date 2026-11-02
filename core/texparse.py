@@ -136,6 +136,7 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
     blocks = []
     toc_entries = []
     cnt = [0, 0, 0]
+    fourth = 0
     buf = []
     refn = 0
     tab_iter = iter(tables)
@@ -155,6 +156,13 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
 
         if ln.startswith("%") or ln == "":
             flush()
+            k += 1
+            continue
+
+        spacing = re.fullmatch(r"(?:\\par)?\\vspace\*?\{(\d+)\\baselineskip\}", ln)
+        if spacing:
+            flush()
+            blocks.append({"kind": "space", "lines": int(spacing.group(1))})
             k += 1
             continue
 
@@ -191,6 +199,7 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
         m = re.match(r"\\section(\*)?\{(.+)\}\s*$", ln)
         if m:
             flush()
+            fourth = 0
             title = resolve(unesc(m.group(2)))
             if m.group(1):
                 blocks.append({"kind": "heading", "level": 1, "text": title})
@@ -204,9 +213,20 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
             k += 1
             continue
 
+        starred = re.match(r"\\subsection\*\{(.+)\}\s*$", ln)
+        if starred:
+            flush()
+            fourth = 0
+            title = resolve(unesc(starred.group(1)))
+            blocks.append({"kind": "heading", "level": 2, "text": title})
+            toc_entries.append((2, title))
+            k += 1
+            continue
+
         m = re.match(r"\\subsection\{(.+)\}\s*$", ln)
         if m:
             flush()
+            fourth = 0
             cnt[1] += 1
             cnt[2] = 0
             t = "%d.%d　%s" % (cnt[0], cnt[1], resolve(unesc(m.group(1))))
@@ -215,9 +235,20 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
             k += 1
             continue
 
+        starred = re.match(r"\\subsubsection\*\{(.+)\}\s*$", ln)
+        if starred:
+            flush()
+            fourth = 0
+            title = resolve(unesc(starred.group(1)))
+            blocks.append({"kind": "heading", "level": 3, "text": title})
+            toc_entries.append((3, title))
+            k += 1
+            continue
+
         m = re.match(r"\\subsubsection\{(.+)\}\s*$", ln)
         if m:
             flush()
+            fourth = 0
             cnt[2] += 1
             t = "%d.%d.%d　%s" % (cnt[0], cnt[1], cnt[2], resolve(unesc(m.group(1))))
             blocks.append({"kind": "heading", "level": 3, "text": t})
@@ -228,8 +259,11 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
         m = re.match(r"\\paragraph\*?\{(.+)\}\s*$", ln)
         if m:
             flush()
-            blocks.append({"kind": "subheading",
-                           "text": resolve(unesc(m.group(1)))})
+            title = resolve(unesc(m.group(1)))
+            if not ln.startswith(r"\paragraph*"):
+                fourth += 1
+                title = "（%d）%s" % (fourth, title)
+            blocks.append({"kind": "subheading", "text": title})
             k += 1
             continue
 

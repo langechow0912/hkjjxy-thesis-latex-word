@@ -96,7 +96,7 @@
 \ctexset{section = { format={\heiti\zihao{-3}\raggedright}, name={,}, number={\arabic{section}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={6pt}, afterskip={6pt}, runin=false }}
 \ctexset{subsection = { format={\heiti\zihao{4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={4pt}, afterskip={4pt}, runin=false }}
 \ctexset{subsubsection = { format={\heiti\zihao{-4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}.\arabic{subsubsection}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={3pt}, afterskip={3pt}, runin=false }}
-\ctexset{paragraph = { format={\songti\zihao{-4}\raggedright}, name={,}, number={\arabic{section}.\arabic{subsection}.\arabic{subsubsection}.\arabic{paragraph}}, aftername={\hspace{\ccwd}}, indent={0pt}, beforeskip={3pt}, afterskip={3pt}, runin=false }}
+\ctexset{paragraph = { format={\songti\zihao{-4}\raggedright}, name={,}, number={（\arabic{paragraph}）}, aftername={}, indent={0pt}, beforeskip={3pt}, afterskip={3pt}, runin=false }}
 
 % 【C-1.1】目录收录到三级标题；四级编号保留但不进目录
 \setcounter{secnumdepth}{4}
@@ -126,12 +126,12 @@
 \renewcommand{\contentsname}{目\hspace{4\ccwd}录}
 \renewcommand{\listtablename}{表\hspace{2\ccwd}目\hspace{2\ccwd}录}
 \renewcommand{\listfigurename}{图\hspace{2\ccwd}目\hspace{2\ccwd}录}
-\renewcommand{\cfttoctitlefont}{\hfil\songti\zihao{-2}\bfseries}
-\renewcommand{\cftaftertoctitle}{\hfil\vspace*{6mm}}
-\renewcommand{\cftlottitlefont}{\hfil\songti\zihao{-2}\bfseries}
-\renewcommand{\cftafterlottitle}{\hfil\vspace*{6mm}}
-\renewcommand{\cftloftitlefont}{\hfil\songti\zihao{-2}\bfseries}
-\renewcommand{\cftafterloftitle}{\hfil\vspace*{6mm}}
+\renewcommand{\cfttoctitlefont}{\centering\songti\zihao{-2}\bfseries}
+\renewcommand{\cftaftertoctitle}{\par}
+\renewcommand{\cftlottitlefont}{\centering\songti\zihao{-2}\bfseries}
+\renewcommand{\cftafterlottitle}{\par}
+\renewcommand{\cftloftitlefont}{\centering\songti\zihao{-2}\bfseries}
+\renewcommand{\cftafterloftitle}{\par}
 
 % ---------- 表目录/图目录条目：宋体小四、顶格、点线 ----------
 \renewcommand{\cfttabfont}{\zihao{-4}\songti}
@@ -153,9 +153,11 @@
 \renewcommand{\footnotesize}{\zihao{5}\songti}
 
 % ================= 【E-2/E-3】图题：图下方、居中、黑体五号 =================
-\renewcommand{\figurename}{图\hspace{1\ccwd}}
+\renewcommand{\figurename}{图}
+\DeclareCaptionLabelFormat{thesfigure}{图#2}
+\DeclareCaptionLabelSeparator{thesdouble}{\hspace{2\ccwd}}
 \DeclareCaptionFont{wuhaohei}{\zihao{5}\heiti\bfseries}
-\captionsetup[figure]{position=below, justification=centering, singlelinecheck=false, font=wuhaohei, labelfont=wuhaohei, textfont=wuhaohei, labelsep=quad, skip=4pt}
+\captionsetup[figure]{position=below, labelformat=thesfigure, justification=centering, singlelinecheck=false, font=wuhaohei, labelfont=wuhaohei, textfont=wuhaohei, labelsep=thesdouble, skip=4pt}
 
 % ================= 【D】表格 =================
 \newcounter{tblnum}
@@ -203,7 +205,7 @@
 
 % ================= 不带编号的一级块（参考文献、致谢） =================
 % 【M】不带冒号，黑体小四，顶格，两端对齐，并自动进目录
-\newcommand{\unnumsec}[1]{\par\vspace{4pt}\noindent{\heiti\zihao{-4}\linespread{1.5}\selectfont #1}\par\vspace{4pt}\phantomsection\addcontentsline{toc}{section}{#1}}
+\newcommand{\unnumsec}[1]{\par\noindent{\heiti\zihao{-4}\linespread{1.5}\selectfont #1}\par\phantomsection\addcontentsline{toc}{section}{#1}}
 
 % ================= 摘要区：中文题目、英文题目 =================
 % 【C-2】中文题目：黑体小二居中；有副标题时下一行同字号排
@@ -270,5 +272,16 @@
   \fi
   \newpage
 }
+
+
+% Explicit title box: isolate centering from inherited section alignment.
+\newcommand{\thesListTitle}[1]{%
+  \par\noindent\makebox[\linewidth][c]{{\songti\zihao{-2}\bfseries #1}}%
+  \par\nobreak\vspace{\baselineskip}}
+\makeatletter
+\renewcommand{\@cftmaketoctitle}{\thesListTitle{\contentsname}}
+\renewcommand{\@cftmakelottitle}{\thesListTitle{\listtablename}}
+\renewcommand{\@cftmakeloftitle}{\thesListTitle{\listfigurename}}
+\makeatother
 
 \endinput

@@ -22,6 +22,69 @@ def convert(lines):
 
 
 class HeadingNumbers(unittest.TestCase):
+    def test_missing_parent_continues_with_original_number_and_warning(self):
+        stat, headings, logs = convert(['1.1 焦虑表达形式的研究', '正文内容。'])
+        self.assertEqual(headings, ['1.1 焦虑表达形式的研究'])
+        self.assertEqual(stat['numbering'], 'auto')
+        self.assertTrue(any('缺少上级标题' in text for text in logs))
+
+    def test_unnumbered_word_chapter_style_is_recognized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'source.docx'
+            doc = Document()
+            doc.add_paragraph('绪论', style='Heading 1')
+            doc.add_paragraph('1.1 背景')
+            doc.save(source)
+            tex, _ = docx2tex.convert(str(source), tmp, P.load('hkjjxy'), log=lambda *a: None)
+            headings = [b['text'] for b in texparse.parse(tex)['blocks'] if b['kind'] == 'heading']
+            self.assertEqual(headings, ['1　绪论', '1.1　背景'])
+
+    def test_latex_fourth_level_keeps_numbering_and_references_do_not_force_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'source.docx'
+            doc = Document()
+            for line in ['1 绪论', '1.1 背景', '1.1.1 现状', '（1）流动比率',
+                         '内容。', '（2）速动比率', '参考文献', '[1] 文献[J]. 2025.']:
+                doc.add_paragraph(line)
+            doc.save(source)
+            tex, _ = docx2tex.convert(str(source), tmp, P.load('hkjjxy'), log=lambda *a: None)
+            self.assertIn(r'\paragraph{流动比率}', tex)
+            self.assertIn(r'\paragraph{速动比率}', tex)
+            self.assertNotIn(r'\paragraph*', tex)
+            tail = tex[tex.index(r'\paragraph{速动比率}'):]
+            self.assertNotIn(r'\newpage', tail)
+            self.assertIn(r'\par\vspace{3\baselineskip}', tail)
+
+    def test_unnumbered_chapter_before_zero_prefixed_child_is_recovered(self):
+        stat, headings, _ = convert(['引言', '这里是正文。', '企业筹资风险相关理论基础',
+                                    '0.1 企业筹资风险的内涵与分类', '0.1.1 企业筹资风险',
+                                    '1 比亚迪风险识别', '1.1 概况'])
+        self.assertEqual(stat['numbering'], 'auto')
+        self.assertEqual(headings, ['1', '1.1', '1.1.1', '2', '2.1'])
+
+    def test_bracket_titles_follow_parent_level_and_keep_fourth_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Document()
+            for text in ['1 风险', '1.1 偿债', '1.1.1 短期', '（1）流动比率',
+                         '（2）速动比率', '1.2 营运', '（1）应收账款周转率', '（2）存货周转率']:
+                doc.add_paragraph(text)
+            source = Path(tmp) / 'source.docx'
+            doc.save(source)
+            tex, _ = docx2tex.convert(str(source), tmp, P.load('hkjjxy'), log=lambda *a: None)
+            blocks = texparse.parse(tex)['blocks']
+            self.assertEqual([b['text'] for b in blocks if b['kind']=='subheading'],
+                             ['（1）流动比率', '（2）速动比率'])
+            third = [b['text'] for b in blocks if b.get('level')==3]
+            self.assertEqual(third, ['1.1.1　短期', '1.2.1　应收账款周转率', '1.2.2　存货周转率'])
+
+    def test_plain_growth_metric_labels_under_second_level_are_third_level(self):
+        _, headings, _ = convert(['1 风险', '1.1 发展风险', '营业收入增长率',
+                                  '本企业营收增长率在五年内发生变化，' + '指标解释。' * 12,
+                                  '净利润增长率', '净利润增长率用于观察企业变化，' + '指标解释。' * 12])
+        self.assertEqual(headings, ['1', '1.1', '1.1.1', '1.1.2'])
+        _, headings, _ = convert(['1 风险', '1.1 发展风险', '营业收入增长率', '简短备注。'])
+        self.assertEqual(headings, ['1', '1.1'])
+
     def test_complete_source_numbering_is_kept(self):
         stat, headings, logs = convert(
             ['1 绪论', '1.1 背景', '1.1.1 现状', '1.2 意义', '2 理论', '2.1 概念'])

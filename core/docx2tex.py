@@ -64,8 +64,24 @@ def read_items(doc):
                 rid = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
                 if rid and rid in doc.part.related_parts:
                     imgs.append(str(doc.part.related_parts[rid].partname))
+            level = None
+            style = p.style
+            for _ in range(12):
+                if style is None:
+                    break
+                outline = style.element.xpath('./w:pPr/w:outlineLvl/@w:val')
+                match = re.fullmatch(r'(?:heading|标题)\s*([1-4])', style.name, re.I)
+                if outline or match:
+                    level = int(outline[0]) + 1 if outline else int(match.group(1))
+                    break
+                style = style.base_style
+            direct = child.xpath('./w:pPr/w:outlineLvl/@w:val')
+            if direct:
+                level = int(direct[0]) + 1
             items.append({"kind": "p", "pno": pno,
-                          "text": p.text.strip(), "imgs": imgs})
+                          "text": p.text.strip(), "imgs": imgs,
+                          "style": p.style.name if p.style is not None else "",
+                          "heading_level": level if level in (1, 2, 3, 4) else None})
             pno += 1
         elif tag == "tbl":
             t = Table(child, doc)
@@ -103,7 +119,7 @@ def extract_figures(docx_path, items, out_dir, body_start, log=print):
     z = zipfile.ZipFile(docx_path)
     figdir = os.path.join(out_dir, "figures")
     os.makedirs(figdir, exist_ok=True)
-    figmap, order, seq = {}, [], 0
+    figmap, order, seq, missing = {}, [], 0, []
     for it in items:
         if it["kind"] != "p" or not it.get("imgs"):
             continue
@@ -119,6 +135,7 @@ def extract_figures(docx_path, items, out_dir, body_start, log=print):
                 data = z.read("word/media/" + name)
             except KeyError:
                 seq -= 1
+                missing.append(name)
                 continue
             with open(os.path.join(figdir, new), "wb") as f:
                 f.write(data)
@@ -126,8 +143,9 @@ def extract_figures(docx_path, items, out_dir, body_start, log=print):
             order.append(new)
     if seq:
         log("  提取图片 %d 张" % seq)
+    if missing:
+        log("  警告：%d 张图片引用缺失实际文件（%s），已跳过" % (len(missing), ', '.join(missing[:3])))
     return figmap, order
-
 
 def _is_heading_line(s):
     return len(s) <= MAX_HEADING_LEN and "。" not in s and "；" not in s
@@ -142,6 +160,19 @@ def _promote_chapter_title(blocks, chapter):
     章题过长或带句读时 _is_heading_line() 会放过它，整章就并进了上一章。
     只在上一个标题之后找，不跨标题。
     """
+    current = next((b for b in reversed(blocks) if b["t"] == "sec1"), None)
+    if current and current["src"] == (chapter,):
+        return
+    # A short standalone line immediately before a numbered child can be its
+    # unnumbered chapter title. Never invent a title or promote prose paragraphs.
+    if current is None and blocks and blocks[-1]["t"] == "body":
+        candidate = blocks[-1]
+        text = candidate["text"]
+        if (_is_heading_line(text) and len(text) <= MAX_HEADING_LEN
+                and not re.search(r"[，,：:！？!?]", text)
+                and text not in ("引言", "前言", "绪论")):
+            candidate.update(t="sec1", src=(chapter,))
+            return
     for b in reversed(blocks):
         if b["t"] in _SEC_LEVEL:
             return
@@ -161,17 +192,26 @@ def number_headings(blocks):
     并找出第一处错误。返回 ("user", None) 或 ("auto", 错误说明)。
     """
     cnt = [0, 0, 0]
+    problem = None
+    orphan_group = False
     for b in blocks:
         lv = _SEC_LEVEL.get(b["t"])
         if lv is None:
             continue
+        if lv == 1:
+            orphan_group = False
+        elif any(value == 0 for value in cnt[:lv - 1]):
+            orphan_group = True
+            problem = problem or "标题「%s」缺少上级标题，已保留原编号继续排版，请核对标题层级" % b["text"]
+        if orphan_group:
+            b['preserve_number'] = True
         cnt[lv - 1] += 1
         cnt[lv:] = [0] * (3 - lv)
         want = tuple(cnt[:lv])
-        if b["src"] != want:
-            return "auto", "「%s %s」按顺序应为 %s" % (
+        if b["src"] != want and problem is None:
+            problem = "「%s %s」按顺序应为 %s" % (
                 ".".join(map(str, b["src"])), b["text"], ".".join(map(str, want)))
-    return "user", None
+    return ("auto", problem) if problem else ("user", None)
 
 
 def _superscripts(s):
@@ -227,38 +267,51 @@ def scan(items, marks, figmap):
 
         pno, t = it["pno"], it["text"]
 
-        # ---------- 图片 ----------
+        # Consume only an explicit adjacent caption; never take ordinary prose.
         if pno >= body_start and it.get("imgs"):
-            nm = it["imgs"][0].split("/")[-1]
-            if nm in figmap:
-                cap = ""
-                for j in range(i + 1, min(i + 4, len(items))):
-                    nx = items[j]
-                    if nx["kind"] == "p" and nx["text"]:
-                        mm = RE_FIGTITLE.match(nx["text"])
-                        cap = mm.group(3).strip() if mm else re.sub(
-                            r"^图\s*[\d\-．.]+[：:]?\s*", "", nx["text"]).strip()
-                        i = j       # 图题段已被消费
-                        break
+            captions = []
+            end = i + 1
+            # Skip empty paragraphs between image and potential caption
+            while end < len(items) and items[end]["kind"] == "p" and not items[end]["text"] and not items[end].get("imgs"):
+                end += 1
+            # Only consume if next paragraph is an explicit figure caption (matches RE_FIGTITLE)
+            # and has no images of its own (to avoid taking another figure's paragraph)
+            if (end < len(items) and items[end]["kind"] == "p"
+                    and not items[end].get("imgs")):
+                match = RE_FIGTITLE.match(items[end]["text"])
+                if match:
+                    captions.append(match.group(3).strip())
+                    end += 1
+                else:
+                    # Not a figure caption, don't consume it
+                    end = i + 1
+            else:
+                end = i + 1
+            for index, image in enumerate(it["imgs"]):
+                nm = image.split("/")[-1]
+                if nm not in figmap:
+                    blocks.append({"t": "body", "text": "［图片无法提取，请核对原稿］"})
+                    continue
                 fig_seq += 1
                 blocks.append({"t": "figure", "no": fig_seq,
-                               "path": "figures/" + figmap[nm], "cap": cap})
-            i += 1
-            continue
-
-        if pno >= body_start and RE_FIGTITLE.match(t):
-            i += 1
+                               "path": "figures/" + figmap[nm],
+                               "cap": captions[0] if captions and index == 0 else ""})
+            if t:
+                blocks.append({"t": "body", "text": t})
+            i = end
             continue
 
         # ---------- 参考文献区 ----------
-        if ref_pno is not None and pno >= ref_pno:
+        if (ref_pno is not None and pno >= ref_pno
+                and not (ack_pno is not None and ack_pno > ref_pno and pno >= ack_pno)):
             if t and not RE_REF_HEAD.match(t):
                 refs.append(t)
             i += 1
             continue
 
         # ---------- 致谢区 ----------
-        if ack_pno is not None and pno >= ack_pno:
+        if (ack_pno is not None and pno >= ack_pno
+                and not (ref_pno is not None and ref_pno > ack_pno and pno >= ref_pno)):
             if t and not RE_ACK_HEAD.match(t):
                     ack.append(t)
             i += 1
@@ -271,7 +324,12 @@ def scan(items, marks, figmap):
             i += 1
             continue
         if RE_NOTE.match(t) and pno >= body_start:
-            pend_note = t
+            if blocks and blocks[-1]["t"] == "table":
+                blocks[-1]["note"] = " ".join(filter(None, [blocks[-1]["note"], t]))
+            elif i + 1 < len(items) and items[i + 1]["kind"] == "tbl":
+                pend_note = t
+            else:
+                blocks.append({"t": "body", "text": t})
             i += 1
             continue
 
@@ -292,8 +350,46 @@ def scan(items, marks, figmap):
                 blocks.append({"t": "sec2", "text": m2.group(3), "src": src})
             elif m1 and _is_heading_line(t):
                 blocks.append({"t": "sec1", "text": m1.group(2), "src": (int(m1.group(1)),)})
+            elif it.get("heading_level"):
+                level = it["heading_level"]
+                if level == 4:
+                    blocks.append({"t": "sec4", "text": t})
+                else:
+                    counts = [0, 0, 0]
+                    for existing in blocks:
+                        lv = _SEC_LEVEL.get(existing["t"])
+                        if lv:
+                            counts[lv - 1] += 1
+                            counts[lv:] = [0] * (3 - lv)
+                    counts[level - 1] += 1
+                    blocks.append({"t": "sec%d" % level, "text": t,
+                                   "src": tuple(counts[:level])})
             elif m4 and len(m4.group(2)) <= 26:
-                blocks.append({"t": "sec4", "text": m4.group(2)})
+                parent = next((b for b in reversed(blocks)
+                               if b["t"] in _SEC_LEVEL and not b.get("bracket_child")), None)
+                if parent and parent["t"] == "sec2":
+                    blocks.append({"t": "sec3", "text": m4.group(2),
+                                   "src": parent["src"] + (int(m4.group(1)),),
+                                   "bracket_child": True})
+                else:
+                    blocks.append({"t": "sec4", "text": m4.group(2)})
+            elif (3 <= len(t) <= 18 and t.endswith("增长率")
+                  and i + 1 < len(items) and items[i + 1]["kind"] == "p"
+                  and len(items[i + 1]["text"]) > 40
+                  and t[:-1].replace("营业收入", "营收") in
+                      items[i + 1]["text"][:40].replace("营业收入", "营收")):
+                # Standalone metric label followed by its own explanation.
+                # Require a level-2 parent; ordinary short prose stays body text.
+                parent = next((b for b in reversed(blocks)
+                               if b["t"] in _SEC_LEVEL and not b.get("bracket_child")), None)
+                if parent and parent["t"] == "sec2":
+                    siblings = sum(b["t"] == "sec3" and b.get("src", ())[:2] == parent["src"]
+                                   for b in blocks)
+                    blocks.append({"t": "sec3", "text": t,
+                                   "src": parent["src"] + (siblings + 1,),
+                                   "bracket_child": True})
+                else:
+                    blocks.append({"t": "body", "text": t})
             elif t:
                 blocks.append({"t": "body", "text": t})
         i += 1
@@ -324,7 +420,7 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
         r"\enTitle{" + E(meta["en_title"]) + "}",
         "",
         r"\begin{document}",
-        r"\includepdf[pages={%s},pagecommand={}]{front.pdf}" % page_list,
+        r"\includepdf[pages={%s},pagecommand={\thispagestyle{empty}}]{front.pdf}" % page_list,
         r"\tocpage",
         "",
         r"\setcounter{page}{1}",
@@ -352,6 +448,13 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
 
     for b in blocks:
         k = b["t"]
+        if k in ("sec1", "sec2", "sec3"):
+            out.append(r"\setcounter{paragraph}{0}")
+        if b.get('preserve_number'):
+            command = {"sec2": "subsection", "sec3": "subsubsection"}[k]
+            title = ".".join(map(str, b['src'])) + "　" + b['text']
+            out.append("\\%s*{%s}" % (command, E(title)))
+            continue
         if k == "sec1":
             out.append(r"\section{%s}" % E(b["text"]))
         elif k == "sec2":
@@ -359,7 +462,7 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
         elif k == "sec3":
             out.append(r"\subsubsection{%s}" % E(b["text"]))
         elif k == "sec4":
-            out.append(r"\paragraph*{%s}" % E(b["text"]))
+            out.append(r"\paragraph{%s}" % E(b["text"]))
         elif k == "body":
             out.append(_superscripts(E(b["text"])))
             out.append("")
@@ -387,7 +490,7 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
             out.append(r"\end{figure}")
             out.append("")
 
-    out += ["", r"\newpage", r"\vspace*{3\baselineskip}",
+    out += ["", r"\par\vspace{3\baselineskip}",
             r"\unnumsec{参考文献}", "", r"\begin{thesref}"]
     # The bibliography environment supplies numbering; source labels are not citations.
     out += ["  " + r"\item " + E(re.sub(r"^\s*\[\d+\]\s*", "", r)) for r in refs]
@@ -414,7 +517,7 @@ def convert(docx_path, out_dir, cfg=None, log=print):
     blocks, refs, ack = scan(items, marks, figmap)
     numbering, problem = number_headings(blocks)
     if problem:
-        log("  标题编号有误（%s），已按顺序自动编号" % problem)
+        log("  标题编号有误（%s），已继续排版，请核对标题与目录" % problem)
     meta = _meta(items, marks)
     tex = render(blocks, refs, ack, meta, cfg, figmap, fig_order)
     stat = {
@@ -457,6 +560,14 @@ def _meta(items, marks):
             m = RE_TITLE_FIELD.match(it["text"])
             if m and m.group(1).strip():
                 cn_title = m.group(1).strip()
+                break
+
+    if not cn_title and marks["abs_cn"] is not None:
+        for it in reversed(items[:marks["abs_cn"]]):
+            candidate = it.get("text", "").strip()
+            if candidate and len(candidate) <= 100 and not re.search(r"[。；：:]", candidate):
+                if candidate not in ("目录", "目　录", "声明") and not re.search(r"\.{3}|…", candidate):
+                    cn_title = candidate
                 break
 
     en_title = ""

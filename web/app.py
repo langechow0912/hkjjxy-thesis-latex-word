@@ -955,8 +955,7 @@ async def api_dp_format(file: UploadFile = File(...),
         raise HTTPException(400, "题目、作者名、规范 ID 都是必填")
 
     if meta['ruleId'] in ('hkjjxy', 'school:hkjjxy'):
-        if suffix != '.docx':
-            raise HTTPException(400, '海口经济学院本地排版只收 .docx 源文件')
+        meta['sourceSuffix'] = suffix
         job = _new_job(kind='school')
         job.update({'name': meta['title'], 'school_key': 'school:hkjjxy',
                     'stage': '准备本地排版', 'status': None, 'statusLabel': '',

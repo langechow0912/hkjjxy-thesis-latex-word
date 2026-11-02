@@ -41,12 +41,15 @@ class PreviewWatermark(unittest.TestCase):
                  patch.object(schoolformat.texparse, 'parse', return_value={'blocks': [1], 'meta': {}}), \
                  patch.object(schoolformat, 'prepare_cover'), \
                  patch.object(schoolformat.toc, 'probe', return_value=[]), \
+                 patch.object(schoolformat.toc, 'read_entries', return_value=[]), \
+                 patch('core.format_validation.verify', return_value={'passed': False, 'warnings':['需要核对正文']}), \
                  patch.object(schoolformat.docxbuild, 'build'), \
                  patch.object(schoolformat.compiler, 'convert_pdf', return_value='original.pdf'), \
                  patch('core.preview_watermark.haikou_preview', return_value='branded.pdf') as watermark:
                 schoolformat.run(job, b'input', cfg, {'title': 'Title'})
             watermark.assert_called_once_with('original.pdf', 'hkjjxy')
             self.assertEqual(job['state'], 'done')
+            self.assertIn('需要核对正文', job['suggestions'])
             self.assertEqual(job['files']['pdf'], 'branded.pdf')
             self.assertEqual(job['files']['docx'], str(Path(directory) / 'formatted.docx'))
 

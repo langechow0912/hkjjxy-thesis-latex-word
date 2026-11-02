@@ -54,11 +54,40 @@ class SchoolRouting(unittest.TestCase):
                 job = web.JOBS.pop(jid)
                 shutil.rmtree(job['tmp'])
 
+    def test_legacy_doc_upload_enters_local_conversion_flow(self):
+        with patch.object(web, '_run_school') as local:
+            response = self.client.post('/api/format', files={'file': ('paper.DOC', b'legacy')},
+                data={'ruleId': 'school:hkjjxy', 'title': 'Title', 'authorName': 'Author'})
+            self.assertEqual(response.status_code, 200)
+            jid = response.json()['job']
+            try:
+                self.assertEqual(local.call_args.args[2]['sourceSuffix'], '.doc')
+            finally:
+                shutil.rmtree(web.JOBS.pop(jid)['tmp'])
+
     def test_unknown_school_cannot_become_a_path(self):
         with patch.object(web.dayipaper, 'has_token', return_value=True):
             response = self.client.post('/api/format', files={'file': ('paper.docx', b'input')},
             data={'ruleId': 'school:../../outside', 'title': 'Title', 'authorName': 'Author'})
         self.assertEqual(response.status_code, 400)
+
+    def test_cover_trailing_empty_paragraphs_are_removed_before_section(self):
+        from core import docxbuild
+        cfg = P.load('hkjjxy')
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'formatted.docx'
+            struct = texparse.parse(r"\begin{document}" + '\n' + r"\section{绪论}" + '\n' + r"\end{document}")
+            struct['meta'].update(cn_title='测试标题', cn_abstract='', cn_keywords='',
+                                  en_title='', en_abstract='', en_keywords='')
+            docxbuild.build(cfg, struct, str(target), tmp,
+                            P.path(cfg, cfg['cover']['template']))
+            doc = Document(target)
+            declaration = next(p for p in doc.paragraphs if ''.join(p.text.split()) == '声明')
+            self.assertTrue(declaration.paragraph_format.page_break_before)
+            from docx.oxml.ns import qn
+            boundary = next(i for i, p in enumerate(doc.paragraphs)
+                            if p._p.find('.//' + qn('w:sectPr')) is not None)
+            self.assertIn('日期', doc.paragraphs[boundary - 1].text.replace(' ', ''))
 
     def test_cover_keeps_template_fields_unfilled(self):
         cfg = P.load('hkjjxy')

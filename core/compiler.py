@@ -53,6 +53,34 @@ def convert_pdf(cfg, src, outdir, log=print):
     raise RuntimeError("LibreOffice 转换失败：%s" % src)
 
 
+def convert_docx(cfg, src, outdir):
+    """Convert legacy Word to a validated DOCX using a private Office profile."""
+    from pathlib import Path
+    from docx import Document
+    target = Path(outdir) / (Path(src).stem + '.docx')
+    if target.resolve() == Path(src).resolve():
+        raise ValueError('转换输入和输出不能相同')
+    target.unlink(missing_ok=True)
+    soffice = tools.resolve('soffice', cfg)
+    try:
+        with tempfile.TemporaryDirectory(prefix='lo-doc-') as profile_dir:
+            result = subprocess.run([
+                soffice, '-env:UserInstallation=' + Path(profile_dir).as_uri(),
+                '--headless', '--convert-to', 'docx:Office Open XML Text',
+                '--outdir', str(Path(outdir).resolve()), str(Path(src).resolve())
+            ], capture_output=True, timeout=180)
+        if result.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+            raise ValueError('DOC 自动转换失败，文件可能损坏、加密或不是有效的 Word 文档')
+        Document(target)  # Reject invalid output even if Office reports success.
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError('DOC 自动转换超时，请稍后重试') from exc
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError('DOC 自动转换失败，无法读取转换后的 Word 文档') from exc
+    return str(target)
+
+
 def extract_front_pages(cfg, docx_path, out_pdf, tmp_dir, log=print):
     """把生成的 docx 前 N 页（封面 + 声明）单独存成 PDF，供 LaTeX 嵌入"""
     import fitz

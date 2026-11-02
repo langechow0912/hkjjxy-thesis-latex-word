@@ -58,6 +58,9 @@ def para(doc, align=None, before=0, after=0, ls=1.5, indent_first=None,
     pf.space_before = Pt(before)
     pf.space_after = Pt(after)
     pf.line_spacing = ls
+    snap = OxmlElement("w:snapToGrid")
+    snap.set(qn("w:val"), "0")
+    p._p.get_or_add_pPr().append(snap)
     if indent_first is not None:
         pf.first_line_indent = Pt(indent_first)
     if left is not None:
@@ -148,10 +151,9 @@ def figure_caption(doc, n, name, cap_cfg):
 def insert_figure(doc, fig_dir, rel_path, frac, cfg):
     img = os.path.join(fig_dir, os.path.basename(rel_path))
     if not os.path.isfile(img):
-        p = para(doc, align=WD_ALIGN_PARAGRAPH.CENTER)
-        r = p.add_run("［缺图：%s］" % rel_path)
-        fmt(r, size=10.5)
-        return p
+        paragraph = para(doc, align=WD_ALIGN_PARAGRAPH.CENTER)
+        fmt(paragraph.add_run("［缺少图片：%s，请核对原稿］" % rel_path), size=10.5)
+        return paragraph
     doc.add_picture(img, width=Pt(P.textwidth_pt(cfg) * frac))
     # add_picture 返回 InlineShape；承载它的段落是最后一段
     p = doc.paragraphs[-1]
@@ -334,12 +336,29 @@ def build(cfg, struct, out_path, fig_dir, tpl_path, entries_map=None):
     entries_map 为 None 时是「探针」pass：目录只放占位文本，用来渲染取页码。
     """
     doc = Document(tpl_path)
+    # Trailing empty paragraphs can overflow the declaration onto a blank page.
+    # The following section break alone owns the transition to the contents.
+    while len(doc.element.body) > 1:
+        tail = doc.element.body[-2]
+        if tail.tag != qn("w:p"):
+            break
+        if any(node.tag not in {qn("w:p"), qn("w:pPr"), qn("w:rPr"),
+                                qn("w:rFonts"), qn("w:ind"), qn("w:spacing"),
+                                qn("w:r"), qn("w:br"), qn("w:lastRenderedPageBreak")}
+               for node in tail.iter()):
+            break
+        if tail.find(".//" + qn("w:sectPr")) is not None:
+            break
+        doc.element.body.remove(tail)
     define_toc_styles(doc, cfg)
 
     page = cfg["page"]
     m = page["margins"]
 
     def setup_section(s):
+        grid = s._sectPr.find(qn("w:docGrid"))
+        if grid is not None:
+            s._sectPr.remove(grid)
         s.page_width = Pt(P.mm(page["width"]))
         s.page_height = Pt(P.mm(page["height"]))
         s.top_margin = Pt(P.mm(m["top"]))
@@ -448,8 +467,13 @@ def _write_front_matter(doc, cfg, meta):
 def _write_blocks(doc, cfg, blocks, fig_dir):
     tab_no = [0]
     fig_no = [0]
+    pending_space = 0
     for b in blocks:
         kind = b["kind"]
+        if kind == "space":
+            pending_space = max(pending_space, b["lines"] * P.pt(cfg["body"]["size"]) * cfg["body"].get("linespread", 1.5))
+            continue
+        before_count = len(doc.paragraphs)
         if kind == "break":
             page_break(doc)
         elif kind == "heading":
@@ -457,10 +481,9 @@ def _write_blocks(doc, cfg, blocks, fig_dir):
         elif kind == "unnum":
             heading(doc, b["text"], 1, cfg["heading"]["unnum"])
         elif kind == "subheading":
-            p = para(doc, before=6, after=3,
-                     indent_first=P.pt(cfg["body"]["size"]) * cfg["body"]["first_indent"])
+            p = para(doc, before=0, after=0, indent_first=0)
             r = p.add_run(b["text"])
-            fmt(r, size=P.pt(cfg["body"]["size"]), bold=True)
+            fmt(r, size=P.pt(cfg["body"]["size"]))
         elif kind == "table":
             tab_no[0] += 1
             if cfg["table"]["caption"].get("position", "above") == "above":
@@ -478,11 +501,16 @@ def _write_blocks(doc, cfg, blocks, fig_dir):
             insert_figure(doc, fig_dir, b["path"], b.get("frac", 0.82), cfg)
             figure_caption(doc, fig_no[0], b["caption"], cfg["figure"]["caption"])
         elif kind == "ref":
-            p = para(doc, ls=1.2, left=24, hanging=24)
+            p = para(doc, ls=cfg["reference"].get("linespread", 1.0), left=24, hanging=24)
             r = p.add_run(b["text"])
             fmt(r, size=P.pt(cfg["reference"]["size"]))
         elif kind == "text":
             body_paragraph(doc, b["text"], cfg)
+        if pending_space and len(doc.paragraphs) > before_count:
+            paragraph = doc.paragraphs[before_count]
+            paragraph.paragraph_format.space_before = Pt(pending_space)
+            pending_space = 0
+
 
 
 def toc_entry_list(cfg, struct):

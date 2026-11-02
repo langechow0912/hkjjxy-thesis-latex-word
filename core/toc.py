@@ -25,52 +25,73 @@ def probe(cfg, struct, fig_dir, tpl_path, tmp_dir, log=print):
     D.build(cfg, struct, probe_docx, fig_dir, tpl_path, None)
     probe_pdf = compiler.convert_pdf(cfg, probe_docx, tmp_dir, log=log)
 
+    return read_entries(cfg, struct, probe_pdf, log=log)
+
+
+def read_entries(cfg, struct, pdf_path, log=print, strict=False):
+    """Read actual body page numbers; never fabricate a successful page match."""
     import fitz
-    d = fitz.open(probe_pdf)
-    texts = [d[i].get_text().replace("\u3000", " ") for i in range(d.page_count)]
-    d.close()
+    def compact(text):
+        return re.sub(r"\s+", "", text)
 
-    try:
-        body_start = next(i for i, t in enumerate(texts) if "Key words" in t)
-    except StopIteration:
-        body_start = 0
-        log("  警告：探针 PDF 中未找到 Key words，页码从第 1 页起算")
+    # Calculate footer height from bottom margin (default 30mm = ~85pt)
+    # Use 70% of bottom margin to safely capture page number without body text
+    bottom_margin_mm = cfg.get("page", {}).get("margins", {}).get("bottom", 30)
+    if isinstance(bottom_margin_mm, str):
+        # Handle string values like "30mm" by extracting the number
+        bottom_margin_mm = float(re.search(r'[\d.]+', bottom_margin_mm).group())
+    footer_height_pt = float(bottom_margin_mm) * 2.835 * 0.7  # mm to pt conversion, 70% safety margin
 
-    cur = [body_start]
+    with fitz.open(pdf_path) as pdf:
+        texts = [compact(page.get_text(clip=fitz.Rect(0, 0, page.rect.width, page.rect.height - footer_height_pt))) for page in pdf]
+        footers = [page.get_text(clip=fitz.Rect(0, page.rect.height - footer_height_pt, page.rect.width, page.rect.height)).strip() for page in pdf]
+    start_value = int(cfg["page"].get("body_page_start", 1))
+    starts = [i for i, footer in enumerate(footers) if footer == str(start_value)]
+    if len(starts) != 1:
+        if strict:
+            raise ValueError("无法唯一定位正文起始页码，目录核验失败")
+        log("正文起始页码无法唯一确认，目录仅供参考，请核对页码。")
+        title = compact(struct.get('meta', {}).get('cn_title', ''))
+        body_start = next((i for i, text in enumerate(texts) if title and title in text), 0)
+    else:
+        body_start = starts[0]
+    for offset, footer in enumerate(footers[body_start:]):
+        if footer != str(start_value + offset):
+            if strict:
+                raise ValueError("正文页码不连续，目录核验失败")
+            log("正文页码不连续，已继续生成，请核对目录页码。")
+            break
 
-    def find_page(pattern):
-        for i in range(cur[0], len(texts)):
-            if re.search(pattern, texts[i]):
-                cur[0] = i
-                return i - body_start + 1
-        return 1
+    def find(text, cursor):
+        pattern = compact(text)
+        if not pattern:
+            if strict:
+                raise ValueError("目录条目为空，不能生成页码")
+            log("存在空目录条目，请核对目录。")
+            return "待核对", cursor
+        for i in range(cursor, len(texts)):
+            if pattern in texts[i]:
+                return start_value + i - body_start, i
+        if strict:
+            raise ValueError("目录条目无法定位：%s" % text)
+        log("目录条目无法定位，页码标记为待核对：%s" % text)
+        return "待核对", cursor
 
-    loose = set(cfg["toc"].get("loose_match", []))
-
-    def pattern_of(disp):
-        plain = disp.replace("\u3000", " ")
-        if plain in loose:
-            return r"\s*".join(re.escape(c) for c in plain)
-        m = re.match(r"([\d.]+)\s+(.*)", plain)
-        if m:
-            return re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)[:8])
-        return re.escape(plain[:6])
-
-    entries = D.toc_entry_list(cfg, struct)
-    toc_map = [(d_, find_page(pattern_of(d_))) for _, d_ in entries]
-
-    cur[0] = body_start
-    lot_map = [("表%d　%s" % (i, t["name"]), find_page(re.escape(t["name"][:8])))
-               for i, t in enumerate(struct["tables"], 1)] if struct["tables"] else []
-
-    cur[0] = body_start
-    lof_map = [("图%d　%s" % (i, f["caption"]),
-                find_page(r"图\s*%d\s*[\u3000\s]" % i + re.escape(f["caption"][:6])))
-               for i, f in enumerate(struct["figures"], 1)] if struct["figures"] else []
-
-    log("  页码探测：目录 %d 条 / 表目录 %d 条 / 图目录 %d 条"
-        % (len(toc_map), len(lot_map), len(lof_map)))
-    return {"toc": toc_map, "lot": lot_map, "lof": lof_map}
+    result = {}
+    groups = {
+        "toc": [text for _, text in D.toc_entry_list(cfg, struct)],
+        "lot": ["表%d　%s" % (i, table["name"]) for i, table in enumerate(struct["tables"], 1)],
+        "lof": ["图%d　%s" % (i, figure["caption"]) for i, figure in enumerate(struct["figures"], 1)],
+    }
+    for key, labels in groups.items():
+        cursor = body_start
+        entries = []
+        for label in labels:
+            page, cursor = find(label, cursor)
+            entries.append((label, page))
+        result[key] = entries
+    log("  目录页码核验完成")
+    return result
 
 
 def cleanup(tmp_dir):

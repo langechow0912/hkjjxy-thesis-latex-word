@@ -107,9 +107,6 @@ function selectFile(file) {
 }
 async function submit() {
   if ($('go').disabled || !requireLogin(submit)) return;
-  if (selectedRule.id === 'school:hkjjxy' && /\.doc$/i.test(selectedFile.name)) {
-    message('海口经济学院排版只支持 .docx。请在 Word 里“另存为 .docx”后重新上传。', 'error'); return;
-  }
   // The previous result (paid or not) stays in 我的记录, so no confirmation is needed.
   busy = true; clearResult(true); controls(); $('state').textContent = '提交中';
   const data = new FormData(); data.append('file', selectedFile); data.append('ruleId', selectedRule.id);
