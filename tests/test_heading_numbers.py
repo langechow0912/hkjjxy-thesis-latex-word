@@ -22,11 +22,12 @@ def convert(lines):
 
 
 class HeadingNumbers(unittest.TestCase):
-    def test_missing_parent_continues_with_original_number_and_warning(self):
-        stat, headings, logs = convert(['1.1 焦虑表达形式的研究', '正文内容。'])
-        self.assertEqual(headings, ['1.1 焦虑表达形式的研究'])
+    def test_missing_parent_is_compressed_to_top_level_with_a_note(self):
+        # 只有 1.1 没有 1：不编造章题，也不保留星号原编号，压成一级并提示用户。
+        stat, headings, _ = convert(['1.1 焦虑表达形式的研究', '正文内容。'])
+        self.assertEqual(headings, ['1'])
         self.assertEqual(stat['numbering'], 'auto')
-        self.assertTrue(any('缺少上级标题' in text for text in logs))
+        self.assertTrue(any('缺少上级标题' in note for note in stat['notes']))
 
     def test_unnumbered_word_chapter_style_is_recognized(self):
         with tempfile.TemporaryDirectory() as tmp:

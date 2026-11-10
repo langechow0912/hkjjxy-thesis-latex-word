@@ -1,7 +1,7 @@
 """CP4: 最终质检检查点（占位实现）"""
 
 from typing import Dict, Any
-from . import Checkpoint
+from core.dsh.checkpoints import Checkpoint
 
 
 class QualityCheckpoint(Checkpoint):

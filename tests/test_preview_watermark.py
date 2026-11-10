@@ -27,7 +27,7 @@ class PreviewWatermark(unittest.TestCase):
                 self.assertEqual(len(document), 4)
                 for index, page in enumerate(document):
                     self.assertEqual(page.rotation, index * 90)
-                    self.assertEqual(page.get_text().count('良品论文'), 3)
+                    self.assertEqual(page.get_text().count('Paper Studio'), 3)
                     self.assertIn('Original content', page.get_text())
 
     def test_other_school_does_not_open_or_modify_pdf(self):

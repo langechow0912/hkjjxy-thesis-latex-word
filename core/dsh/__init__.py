@@ -43,63 +43,35 @@ class DSHManager:
             self.client = DeepSeekClient(self.dsh_config)
             self.cost = CostController(self.dsh_config)
             self.checkpoints: Dict[str, Checkpoint] = {}
+            self.skills: Dict[str, Dict[str, Any]] = {}
             self._register_checkpoints()
         else:
             self.client = None
             self.cost = None
             self.checkpoints = {}
+            self.skills = {}
 
     def _register_checkpoints(self):
-        """注册检查点（从 skill 加载）"""
-        # 内置检查点（未来移到 skill）
-        from .checkpoints.cp1_preprocess import PreprocessCheckpoint
-        from .checkpoints.cp4_quality import QualityCheckpoint
+        """扫描 core/dsh/skills/ 注册检查点；单个 skill 坏了只跳过它。"""
+        from . import skills
 
-        for cp_class in [PreprocessCheckpoint, QualityCheckpoint]:
-            try:
-                instance = cp_class(self.config, self.client, self.cost)
-                self.checkpoints[instance.name] = instance
-                logger.info(f"Registered checkpoint: {instance.name}")
-            except Exception as e:
-                logger.warning(f"Failed to register {cp_class.__name__}: {e}")
-
-        # TODO: 从 .claude/skills/dsh-*/checkpoint.py 加载自定义检查点
-        self._load_skill_checkpoints()
-
-    def _load_skill_checkpoints(self):
-        """从 skill 目录加载检查点"""
-        skills_dir = Path('.claude/skills')
-        if not skills_dir.exists():
-            return
-
-        for skill_dir in skills_dir.iterdir():
-            if not skill_dir.is_dir() or not skill_dir.name.startswith('dsh-'):
+        self.skills: Dict[str, Dict[str, Any]] = {}
+        for info in skills.discover():
+            if not info['has_checkpoint']:
                 continue
-
-            checkpoint_file = skill_dir / 'checkpoint.py'
-            if not checkpoint_file.exists():
-                continue
-
             try:
-                # 动态加载 checkpoint.py
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    f"skill_{skill_dir.name}", checkpoint_file
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-
-                # 查找 Checkpoint 子类
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if (isinstance(attr, type) and
-                        issubclass(attr, Checkpoint) and
-                        attr != Checkpoint):
+                module = skills.load_module(info['dir'])
+                for attr in vars(module).values():
+                    if (isinstance(attr, type) and issubclass(attr, Checkpoint)
+                            and attr is not Checkpoint
+                            and attr.__module__ == module.__name__):
                         instance = attr(self.config, self.client, self.cost)
                         self.checkpoints[instance.name] = instance
-                        logger.info(f"Loaded skill checkpoint: {instance.name} from {skill_dir.name}")
+                        self.skills[instance.name] = info
+                        logger.info("Registered checkpoint %s from skill %s",
+                                    instance.name, info['dir'])
             except Exception as e:
-                logger.warning(f"Failed to load checkpoint from {skill_dir.name}: {e}")
+                logger.warning("Failed to load skill %s: %s", info['dir'], e)
 
     async def run_checkpoint(
         self,
@@ -162,16 +134,19 @@ class DSHManager:
                 raise
             return {'success': False, 'error': str(e), 'actions': []}
 
-    def list_checkpoints(self) -> List[Dict[str, str]]:
-        """列出所有已注册的检查点"""
-        return [
-            {
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        """列出所有已注册的检查点及其 skill 元数据"""
+        out = []
+        for name, cp in self.checkpoints.items():
+            info = (getattr(self, 'skills', {}) or {}).get(name, {})
+            out.append({
                 'name': name,
                 'enabled': cp.is_enabled(),
-                'description': cp.__doc__ or ''
-            }
-            for name, cp in self.checkpoints.items()
-        ]
+                'description': info.get('description') or cp.__doc__ or '',
+                'skill': info.get('dir', ''),
+                'version': info.get('version', ''),
+            })
+        return out
 
 
 __all__ = ['DSHManager', 'Checkpoint']

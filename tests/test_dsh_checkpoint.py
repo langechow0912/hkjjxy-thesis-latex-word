@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from core import profile
 from core.dsh import runner as dsh_runner
-from core.dsh.checkpoints.cp1_preprocess import PreprocessCheckpoint, parse_suggestions
+from core.dsh import skills
+_preprocess = skills.load_module('dsh-preprocess')
+PreprocessCheckpoint, parse_suggestions = _preprocess.PreprocessCheckpoint, _preprocess.parse_suggestions
 
 
 GOOD = json.dumps({
@@ -121,9 +123,9 @@ class CheckpointBehaviour(unittest.TestCase):
         self.assertTrue(result['warnings'])
 
     def test_prompt_ships_inside_the_package(self):
-        """prompt 必须在 core/dsh/prompts/ 下，否则镜像里读不到。
+        """prompt 必须在 core/dsh/skills/ 下，否则镜像里读不到。
 
-        Dockerfile 只 COPY core/web/schools，.claude/skills 不进镜像。
+        Dockerfile 只 COPY core/web/schools，.claude/ 不进镜像。
         """
         cp = PreprocessCheckpoint(self.cfg, FakeClient(GOOD), cost=None)
         path = cp._prompt_path()

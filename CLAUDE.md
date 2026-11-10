@@ -41,9 +41,11 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 
 **前端**是 `web/static/` 下无构建的 `index.html` + `app.js`，每个静态文件在 `web/app.py` 里有单独的路由，没有整体挂载，新增静态文件要加路由。
 
-**标题编号**：`docx2tex.number_headings` 在原稿编号完整（章、节、小节都从 1 起连续）时沿用，否则按顺序自动编号。
+**标题识别与编号**：`core/headings.py` 的 `plan()` 通读全文给标题定级。认「第X章 / 一、/（一）/ 1. / 1.1 /（1）/ ①」等编号、Word 标题样式和加粗短行；`1 / 1.1 / 1.1.1` 层级固定，`（一）/ 1. /（1）/ ①` 按嵌套顺序推断。原编号一律剥掉再由模板重新编号；缺上级时压缩层级（不编造标题、不再用星号保留原编号）；超过第 4 级的降为加粗正文。每次自动调整都写进 `stat['notes']` 展示给用户。`docx2tex.number_headings` 只负责判断原稿编号是否完整（完整就沿用，否则按顺序自动编号）。图题在图上方、下方、同段都认（`docx2tex.scan` + `core/figures.py`），表格单元格里的图会移到表后。
 
 **Tabword 服务**（`core/tabword.py` + `web/tabword_routes.py`）：26 个接口涵盖降 AI/检测/格式排版，详见 `docs/tabword-api.md`。付费任务默认关闭（`TABWORD_ENABLE_CALLS=false`），只开放免费目录 GET（`presets`、`detection_options`）。需独立 `TABWORD_API_KEY`，不复用大以论文 PAT。
+
+**DSH（DeepSeek Harness，`core/dsh/`）**：排版流程里的智能检查点框架，只产出建议，不改原稿，失败不影响排版。每个功能是 `core/dsh/skills/<name>/`（`SKILL.md` + `checkpoint.py` + `prompts/`），`DSHManager` 自动扫描；新增功能只加目录。必须放在 `core/` 下，镜像不 COPY `.claude/`。模型只收到 `outline.py` 压出的结构清单（正文只给字数）。登录用户调试页 `/dsh`（`web/dsh_routes.py`）可看目录、手动运行、对话，会真调 DeepSeek，受 `dsh.chat.per_user_daily` 限制。详见 `core/dsh/README.md`。
 
 **优惠券与推广员**（`core/affiliates.py`）：管理后台 `/admin/affiliates` 可创建全平台或按 `school:<id>` / `dayipaper:<id>` 限定的优惠券，支付下单时服务端校验并冻结优惠金额。推广员入口 `/affiliate`，新增时显示一次性访问令牌。推广员可申请提现，管理员审核后手动转账并上传凭证（保存在 `/data` 卷）。
 

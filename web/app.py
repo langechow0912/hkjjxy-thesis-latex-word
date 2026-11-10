@@ -76,9 +76,11 @@ app = FastAPI(title="毕业论文格式流水线", lifespan=_lifespan,
               redoc_url=None if PRODUCTION else "/redoc",
               openapi_url=None if PRODUCTION else "/openapi.json")
 from web.tabword_routes import router as tabword_router
+from web import dsh_routes
 from web import account_routes
 from web.account_routes import current_user
 app.include_router(tabword_router)
+app.include_router(dsh_routes.router)
 app.include_router(account_routes.router)
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -396,7 +398,20 @@ def _new_job(kind="build"):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC / "index.html").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    if not dsh_routes.page_enabled():      # DSH 调试页未开放时，首页不显示入口
+        html = re.sub(r"<!--dsh-nav-->.*?<!--/dsh-nav-->", "", html, flags=re.S)
+    return html
+
+
+@app.get("/favicon.png")
+def favicon_png():
+    return FileResponse(STATIC / "favicon.png", media_type="image/png")
+
+
+@app.get("/favicon.ico")
+def favicon_ico():
+    return FileResponse(STATIC / "favicon.ico", media_type="image/x-icon")
 
 
 @app.get("/app.js")
@@ -521,6 +536,20 @@ def affiliate_portal_page():
 @app.get("/affiliate.js")
 def affiliate_portal_script():
     return FileResponse(STATIC / "affiliate.js", media_type="application/javascript")
+
+
+@app.get("/dsh", response_class=HTMLResponse)
+def dsh_page():
+    if not dsh_routes.page_enabled():
+        raise HTTPException(404, "Not Found")
+    return (STATIC / "dsh.html").read_text(encoding="utf-8")
+
+
+@app.get("/dsh.js")
+def dsh_script():
+    if not dsh_routes.page_enabled():
+        raise HTTPException(404, "Not Found")
+    return FileResponse(STATIC / "dsh.js", media_type="application/javascript")
 
 
 @app.get("/r/{code}")
@@ -764,6 +793,9 @@ def _live_job(job_id):
         _drop_job(job)
         raise HTTPException(410, "付款已超过 24 小时，排版成品已按规定删除")
     return job
+
+
+dsh_routes.bind(_live_job)
 
 
 def _format_job(job_id):

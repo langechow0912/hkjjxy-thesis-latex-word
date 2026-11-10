@@ -54,6 +54,7 @@ def run(job, payload, cfg, meta):
         # 交给 DSH 判断；它只返回建议，不改原稿，失败也不影响排版。
         from .dsh import runner as dsh_runner
         stat = stat or {}
+        dsh_runner.save_outline(work, stat)
         suspicious = bool((stat.get('numbering') or (None, None))[1])
         report = dsh_runner.run_preprocess(cfg, {
             'source': str(source),

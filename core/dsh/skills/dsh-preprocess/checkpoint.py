@@ -11,7 +11,7 @@ import json
 import re
 from typing import Dict, Any
 
-from . import Checkpoint
+from core.dsh.checkpoints import Checkpoint
 
 # 允许模型提出的动作。超出这个集合的一律丢弃——防止它顺手改正文。
 ALLOWED_OPS = {"insert_heading", "adjust_level", "renumber", "rename"}
@@ -96,14 +96,21 @@ class PreprocessCheckpoint(Checkpoint):
         return bool(context.get('suspicious'))
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        from .. import outline as outline_mod
+        from core.dsh import outline as outline_mod
 
         items = context.get('items') or []
         body_start = context.get('body_start', 0)
-        structure = "\n".join(outline_mod.build(
-            items, body_start,
-            resolved_levels=context.get('resolved_levels') or {}))
-        outl = "\n".join(outline_mod.outline_lines(items, body_start))
+        # 调试页没有原始 items，只有落盘的结构清单，直接传现成的行
+        structure_lines = context.get('structure_lines')
+        if structure_lines is None:
+            structure_lines = outline_mod.build(
+                items, body_start,
+                resolved_levels=context.get('resolved_levels') or {})
+        outline_lines = context.get('outline_lines')
+        if outline_lines is None:
+            outline_lines = outline_mod.outline_lines(items, body_start)
+        structure = "\n".join(structure_lines)
+        outl = "\n".join(outline_lines)
 
         prompt_file = self._prompt_path()
         template = prompt_file.read_text(encoding='utf-8')
@@ -143,15 +150,9 @@ class PreprocessCheckpoint(Checkpoint):
         }
 
     def _prompt_path(self):
-        """prompt 跟着包走（core/dsh/prompts/），镜像里才有。
+        """prompt 在 skill 目录里（core/dsh/skills/dsh-preprocess/prompts/）。
 
-        开发时的 .claude/skills 版本只作为兜底：它是同一份文件的副本，
-        放在包里分发是因为 Dockerfile 只 COPY core/web/schools。
+        整个 skill 随 core/ 一起进镜像（Dockerfile 只 COPY core/web/schools）。
         """
         from pathlib import Path
-        here = Path(__file__).resolve()
-        packaged = here.parents[1] / 'prompts' / 'heading_fix.txt'
-        if packaged.exists():
-            return packaged
-        skill = here.parents[3] / '.claude' / 'skills' / 'dsh-preprocess' / 'prompts' / 'heading_fix.txt'
-        return skill
+        return Path(__file__).resolve().parent / 'prompts' / 'heading_fix.txt'

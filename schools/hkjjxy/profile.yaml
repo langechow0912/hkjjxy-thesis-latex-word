@@ -145,6 +145,10 @@ dsh:
     per_job_limit: 5
     cache_ttl: 3600
 
+  # 调试页的对话 / 手动检查：每个登录用户每天最多调用次数（会真实消耗 DeepSeek token）
+  chat:
+    per_user_daily: 20
+
   # 降级策略
   fallback:
     on_error: "warn"

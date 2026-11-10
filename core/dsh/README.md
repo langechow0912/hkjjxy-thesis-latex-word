@@ -37,21 +37,22 @@ PDF 转换
 
 ```
 core/dsh/
-  __init__.py           # DSHManager（检查点调度）
+  __init__.py           # DSHManager（扫描 skills/ 注册检查点、调度）
   client.py             # DeepSeek API 封装
-  cost_control.py       # 配额管理与成本统计
+  cost_control.py       # 配额管理（全局日配额 / 单任务 / 每用户每日）与成本统计
+  outline.py            # 把原稿压成「结构清单」（模型只看这个，不看正文）
+  runner.py             # 同步排版流程里调用 DSH；save_outline/load_outline 落盘结构
   checkpoints/
     __init__.py         # Checkpoint 基类
-    cp1_preprocess.py   # 文档预处理（Phase 2 实现）
-    cp4_quality.py      # 最终质检（Phase 3 实现）
-  prompts/
-    preprocess.txt      # CP1 的 prompt 模板
-    quality.txt         # CP4 的 prompt 模板
-
-.claude/skills/
-  dsh-xxx/              # 自定义检查点（通过 skill 扩展）
-    checkpoint.py       # 继承 Checkpoint 基类
-    SKILL.md            # skill 元数据
+  skills/               # 每个 DSH 功能一个目录，新增功能 = 新增目录
+    __init__.py         # discover()/load_module()
+    dsh-preprocess/     # CP1 标题层级 / 编号检查
+      SKILL.md          #   frontmatter：name/description/version/checkpoint
+      checkpoint.py     #   Checkpoint 子类
+      prompts/heading_fix.txt
+    dsh-quality/        # CP4 质检（占位，默认不启用）
+web/dsh_routes.py       # /api/dsh/*：skills、jobs、outline、run、chat
+web/static/dsh.html|js  # 调试页 /dsh：目录树、skill 列表、对话、调试信息
 ```
 
 ## 📦 Phase 1 实现（基础框架）
@@ -68,9 +69,10 @@ core/dsh/
 ### 功能特性
 
 1. **Skill 扩展机制**
-   - 将自定义检查点放在 `.claude/skills/dsh-xxx/checkpoint.py`
+   - 在 `core/dsh/skills/dsh-xxx/` 下放 `SKILL.md` + `checkpoint.py`（+ `prompts/`）
    - 继承 `Checkpoint` 基类并实现 `name`, `should_run`, `execute`
-   - DSHManager 自动扫描加载
+   - DSHManager 自动扫描加载；单个 skill 加载失败只跳过它
+   - 放在 `core/` 下是因为 Dockerfile 只 COPY `core/ web/ schools/`，`.claude/` 不进镜像
 
 2. **成本控制**
    - 日配额限制（默认 1000 次/天）
@@ -117,7 +119,7 @@ if result and result['success']:
 
 ### 3. 编写自定义检查点（Skill）
 
-创建 `.claude/skills/dsh-my-check/checkpoint.py`：
+创建 `core/dsh/skills/dsh-my-check/`，里面放 `SKILL.md`（frontmatter 写 name/description/version/checkpoint）和 `checkpoint.py`：
 
 ```python
 from core.dsh.checkpoints import Checkpoint
@@ -158,6 +160,15 @@ dsh:
     - cpx_my_check  # 你的自定义检查点
 ```
 
+## 🧪 调试页 `/dsh`
+
+登录用户可打开 `/dsh`：选一个自己的本地排版任务，查看 DSH 识别出的目录树（标出流水线判定级别与 Word 原大纲级别的差异）、模型实际收到的结构清单、
+已注册的 skill（可手动运行已启用的检查点），以及和 DSH 对话。
+
+- 排版时 `schoolformat.run` 会把结构清单写进任务目录的 `dsh_outline.json`（只含标题文字和各段字数，不含正文）；只有此后新排版的任务才有。
+- 对话与手动运行会真实调用 DeepSeek：受全局日配额和 `dsh.chat.per_user_daily`（默认 20 次/人/天）限制；模型只收到结构清单。
+- 只能访问自己名下的任务，别人的任务一律 404。
+
 ## 📊 成本统计
 
 DSH 会记录每次 API 调用的成本（保存在 `.dsh_cost.json`）：
@@ -177,14 +188,11 @@ print(stats)
 
 ### Phase 2: CP1 预处理（通过 Skill 实现）
 
-创建 `.claude/skills/dsh-preprocess/`:
-- `checkpoint.py`：标题层级修复逻辑
-- `prompts/heading_fix.txt`：Prompt 模板
-- `SKILL.md`：Skill 元数据
+已完成：`core/dsh/skills/dsh-preprocess/`（`checkpoint.py` / `prompts/heading_fix.txt` / `SKILL.md`）。
 
 ### Phase 3: CP4 质检（通过 Skill 实现）
 
-创建 `.claude/skills/dsh-quality/`:
+目前 `core/dsh/skills/dsh-quality/` 只是占位：
 - `checkpoint.py`：PDF 质量评分逻辑
 - `prompts/quality_check.txt`：Prompt 模板
 - `SKILL.md`：Skill 元数据

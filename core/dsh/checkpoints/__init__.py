@@ -19,7 +19,7 @@ class Checkpoint(ABC):
     - 最终质量评分
 
     通过继承此类并实现抽象方法，可以添加新的检查点。
-    建议将自定义检查点放在 .claude/skills/dsh-xxx/checkpoint.py 中。
+    新检查点放在 core/dsh/skills/dsh-xxx/（SKILL.md + checkpoint.py + prompts/），DSHManager 会自动扫描加载。
     """
 
     def __init__(

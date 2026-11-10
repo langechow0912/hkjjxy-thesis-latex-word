@@ -4,9 +4,11 @@
 通用启发式，不为某一篇硬编码。转完务必人工过一遍 tex，再看一眼 PDF。
 
 识别规则：
-  * 章节标题靠编号格式识别（1 / 1.1 / 1.1.1 / （1））；**没有编号的标题识别不出来**
-  * 原稿编号完整就沿用；有跳号、重号、节不属于当前章时，按出现顺序自动编号
-  * 图表按「图/表 X-Y：题名」识别，编号重排为全文连续（图 1…N、表 1…N）
+  * 章节标题由 core/headings.py 通读全文后定级：认「第一章 / 一、/ （一）/ 1. / 1.1 /
+    （1）/ ①」等编号，也认 Word 标题样式和加粗短行；一律剥掉原编号再按模板重新编号
+  * 缺上级的标题压缩层级，超过模板四级的降为加粗正文
+  * 图表按「图/表 X-Y：题名」识别，题注在图的下方、上方或同一段都认；
+    编号重排为全文连续（图 1…N、表 1…N）
   * 参考文献取「参考文献」之后的连续段落，逐条 \\item
   * 封面信息表、声明页自动跳过（以摘要位置为界）
 
@@ -23,6 +25,9 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from . import figures, headings
+from .headings import MAX_HEADING_LEN, cn2int  # noqa: F401  对外仍从这里取
+
 RE_TITLE_FIELD = re.compile(r"^题目[:：]\s*(.*)$")
 RE_ABS_CN = re.compile(r"^摘\s*要[:：]\s*(.*)$")
 RE_KEY_CN = re.compile(r"^关键词[:：]\s*(.*)$")
@@ -33,47 +38,33 @@ RE_ACK_HEAD = re.compile(r"^致\s*谢\s*$")
 # 编号可以是「1-1」两段式，也可以是全文连续的「1」。不做 \d+ 直接吃下去，
 # 是因为按位置配题名/正文判断，不会因为放宽编号而误收正文。
 # 英文稿常见 Table 1 / Figure 2，同样收进来。
-RE_TABTITLE = re.compile(r"^表\s*(\d+)(?:\s*[-—－]\s*(\d+))?\s*[:：]?\s*(.*)$")
-RE_FIGTITLE = re.compile(r"^图\s*(\d+)(?:\s*[-—－]\s*(\d+))?\s*[:：]?\s*(.*)$")
+RE_TABTITLE = re.compile(r"^表\s*(\d+)(?:\s*[-—－.．]\s*(\d+))?\s*[:：.．、]?\s*(.*)$")
+RE_FIGTITLE = re.compile(r"^图\s*(\d+)(?:\s*[-—－.．]\s*(\d+))?\s*[:：.．、]?\s*(.*)$")
 RE_TABTITLE_EN = re.compile(r"^Table\s*(\d+)(?:\.(\d+))?\s*[:：.]?\s*(.*)$", re.I)
 RE_FIGTITLE_EN = re.compile(r"^Figure\s*(\d+)(?:\.(\d+))?\s*[:：.]?\s*(.*)$", re.I)
 RE_NOTE = re.compile(r"^(数据来源|资料来源|注)[:：]")
-RE_H1 = re.compile(r"^(\d{1,2})(?![\d\-.])[\s\u3000]*(\S.*)$")
-RE_H2 = re.compile(r"^(\d{1,2})\.(\d{1,2})[\s\u3000]*(\S.*)$")
-RE_H3 = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})[\s\u3000]*(\S.*)$")
-RE_H4 = re.compile(r"^[（(](\d+)[)）]\s*(.+)$")
 RE_CITE = re.compile(r"\[(\d+(?:\s*[,，]\s*\d+)*)\]")
-
-# 中文数字编号：第一章 / 第 2 章 / 一、/ （一）。很多学校模板用这套，
-# 而 Word 大纲级别并不总是可靠，所以单独认。
-_CN_NUM = "〇零一二三四五六七八九十"
-RE_H1_CN = re.compile(r"^第\s*([%s\d]{1,3})\s*[章篇]\s*([\s　]*\S.*)?$" % _CN_NUM)
-RE_H1_CN_DUN = re.compile(r"^([%s]{1,3})\s*[、．.]\s*(\S.*)$" % _CN_NUM)
-RE_H2_CN_PAREN = re.compile(r"^[（(]([%s]{1,3})[)）]\s*(\S.*)$" % _CN_NUM)
-
-_CN_DIGITS = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
-              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-
-MAX_HEADING_LEN = 32
+MAX_CAPTION_LEN = 60
+RE_APPENDIX = re.compile(
+    r"^附\s*录(?:\s*([A-Za-z]|\d{1,2}|[一二三四五六七八九十]{1,2}))?([\s　:：、.．]*)(.*)$")
 
 
-def cn2int(s):
-    """中文数字转整数，够用到 99。转不出来返回 None（宁可当正文，不猜）。"""
-    s = (s or "").strip()
-    if s.isdigit():
-        return int(s)
-    if not s or "百" in s:
+def appendix_title(text):
+    """「附录1 调查问卷」「附录A：访谈提纲」「附录」→ 规范化标题；不是附录标题返回 None。
+
+    只认短的、不带句号的行；「附录见文末」这类正文句子（附录后面直接跟字、
+    既没编号也没分隔）不算。
+    """
+    t = (text or "").strip()
+    if len(t) > 40 or "。" in t:
         return None
-    if "十" in s:
-        head, _, tail = s.partition("十")
-        tens = 1 if not head else _CN_DIGITS.get(head)
-        ones = 0 if not tail else _CN_DIGITS.get(tail)
-        if tens is None or ones is None:
-            return None
-        return tens * 10 + ones
-    if len(s) == 1:
-        return _CN_DIGITS.get(s)
-    return None
+    m = RE_APPENDIX.match(t)
+    if not m:
+        return None
+    label, sep, rest = m.group(1) or "", m.group(2), m.group(3).strip()
+    if not label and rest and not sep:
+        return None
+    return "附录" + label + ("　" + rest if rest else "")
 
 
 def esc(s):
@@ -118,11 +109,7 @@ def read_items(doc):
         tag = child.tag.split("}")[-1]
         if tag == "p":
             p = Paragraph(child, doc)
-            imgs = []
-            for blip in child.iter(qn("a:blip")):
-                rid = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
-                if rid and rid in doc.part.related_parts:
-                    imgs.append(str(doc.part.related_parts[rid].partname))
+            imgs = figures.image_targets(child, doc)
             level = None
             style = p.style
             for _ in range(12):
@@ -140,6 +127,7 @@ def read_items(doc):
             items.append({"kind": "p", "pno": pno,
                           "text": _para_text(child).strip(), "imgs": imgs,
                           "style": p.style.name if p.style is not None else "",
+                          "bold": _all_bold(p),
                           "heading_level": level if level in (1, 2, 3, 4) else None})
             pno += 1
         elif tag == "tbl":
@@ -147,7 +135,31 @@ def read_items(doc):
             rows = [[c.text.strip().replace("\n", " ") for c in r.cells]
                     for r in t.rows]
             items.append({"kind": "tbl", "pno": pno, "rows": rows})
+            # 单元格里的图片 python-docx 读不到文字，原先整张图会丢。
+            # 挪到表格后面作为独立图片段，并标记来源，后面据此提示用户。
+            for target in figures.image_targets(child, doc):
+                items.append({"kind": "p", "pno": pno, "text": "", "imgs": [target],
+                              "style": "", "bold": False, "heading_level": None,
+                              "from_table": True})
     return items
+
+
+def _all_bold(p):
+    """整段文字都加粗（run 自身或段落样式设了粗体）。空段落返回 False。"""
+    runs = [r for r in p.runs if r.text.strip()]
+    if not runs:
+        return False
+    try:
+        style_bold = p.style.font.bold if p.style is not None else None
+    except AttributeError:
+        style_bold = None
+    for r in runs:
+        bold = r.bold
+        if bold is None:
+            bold = style_bold
+        if not bold:
+            return False
+    return True
 
 
 def locate(items):
@@ -206,61 +218,7 @@ def extract_figures(docx_path, items, out_dir, body_start, log=print):
         log("  警告：%d 张图片引用缺失实际文件（%s），已跳过" % (len(missing), ', '.join(missing[:3])))
     return figmap, order
 
-def _is_heading_line(s):
-    return len(s) <= MAX_HEADING_LEN and "。" not in s and "；" not in s
-
-
-def _cn_chapter(t):
-    """「第一章 绪论」「第十二章 …」「一、研究背景」→ (章号, 题名) 或 None。
-
-    只认一级；「（一）」在中文模板里既可能是一级也可能是二级，
-    交给调用方按上下文判断，这里不猜。
-    """
-    m = RE_H1_CN.match(t)
-    if m:
-        num = cn2int(m.group(1))
-        if num is not None:
-            return num, (m.group(2) or "").strip()
-        return None
-    m = RE_H1_CN_DUN.match(t)
-    if m:
-        num = cn2int(m.group(1))
-        if num is not None and _is_heading_line(t):
-            return num, m.group(2).strip()
-    return None
-
-
 _SEC_LEVEL = {"sec1": 1, "sec2": 2, "sec3": 3}
-
-
-def _promote_chapter_title(blocks, chapter):
-    """遇到 X.Y 却还没见过第 X 章时，往回找被当成正文的「X 章题」并升格。
-
-    章题过长或带句读时 _is_heading_line() 会放过它，整章就并进了上一章。
-    只在上一个标题之后找，不跨标题。
-    """
-    current = next((b for b in reversed(blocks) if b["t"] == "sec1"), None)
-    if current and current["src"] == (chapter,):
-        return
-    # A short standalone line immediately before a numbered child can be its
-    # unnumbered chapter title. Never invent a title or promote prose paragraphs.
-    if current is None and blocks and blocks[-1]["t"] == "body":
-        candidate = blocks[-1]
-        text = candidate["text"]
-        if (_is_heading_line(text) and len(text) <= MAX_HEADING_LEN
-                and not re.search(r"[，,：:！？!?]", text)
-                and text not in ("引言", "前言", "绪论")):
-            candidate.update(t="sec1", src=(chapter,))
-            return
-    for b in reversed(blocks):
-        if b["t"] in _SEC_LEVEL:
-            return
-        if b["t"] != "body":
-            continue
-        m = RE_H1.match(b["text"])
-        if m and int(m.group(1)) == chapter and len(b["text"]) <= 2 * MAX_HEADING_LEN:
-            b.update(t="sec1", text=m.group(2), src=(chapter,))
-            return
 
 
 def number_headings(blocks):
@@ -272,18 +230,10 @@ def number_headings(blocks):
     """
     cnt = [0, 0, 0]
     problem = None
-    orphan_group = False
     for b in blocks:
         lv = _SEC_LEVEL.get(b["t"])
         if lv is None:
             continue
-        if lv == 1:
-            orphan_group = False
-        elif any(value == 0 for value in cnt[:lv - 1]):
-            orphan_group = True
-            problem = problem or "标题「%s」缺少上级标题，已保留原编号继续排版，请核对标题层级" % b["text"]
-        if orphan_group:
-            b['preserve_number'] = True
         cnt[lv - 1] += 1
         cnt[lv:] = [0] * (3 - lv)
         want = tuple(cnt[:lv])
@@ -316,6 +266,9 @@ def _caption_match(text, kind):
         if m:
             # 中文正则组 3 是题名，英文正则也是组 3
             title = (m.group(3) or "").strip()
+            # 「图1显示了公司……。」是正文引用，不是题注：题名过长或以句末标点收尾就放过。
+            if len(title) > MAX_CAPTION_LEN or title.endswith(("。", "；")):
+                return None
             return _label_key(m.group(1), m.group(2)), title
     return None
 
@@ -335,11 +288,56 @@ def _unph(s):
     return re.sub(r"\ue001(\d+)\ue002", r"\\ref{fig:f\1}", s)
 
 
+def _heading_block(d):
+    """headings.plan 的决定 → 文档块。level 超过 4 的降为加粗正文，保留原文含编号。"""
+    level = d["level"]
+    if level <= 3:
+        return {"t": "sec%d" % level, "text": d["text"], "src": d["src"]}
+    if level == 4:
+        return {"t": "sec4", "text": d["text"]}
+    return {"t": "body", "text": d["orig"], "bold": True}
+
+
 def scan(items, marks, figmap):
-    """扫描文档流，产出 blocks / refs / ack"""
+    """扫描文档流，产出 blocks / refs / ack / 标题调整说明"""
     body_start = marks["body_start"]
     ref_pno = items[marks["ref"]]["pno"] if marks["ref"] is not None else None
     ack_pno = items[marks["ack"]]["pno"] if marks["ack"] is not None else None
+
+    # 正文之后依次可能出现参考文献、致谢、附录，顺序不固定：
+    # 每个标记管到下一个标记之前。附录区的图表照常处理，只是不再判标题。
+    markers = []
+    if ref_pno is not None:
+        markers.append((ref_pno, "ref"))
+    if ack_pno is not None:
+        markers.append((ack_pno, "ack"))
+    app_titles = {}
+    for it in items:
+        if it["kind"] == "p" and it["pno"] >= body_start and it["text"]:
+            title = appendix_title(it["text"])
+            if title is not None:
+                app_titles[it["pno"]] = title
+                markers.append((it["pno"], "app"))
+    markers.sort()
+
+    def zone(pno):
+        found = None
+        for start, name in markers:
+            if start > pno:
+                break
+            found = name
+        return found
+
+    def not_heading_candidate(it):
+        """题注、表注、参考文献/致谢/附录区的段落不参与标题判断"""
+        pno, text = it["pno"], it["text"]
+        if zone(pno) or RE_NOTE.match(text):
+            return True
+        mt = _caption_match(text, "table")
+        return bool(mt and mt[1].strip()) or bool(_caption_match(text, "figure"))
+
+    # 先通读全文给标题定级（编号体系、缺上级、超层级都在这里处理）
+    hplan, hnotes = headings.plan(items, body_start, not_heading_candidate)
 
     # ---- 先建「表 X-Y / 表 X → 全文序号」映射（按表出现顺序）----
     tabmap, keys = {}, []
@@ -350,23 +348,29 @@ def scan(items, marks, figmap):
                 keys.append(m[0])
     for i, k in enumerate(keys, 1):
         tabmap.setdefault(k, i)
+    # 图的映射在扫描时随图出现顺序填：图题的位置有三种写法，提前数不准。
+    fig_keys = {}
 
     def resolve(s):
         # 正文里的「如表 1-1 / 如表 1 所示」换成 \ref。编号两段式优先，其次是单段。
         # 原稿常写成「如表 表1 所示」，重复的「表」一并收掉。
         # 这里只放占位符：正文后面还要过 esc()，直接写反斜杠会被转义成字面文本。
-        s = re.sub(r"表\s*(?:表\s*)?(\d+)\s*[-—－]\s*(\d+)",
+        s = re.sub(r"表\s*(?:表\s*)?(\d+)\s*[-—－.．]\s*(\d+)",
                    lambda m: _ph("tab", tabmap.get(_label_key(m.group(1), m.group(2)), 1)), s)
         s = re.sub(r"表\s*(?:表\s*)?(\d+)(?![\d\-—－.])",
                    lambda m: _ph("tab", tabmap.get(_label_key(m.group(1), None), 1)), s)
-        s = re.sub(r"图\s*(?:图\s*)?(\d+)\s*[-—－]\s*(\d+)",
-                   lambda m: _ph("fig", tabmap.get(_label_key(m.group(1), m.group(2)), 1)), s)
+        # 图编号只查图自己的映射；查不到（原稿引用了不存在的图）就保持原文，不乱指。
+        s = re.sub(r"图\s*(?:图\s*)?(\d+)\s*[-—－.．]\s*(\d+)",
+                   lambda m: (_ph("fig", fig_keys[_label_key(m.group(1), m.group(2))])
+                              if _label_key(m.group(1), m.group(2)) in fig_keys else m.group(0)), s)
         s = re.sub(r"图\s*(?:图\s*)?(\d+)(?![\d\-—－.])",
-                   lambda m: _ph("fig", tabmap.get(_label_key(m.group(1), None), 1)), s)
+                   lambda m: (_ph("fig", fig_keys[_label_key(m.group(1), None)])
+                              if _label_key(m.group(1), None) in fig_keys else m.group(0)), s)
         return s
 
     blocks, refs, ack = [], [], []
     pending_title = ""
+    pending_fig = None      # 写在图上方的图题 (编号键, 题名)
     pend_note = ""
     tab_seq = 0
     fig_seq = 0
@@ -388,55 +392,77 @@ def scan(items, marks, figmap):
 
         pno, t = it["pno"], it["text"]
 
-        # Consume only an explicit adjacent caption; never take ordinary prose.
+        # ---------- 图片 ----------
+        # 图题只认明确的「图 X…」写法，普通正文不会被当成题注吞掉。
+        # 位置按优先级：图上方已经出现的图题 > 图和题注同一段 > 图下方紧邻的一段。
         if pno >= body_start and it.get("imgs"):
-            captions = []
-            end = i + 1
-            # Skip empty paragraphs between image and potential caption
-            while end < len(items) and items[end]["kind"] == "p" and not items[end]["text"] and not items[end].get("imgs"):
-                end += 1
-            # Only consume if next paragraph is an explicit figure caption (matches RE_FIGTITLE)
-            # and has no images of its own (to avoid taking another figure's paragraph)
-            if (end < len(items) and items[end]["kind"] == "p"
-                    and not items[end].get("imgs")):
-                match = _caption_match(items[end]["text"], "figure")
-                if match and match[1]:
-                    captions.append(match[1])
-                    end += 1
-                else:
-                    # Not a figure caption, don't consume it
-                    end = i + 1
+            cap_key, cap_title, end = None, "", i + 1
+            if pending_fig:
+                cap_key, cap_title = pending_fig
+                pending_fig = None
             else:
-                end = i + 1
+                same = _caption_match(t, "figure") if t else None
+                if same:
+                    cap_key, cap_title = same
+                    t = ""
+                else:
+                    nxt_i = i + 1
+                    while (nxt_i < len(items) and items[nxt_i]["kind"] == "p"
+                           and not items[nxt_i]["text"] and not items[nxt_i].get("imgs")):
+                        nxt_i += 1
+                    if (nxt_i < len(items) and items[nxt_i]["kind"] == "p"
+                            and not items[nxt_i].get("imgs")):
+                        below = _caption_match(items[nxt_i]["text"], "figure")
+                        if below:
+                            cap_key, cap_title = below
+                            end = nxt_i + 1
             for index, image in enumerate(it["imgs"]):
                 nm = image.split("/")[-1]
                 if nm not in figmap:
                     blocks.append({"t": "body", "text": "［图片无法提取，请核对原稿］"})
                     continue
                 fig_seq += 1
+                if index == 0 and cap_key:
+                    fig_keys.setdefault(cap_key, fig_seq)
                 blocks.append({"t": "figure", "no": fig_seq,
                                "path": "figures/" + figmap[nm],
-                               "cap": captions[0] if captions and index == 0 else ""})
+                               "cap": cap_title if index == 0 else "",
+                               "from_table": bool(it.get("from_table"))})
             if t:
                 blocks.append({"t": "body", "text": t})
             i = end
             continue
 
+        # ---------- 附录标题：另起一页，格式同「参考文献」标题 ----------
+        if pno in app_titles:
+            blocks.append({"t": "appendix", "text": app_titles[pno]})
+            i += 1
+            continue
+
         # ---------- 参考文献区 ----------
-        if (ref_pno is not None and pno >= ref_pno
-                and not (ack_pno is not None and ack_pno > ref_pno and pno >= ack_pno)):
+        if zone(pno) == "ref":
             if t and not RE_REF_HEAD.match(t):
                 refs.append(t)
             i += 1
             continue
 
         # ---------- 致谢区 ----------
-        if (ack_pno is not None and pno >= ack_pno
-                and not (ref_pno is not None and ref_pno > ack_pno and pno >= ref_pno)):
+        if zone(pno) == "ack":
             if t and not RE_ACK_HEAD.match(t):
-                    ack.append(t)
+                ack.append(t)
             i += 1
             continue
+
+        # ---------- 图上方的图题 ----------
+        # 紧跟着（隔着空段落也算）就是一张图，这行就是它的题注，先存着等图出现。
+        if pno >= body_start and not it.get("imgs"):
+            mf = _caption_match(t, "figure")
+            if mf:
+                nxt = figures.next_nonempty(items, i)
+                if nxt is not None and nxt["kind"] == "p" and nxt.get("imgs"):
+                    pending_fig = mf
+                    i += 1
+                    continue
 
         # ---------- 表题 / 表注 ----------
         # 题名不能为空，否则宁可当正文留着，不要吞掉一句话。
@@ -461,68 +487,11 @@ def scan(items, marks, figmap):
             i += 1
             continue
 
-        # ---------- 标题 ----------
-        # src 记下原稿写的编号，number_headings() 据此判断沿用原稿还是自动编号。
+        # ---------- 标题 / 正文 ----------
         if pno >= body_start:
-            m3 = RE_H3.match(t)
-            m2 = RE_H2.match(t)
-            m1 = RE_H1.match(t)
-            m4 = RE_H4.match(t)
-            cn1 = _cn_chapter(t)
-            if cn1 is not None and _is_heading_line(t):
-                # 「第一章 绪论」「一、研究背景」。编号形态本身说明了层级，
-                # 比 Word 大纲级别可靠，所以排在前面判。
-                blocks.append({"t": "sec1", "text": cn1[1], "src": (cn1[0],)})
-            elif m3:
-                src = tuple(int(x) for x in m3.group(1, 2, 3))
-                _promote_chapter_title(blocks, src[0])
-                blocks.append({"t": "sec3", "text": m3.group(4), "src": src})
-            elif m2:
-                src = tuple(int(x) for x in m2.group(1, 2))
-                _promote_chapter_title(blocks, src[0])
-                blocks.append({"t": "sec2", "text": m2.group(3), "src": src})
-            elif m1 and _is_heading_line(t):
-                blocks.append({"t": "sec1", "text": m1.group(2), "src": (int(m1.group(1)),)})
-            elif it.get("heading_level"):
-                level = it["heading_level"]
-                if level == 4:
-                    blocks.append({"t": "sec4", "text": t})
-                else:
-                    counts = [0, 0, 0]
-                    for existing in blocks:
-                        lv = _SEC_LEVEL.get(existing["t"])
-                        if lv:
-                            counts[lv - 1] += 1
-                            counts[lv:] = [0] * (3 - lv)
-                    counts[level - 1] += 1
-                    blocks.append({"t": "sec%d" % level, "text": t,
-                                   "src": tuple(counts[:level])})
-            elif m4 and len(m4.group(2)) <= 26:
-                parent = next((b for b in reversed(blocks)
-                               if b["t"] in _SEC_LEVEL and not b.get("bracket_child")), None)
-                if parent and parent["t"] == "sec2":
-                    blocks.append({"t": "sec3", "text": m4.group(2),
-                                   "src": parent["src"] + (int(m4.group(1)),),
-                                   "bracket_child": True})
-                else:
-                    blocks.append({"t": "sec4", "text": m4.group(2)})
-            elif (3 <= len(t) <= 18 and t.endswith("增长率")
-                  and i + 1 < len(items) and items[i + 1]["kind"] == "p"
-                  and len(items[i + 1]["text"]) > 40
-                  and t[:-1].replace("营业收入", "营收") in
-                      items[i + 1]["text"][:40].replace("营业收入", "营收")):
-                # Standalone metric label followed by its own explanation.
-                # Require a level-2 parent; ordinary short prose stays body text.
-                parent = next((b for b in reversed(blocks)
-                               if b["t"] in _SEC_LEVEL and not b.get("bracket_child")), None)
-                if parent and parent["t"] == "sec2":
-                    siblings = sum(b["t"] == "sec3" and b.get("src", ())[:2] == parent["src"]
-                                   for b in blocks)
-                    blocks.append({"t": "sec3", "text": t,
-                                   "src": parent["src"] + (siblings + 1,),
-                                   "bracket_child": True})
-                else:
-                    blocks.append({"t": "body", "text": t})
+            decision = hplan.get(pno)
+            if decision:
+                blocks.append(_heading_block(decision))
             elif t:
                 blocks.append({"t": "body", "text": t})
         i += 1
@@ -531,9 +500,17 @@ def scan(items, marks, figmap):
     # 标题不动：标题里的「1」「2.1」是章节号，不是图表号。
     for b in blocks:
         if b["t"] == "body":
+            # 长得像题注却没被消费的行（题名为空、或图/表不在预期位置），audit 要提示
+            if _caption_match(b["text"], "figure") or _caption_match(b["text"], "table"):
+                b["stray_caption"] = True
             b["text"] = resolve(b["text"])
 
-    return blocks, refs, ack
+    # 附录不管在原稿的哪个位置，都从第一个附录标题起单独成组，最后统一输出
+    cut = next((n for n, b in enumerate(blocks) if b["t"] == "appendix"), None)
+    appendix = []
+    if cut is not None:
+        blocks, appendix = blocks[:cut], blocks[cut:]
+    return blocks, refs, ack, hnotes, appendix
 
 
 def audit(blocks):
@@ -553,6 +530,17 @@ def audit(blocks):
         notes.append("第 %s 张图没识别到图题（原稿可能没写，或图题不在图片紧下方），"
                      "已按无图题排版，请补图题后重新生成。" % "、".join(map(str, unnamed_fig)))
 
+    moved = [b["no"] for b in blocks if b["t"] == "figure" and b.get("from_table")]
+    if moved:
+        notes.append("第 %s 张图原稿放在表格单元格里，已移到该表格之后单独排版，请核对位置。"
+                     % "、".join(map(str, moved)))
+
+    stray = [b["text"][:16] for b in blocks if b["t"] == "body" and b.get("stray_caption")]
+    if stray:
+        notes.append("有 %d 行文字像图/表题注，但没找到对应的图或表（%s），已按正文处理。"
+                     "题注应紧贴图（上方或下方）或表（上方）。"
+                     % (len(stray), "、".join("「%s」" % s for s in stray[:3])))
+
     missing = sum(1 for b in blocks
                   if b["t"] == "body" and b["text"].startswith("［图片无法提取"))
     if missing:
@@ -561,7 +549,7 @@ def audit(blocks):
     return notes
 
 
-def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
+def render(blocks, refs, ack, meta, cfg, figmap, fig_order, appendix=(), ack_first=True):
     pkg = (cfg or {}).get("latex", {}).get("package_name", "thesis-format")
     pages = int((cfg or {}).get("cover", {}).get("pages", 2))
     page_list = ",".join(str(i) for i in range(1, pages + 1))
@@ -610,49 +598,53 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
         "",
     ]
 
-    for b in blocks:
-        k = b["t"]
-        if k in ("sec1", "sec2", "sec3"):
-            out.append(r"\setcounter{paragraph}{0}")
-        if b.get('preserve_number'):
-            command = {"sec2": "subsection", "sec3": "subsubsection"}[k]
-            title = ".".join(map(str, b['src'])) + "　" + b['text']
-            out.append("\\%s*{%s}" % (command, E(title)))
-            continue
-        if k == "sec1":
-            out.append(r"\section{%s}" % E(b["text"]))
-        elif k == "sec2":
-            out.append(r"\subsection{%s}" % E(b["text"]))
-        elif k == "sec3":
-            out.append(r"\subsubsection{%s}" % E(b["text"]))
-        elif k == "sec4":
-            out.append(r"\paragraph{%s}" % E(b["text"]))
-        elif k == "body":
-            out.append(_unph(_superscripts(E(b["text"]))))
-            out.append("")
-        elif k == "table":
-            rows = b["rows"]
-            ncol = len(rows[0]) if rows else 1
-            out.append(r"\begin{thesTab}[htbp]{%s\label{tab:t%d}}{%s}"
-                       % (E(b["title"]), b["no"], E(b["note"])))
-            out.append(r"\begin{tabularx}{\linewidth}{X" + " c" * (ncol - 1) + "}")
-            out.append(r"  \toprule")
-            for ri, row in enumerate(rows):
-                out.append("  " + " & ".join(E(c) for c in row) + r" \\")
-                if ri == 0:
-                    out.append(r"  \midrule")
-            out.append(r"  \bottomrule")
-            out.append(r"\end{tabularx}")
-            out.append(r"\end{thesTab}")
-            out.append("")
-        elif k == "figure":
-            out.append(r"\begin{figure}[htbp]")
-            out.append(r"  \centering")
-            out.append(r"  \includegraphics[width=%.2f\linewidth]{%s}"
-                       % (wfrac, b["path"]))
-            out.append(r"  \caption{%s}\label{fig:f%d}" % (E(b["cap"]), b["no"]))
-            out.append(r"\end{figure}")
-            out.append("")
+    def emit(block_list):
+        for b in block_list:
+            k = b["t"]
+            if k == "appendix":
+                # 附录另起一页，标题格式同「参考文献」（黑体小四、顶格），内容按正文格式
+                out.extend([r"\newpage", r"\vspace*{3\baselineskip}",
+                            r"\unnumsec{%s}" % E(b["text"]), ""])
+                continue
+            if k in ("sec1", "sec2", "sec3"):
+                out.append(r"\setcounter{paragraph}{0}")
+            if k == "sec1":
+                out.append(r"\section{%s}" % E(b["text"]))
+            elif k == "sec2":
+                out.append(r"\subsection{%s}" % E(b["text"]))
+            elif k == "sec3":
+                out.append(r"\subsubsection{%s}" % E(b["text"]))
+            elif k == "sec4":
+                out.append(r"\paragraph{%s}" % E(b["text"]))
+            elif k == "body":
+                text = _unph(_superscripts(E(b["text"])))
+                out.append(r"\textbf{%s}" % text if b.get("bold") else text)
+                out.append("")
+            elif k == "table":
+                rows = b["rows"]
+                ncol = len(rows[0]) if rows else 1
+                out.append(r"\begin{thesTab}[htbp]{%s\label{tab:t%d}}{%s}"
+                           % (E(b["title"]), b["no"], E(b["note"])))
+                out.append(r"\begin{tabularx}{\linewidth}{X" + " c" * (ncol - 1) + "}")
+                out.append(r"  \toprule")
+                for ri, row in enumerate(rows):
+                    out.append("  " + " & ".join(E(c) for c in row) + r" \\")
+                    if ri == 0:
+                        out.append(r"  \midrule")
+                out.append(r"  \bottomrule")
+                out.append(r"\end{tabularx}")
+                out.append(r"\end{thesTab}")
+                out.append("")
+            elif k == "figure":
+                out.append(r"\begin{figure}[htbp]")
+                out.append(r"  \centering")
+                out.append(r"  \includegraphics[width=%.2f\linewidth]{%s}"
+                           % (wfrac, b["path"]))
+                out.append(r"  \caption{%s}\label{fig:f%d}" % (E(b["cap"]), b["no"]))
+                out.append(r"\end{figure}")
+                out.append("")
+
+    emit(blocks)
 
     out += ["", r"\par\vspace{3\baselineskip}",
             r"\unnumsec{参考文献}", "", r"\begin{thesref}"]
@@ -660,11 +652,20 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order):
     out += ["  " + r"\item " + E(re.sub(r"^\s*\[\d+\]\s*", "", r)) for r in refs]
     out += [r"\end{thesref}", ""]
 
-    if ack:
-        out += ["", r"\newpage", r"\vspace*{3\baselineskip}",
-                r"\unnumsec{致谢}", ""]
-        out += [E(a) for a in ack]
-        out += [""]
+    def emit_ack():
+        if ack:
+            out.extend(["", r"\newpage", r"\vspace*{3\baselineskip}",
+                        r"\unnumsec{致谢}", ""])
+            out.extend(E(a) for a in ack)
+            out.append("")
+
+    # 致谢和附录谁在前，跟着原稿走
+    if ack_first:
+        emit_ack()
+        emit(appendix)
+    else:
+        emit(appendix)
+        emit_ack()
 
     out += [r"\end{document}", ""]
     return "\n".join(out)
@@ -678,15 +679,19 @@ def convert(docx_path, out_dir, cfg=None, log=print):
     marks["body_start"] = _body_start(items, marks)
     figmap, fig_order = extract_figures(docx_path, items, out_dir,
                                         marks["body_start"], log=log)
-    blocks, refs, ack = scan(items, marks, figmap)
+    blocks, refs, ack, heading_notes, appendix = scan(items, marks, figmap)
     numbering, problem = number_headings(blocks)
     if problem:
         log("  标题编号有误（%s），已继续排版，请核对标题与目录" % problem)
+    if heading_notes:
+        numbering = "auto"
     meta = _meta(items, marks)
-    tex = render(blocks, refs, ack, meta, cfg, figmap, fig_order)
+    tex = render(blocks, refs, ack, meta, cfg, figmap, fig_order,
+                 appendix=appendix, ack_first=_ack_before_appendix(items, marks))
+    everything = blocks + appendix      # 图表统计和审计要把附录里的也算上
     stat = {
-        "tables": sum(1 for b in blocks if b["t"] == "table"),
-        "figures": sum(1 for b in blocks if b["t"] == "figure"),
+        "tables": sum(1 for b in everything if b["t"] == "table"),
+        "figures": sum(1 for b in everything if b["t"] == "figure"),
         "refs": len(refs),
         "sec1": sum(1 for b in blocks if b["t"] == "sec1"),
         "sec2": sum(1 for b in blocks if b["t"] == "sec2"),
@@ -695,7 +700,7 @@ def convert(docx_path, out_dir, cfg=None, log=print):
         "numbering": numbering,
         "title": meta["cn_title"],
         # 识别不出题名/图片的提示，供 web 流程直接展示给用户。
-        "notes": audit(blocks),
+        "notes": heading_notes + audit(everything),
         # 原文条目与正文起点，给 DSH 生成结构清单用（免得再解析一遍 docx）。
         "items": items,
         "body_start": marks["body_start"],
@@ -704,6 +709,18 @@ def convert(docx_path, out_dir, cfg=None, log=print):
         "resolved_levels": _resolved_levels(blocks),
     }
     return tex, stat
+
+
+def _ack_before_appendix(items, marks):
+    """致谢在附录之前吗？没有致谢或没有附录时无所谓，按默认（致谢在前）。"""
+    if marks["ack"] is None:
+        return True
+    ack_pno = items[marks["ack"]]["pno"]
+    for it in items:
+        if (it["kind"] == "p" and it["pno"] >= marks["body_start"]
+                and appendix_title(it["text"]) is not None):
+            return ack_pno < it["pno"]
+    return True
 
 
 _SEC_LEVEL_NAME = {"sec1": 1, "sec2": 2, "sec3": 3, "sec4": 4}

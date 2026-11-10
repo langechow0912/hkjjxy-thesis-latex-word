@@ -8,9 +8,8 @@ checkpoint: cp1_preprocess
 
 # DSH 预处理 Skill
 
-> **运行时用的是 `core/dsh/prompts/heading_fix.txt`。**
-> 本目录的 `prompts/heading_fix.txt` 只是开发期副本（Dockerfile 不 COPY `.claude/`，
-> 镜像里读不到）。要改 prompt 请改 `core/dsh/` 那份，本目录这份保持同步。
+> 本 skill 放在 `core/dsh/skills/`，随 `core/` 一起进镜像；prompt 就是本目录的
+> `prompts/heading_fix.txt`，只有这一份。
 
 在排版流程中检查并修复文档结构问题。所有修复以**建议**形式反馈给用户，
 不直接改写原稿——用户最终决定是否采纳。

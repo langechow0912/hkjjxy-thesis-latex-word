@@ -535,11 +535,11 @@ function twRender(data, eventName = '') {
   for (const [key,label] of [['score','AI 率'],['level','风险等级'],['total_chars','检测字符数'],['ai_rate','AI 率'],['original_ai_rate','原始 AI 率'],['rewritten_ai_rate','改写后 AI 率'],['reduction','降低'],['character_count','字符数'],['total_time','耗时']]) if (payload[key] != null) stats.push(`${label}：${payload[key]}${key === 'score' ? '%' : ''}`);
   if (stats.length) $('twStats').textContent = stats.join('　·　');
   const links = {...payload, ...(payload.report_files || {})};
-  for (const key of ['result_url','paraphrased_url','diff_url','docxUrl','previewUrl','downloadUrl','workbenchUrl','html_detail_url','pdf_summary_url']) {
+  for (const key of ['original_url','result_url','paraphrased_url','diff_url','docxUrl','previewUrl','downloadUrl','workbenchUrl','html_detail_url','pdf_summary_url']) {
     if (!links[key]) continue;
     try { const url = new URL(links[key]); if (!['https:','http:'].includes(url.protocol)) continue;
       const link = document.createElement('a'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
-      link.textContent = key === 'diff_url' ? '下载标红对比稿' : key === 'previewUrl' || key === 'workbenchUrl' ? '查看报告 / 对照' : key === 'html_detail_url' ? '查看 HTML 详细报告' : key === 'pdf_summary_url' ? '下载 PDF 检测报告' : '下载处理结果'; $('twLinks').append(link);
+      link.textContent = key === 'original_url' ? '下载原文' : key === 'result_url' || key === 'paraphrased_url' ? '下载改写稿' : key === 'diff_url' ? '下载标红对比稿' : key === 'previewUrl' || key === 'workbenchUrl' ? '查看报告 / 对照' : key === 'html_detail_url' ? '查看 HTML 详细报告' : key === 'pdf_summary_url' ? '下载 PDF 检测报告' : '下载处理结果'; $('twLinks').append(link);
     } catch {}
   }
   if (!payload.paraphrased_text && !(eventName === 'progress' && payload.original)) $('twCompare').disabled = true;
@@ -840,7 +840,7 @@ function showWorkspace(view) {
   // The Word payment panel belongs to the formatting view only.
   $('paymentPanel').hidden = !format || !paymentJob;
   const title = format ? '论文排版' : detect ? 'AIGC 检测' : history ? '我的记录' : '降重 / 降 AI';
-  $('pageTitle').textContent = title; $('pageCrumb').textContent = title;
+  $('pageCrumb').textContent = title;
   $('pageLede').textContent = format ? '匹配院校规范，从初稿到成稿。' : detect ? '选择检测平台，查看论文的 AI 率报告。'
     : history ? '登录后上传的论文和已付款的服务都在这里。' : '按需选择降重或降 AI 模型，保留原意，整理表达。';
   for (const button of document.querySelectorAll('[data-view]')) { const active = button.dataset.view === view; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current','page'); else button.removeAttribute('aria-current'); }

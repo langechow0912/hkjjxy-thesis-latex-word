@@ -98,3 +98,43 @@ def to_messages(report, limit=3):
     for note in (report.get('notes') or [])[:2]:
         out.append('结构检查：%s' % note)
     return out
+
+
+OUTLINE_FILE = 'dsh_outline.json'
+
+
+def save_outline(work_dir, stat):
+    """把 DSH 实际看到的结构落盘，供调试页事后查看。只存结构清单，不存正文。
+
+    任何失败都吞掉：这是调试辅助，不能影响排版。
+    """
+    try:
+        import json
+        from pathlib import Path
+        from . import outline
+        stat = stat or {}
+        items = stat.get('items') or []
+        body_start = stat.get('body_start', 0)
+        rows, truncated = outline.rows(items, body_start,
+                                       resolved_levels=stat.get('resolved_levels') or {})
+        data = {
+            'rows': rows,
+            'truncated': truncated,
+            'word_outline': outline.outline_lines(items, body_start),
+            'suspicious': bool((stat.get('numbering') or (None, None))[1]),
+        }
+        Path(work_dir, OUTLINE_FILE).write_text(
+            json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    except Exception as exc:                      # noqa: BLE001
+        logger.warning("DSH outline not saved: %s", exc)
+
+
+def load_outline(work_dir):
+    """读回 save_outline 写的文件；没有或损坏返回 None。"""
+    import json
+    from pathlib import Path
+    try:
+        data = json.loads(Path(work_dir, OUTLINE_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get('rows'), list) else None

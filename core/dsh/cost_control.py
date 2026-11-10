@@ -24,7 +24,9 @@ class CostController:
         self.daily_quota = cost_config.get('daily_quota', 1000)
         self.per_job_limit = cost_config.get('per_job_limit', 5)
 
-        self.state_file = Path('.dsh_cost.json')
+        self.state_file = Path(cost_config.get('state_file') or '.dsh_cost.json')
+        # 对登录用户开放的对话/手动检查：每人每天的调用上限
+        self.per_user_daily = int((config.get('chat') or {}).get('per_user_daily', 20))
         self._load_state()
 
     def _load_state(self):
@@ -118,6 +120,22 @@ class CostController:
         self._save_state()
 
         logger.info(f"DSH call recorded: {checkpoint}, tokens={tokens}, job={job_id}")
+
+    def user_used(self, user_id) -> int:
+        """该用户今天已用的对话/手动检查次数"""
+        return self.state.get('users', {}).get(str(user_id), {}).get(self._today(), 0)
+
+    def can_user(self, user_id) -> bool:
+        return self.user_used(user_id) < self.per_user_daily
+
+    def record_user(self, user_id):
+        today = self._today()
+        days = self.state.setdefault('users', {}).setdefault(str(user_id), {})
+        # 只留今天，状态文件不会随用户数无限增长
+        for day in [d for d in days if d != today]:
+            del days[day]
+        days[today] = days.get(today, 0) + 1
+        self._save_state()
 
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

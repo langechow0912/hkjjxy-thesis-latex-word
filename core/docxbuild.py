@@ -214,19 +214,24 @@ def three_line_table(doc, rows, cfg):
 
 
 def body_paragraph(doc, text, cfg):
-    """正文段落；把 \\textsuperscript{[n]} 渲染成上标"""
+    """正文段落；把 \\textsuperscript{[n]} 渲染成上标。
+    整段被 \\textbf{...} 包住时整段加粗（超出模板层级的标题就这样保留）。"""
     if not text:
         return None
+    bold = False
+    wrapped = re.fullmatch(r"\\textbf\{(.*)\}", text, re.S)
+    if wrapped:
+        bold, text = True, wrapped.group(1)
     p = para(doc, indent_first=P.pt(cfg["body"]["size"]) * cfg["body"]["first_indent"])
     size = P.pt(cfg["body"]["size"])
     for part in re.split(r"(\\textsuperscript\{[^}]*\})", text):
         m = re.match(r"\\textsuperscript\{([^}]*)\}", part)
         if m:
             r = p.add_run(m.group(1))
-            fmt(r, size=size, sup=True)
+            fmt(r, size=size, sup=True, bold=bold)
         elif part:
             r = p.add_run(part)
-            fmt(r, size=size)
+            fmt(r, size=size, bold=bold)
     return p
 
 
