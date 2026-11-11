@@ -241,6 +241,26 @@ class Topup(PointsBase):
         self.assertFalse(points.credit_topup(order_no))
         self.assertEqual(points.balance(user['id']), 100)
 
+    def test_reading_balance_confirms_a_paid_topup_without_notification(self):
+        # 本地收不到异步通知、付款页回跳到新标签或关掉弹窗后没人轮询：读余额时要主动向支付宝确认
+        user = make_user()
+        order_no = self.paid_topup(user)
+        alipay._LAST_QUERY.pop(order_no, None)
+        paid = {'code': '10000', 'out_trade_no': order_no, 'trade_status': 'TRADE_SUCCESS',
+                'total_amount': '10.00', 'trade_no': 't-sync'}
+        with patch.object(alipay, '_request', return_value=paid):
+            self.assertEqual(points.summary(user['id'])['balance'], 100)
+        self.assertEqual([r['kind'] for r in points.ledger(user['id'])], ['topup'])
+
+    def test_old_unpaid_topups_are_not_queried(self):
+        user = make_user()
+        order_no = self.paid_topup(user)
+        with closing(points._connect()) as conn, conn:
+            conn.execute("UPDATE point_topups SET created_at=0 WHERE order_no=?", (order_no,))
+        with patch.object(alipay, 'sync_order') as sync:
+            points.summary(user['id'])
+        sync.assert_not_called()
+
     def test_amount_mismatch_is_not_credited(self):
         user = make_user()
         order_no = self.paid_topup(user, 10)

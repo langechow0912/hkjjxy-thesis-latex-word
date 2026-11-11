@@ -302,11 +302,14 @@ def credit_topup(order_no):
         return False
 
 
+TOPUP_SYNC_GRACE = 30 * 60            # 付款页过期后再查这么久，覆盖临近过期才付款、通知延迟的情况
+
+
 def reconcile(user_id):
     """补记已付款但没入账的充值（进程在标记付款和入账之间崩溃的情况），并补完扣了积分却没落订单的支付。"""
     with closing(_connect()) as conn:
-        topups = [r["order_no"] for r in conn.execute(
-            """SELECT order_no FROM point_topups t WHERE user_id=?
+        topups = [(r["order_no"], r["created_at"]) for r in conn.execute(
+            """SELECT order_no, created_at FROM point_topups t WHERE user_id=?
                AND NOT EXISTS (SELECT 1 FROM points_ledger WHERE kind='topup' AND ref=t.order_no)""", (user_id,))]
         spends = [(r["ref"], r["note"]) for r in conn.execute(
             "SELECT ref, note FROM points_ledger WHERE user_id=? AND kind='spend' ORDER BY id DESC LIMIT 50", (user_id,))]
@@ -319,8 +322,13 @@ def reconcile(user_id):
             ai_release(ref, "AI 助手预留超时，已退还")
         except Exception:                                  # noqa: BLE001
             logger.exception("ai hold release failed: %s", ref)
-    for order_no in topups:
+    recent = time.time() - alipay.ORDER_LIFETIME - TOPUP_SYNC_GRACE
+    for order_no, created_at in topups:
         try:
+            if created_at >= recent:
+                # 异步通知可能收不到（本地没有公网地址、通知丢失），付款页回跳或关掉弹窗后
+                # 就没人再轮询这笔单；读余额时主动向支付宝确认一次（sync_order 自带频率限制）。
+                alipay.sync_order(order_no)
             credit_topup(order_no)
         except Exception:                                  # noqa: BLE001 — 对账失败不该影响读余额
             logger.exception("topup reconcile failed: %s", order_no)

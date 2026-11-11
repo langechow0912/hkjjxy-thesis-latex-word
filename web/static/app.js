@@ -416,6 +416,10 @@ $('resume').onclick = () => { $('resume').hidden = true; controls(); poll(); };
       && sessionStorage.getItem('twPayment') === null) {
     sessionStorage.setItem('twReturned', JSON.stringify({quote_id:returnedJob, order_id:returnedOrder}));
   }
+  // Points top-up: Alipay returns to a fresh tab; keep confirming the order there.
+  if (/^PT-[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')) {
+    sessionStorage.setItem('pointsReturned', returnedOrder);
+  }
   if (params.has('job') || params.has('out_trade_no')) history.replaceState(null, '', location.pathname);
 }
 job = sessionStorage.getItem('thesisJob');
@@ -1118,6 +1122,7 @@ function watchTopup(orderId, tries = 0) {
     try {
       const state = await request(`/api/points/topup/${encodeURIComponent(orderId)}`);
       if (state.paid) {
+        if (currentUser) { currentUser.points = state.balance; renderAccount(); }
         await loadPoints(); renderPointsDialog(); $('pointsCheckout').hidden = true;
         pointsMessage('充值成功，积分已到账。'); return;
       }
@@ -1127,7 +1132,8 @@ function watchTopup(orderId, tries = 0) {
   }, 3000);
 }
 $('pointsBtn').onclick = () => openPoints();
-$('pointsClose').onclick = () => { clearTimeout(topupTimer); $('pointsDialog').close(); };
+// Closing the dialog must not stop watching: the top-up may still be paid and should then show up.
+$('pointsClose').onclick = () => $('pointsDialog').close();
 // 积分价与人民币价一致，不取整：99 分 = 9.9 积分
 function pointsFor(cents) { return cents / 10; }
 function updatePointButtons() {
@@ -1206,7 +1212,15 @@ $('historyRefresh').onclick = loadHistory;
     $('historyMsg').textContent = `订单 ${returned.order_id} 已从支付宝返回。付款确认后，下单的那个页面会自动开始处理；处理完的结果也可以在下面打开。`;
   } else showWorkspace('format');
 }
-request('/api/account/me').then(data => { currentUser = data.user; renderAccount(); return currentUser && loadPoints(); }).then(() => aiRestore()).catch(() => renderAccount());
+request('/api/account/me').then(data => {
+  currentUser = data.user; renderAccount();
+  const returnedTopup = sessionStorage.getItem('pointsReturned');
+  if (returnedTopup && currentUser) {
+    sessionStorage.removeItem('pointsReturned');
+    openPoints().then(() => { pointsMessage('正在确认支付宝付款，请稍候…'); watchTopup(returnedTopup); });
+  }
+  return currentUser && loadPoints();
+}).then(() => aiRestore()).catch(() => renderAccount());
 
 
 // ---- 识别结果预览 + AI 助手 ----
@@ -1529,3 +1543,12 @@ $('aiSend').addEventListener('click', () => {
 });
 $('aiConfirmNo').addEventListener('click', () => $('aiConfirmDialog').close('no'));
 $('aiMsg').addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) $('aiSend').click(); });
+
+// ---- 售后群 ----
+$('supportBtn').onclick = () => $('supportDialog').showModal();
+$('supportCopy').onclick = async () => {
+  const num = $('supportNum').textContent, button = $('supportCopy');
+  try { await navigator.clipboard.writeText(num); button.textContent = '已复制'; }
+  catch { getSelection().selectAllChildren($('supportNum')); button.textContent = '请手动复制'; }
+  setTimeout(() => { button.textContent = '复制'; }, 2000);
+};

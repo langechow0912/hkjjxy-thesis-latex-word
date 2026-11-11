@@ -430,6 +430,11 @@ def frontend_style():
     return FileResponse(STATIC / "ui.css", media_type="text/css")
 
 
+@app.get("/support-qq.jpg")
+def support_qr():
+    return FileResponse(STATIC / "support-qq.jpg", media_type="image/jpeg")
+
+
 @app.get("/app.js")
 def frontend_script():
     return FileResponse(STATIC / "app.js", media_type="application/javascript")
