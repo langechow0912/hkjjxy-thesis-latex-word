@@ -40,6 +40,14 @@ services:
       ALIPAY_APP_PRIVATE_KEY_FILE: /run/secrets/alipay_app_private_key.pem
       ALIPAY_PUBLIC_KEY_FILE: /run/secrets/alipay_platform_public_key.pem
       ALIPAY_ORDER_DB: /data/alipay-orders.sqlite3
+      # 邮箱验证码登录发信（SMTP）。授权码放 deploy/secrets/smtp_password，不要写进环境变量。
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SECURITY: ${SMTP_SECURITY:-ssl}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      THESIS_EMAIL_DAILY_CAP: ${THESIS_EMAIL_DAILY_CAP:-1000}
     expose:
       - "8000"
     volumes:

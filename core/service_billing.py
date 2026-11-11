@@ -227,7 +227,7 @@ def admin_orders():
         pass
     with closing(connect()) as conn:
         rows = conn.execute("""SELECT q.id, q.operation, q.amount_cents, q.characters,
-            q.created_at,q.state,q.error,p.out_trade_no,p.status AS payment_status,
+            q.created_at,q.state,q.error,p.out_trade_no,p.status AS payment_status,p.payment_product,
             p.affiliate_id,p.affiliate_code,p.affiliate_campaign,p.affiliate_bps,
             a.name AS affiliate_name,a.email AS affiliate_email,
             m.amount_cents AS commission_cents,m.status AS commission_status
@@ -240,7 +240,7 @@ def admin_orders():
         exports = conn.execute("""SELECT p.job_id AS id, 'format_export' AS operation, p.amount_cents,
             0 AS characters, p.created_at,
             CASE WHEN p.status='TRADE_SUCCESS' THEN 'paid' ELSE 'ready' END AS state, NULL AS error,
-            p.out_trade_no, p.status AS payment_status,
+            p.out_trade_no, p.status AS payment_status, p.payment_product,
             p.affiliate_id,p.affiliate_code,p.affiliate_campaign,p.affiliate_bps,
             a.name AS affiliate_name,a.email AS affiliate_email,
             m.amount_cents AS commission_cents,m.status AS commission_status

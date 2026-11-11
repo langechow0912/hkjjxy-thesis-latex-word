@@ -116,3 +116,54 @@ def outline_lines(items, body_start):
         if level and text:
             out.append("%d-%s" % (level, text[:MAX_HEADING_CHARS]))
     return out
+
+
+# ---- 识别预览 / AI 助手用的结构清单 ----
+# 行里带 items 下标 idx，模型直接回 idx，不需要再映射。隐私规则和上面一样：
+# 标题、图题、表题和「标题疑似行」给原文，正文只给字数，表格单元格一个字都不给。
+_ROLE_LABEL = {"figure_caption": "图题", "table_caption": "表题", "candidate": "疑似标题", "note": "表注",
+               "figure": "图片", "table": "表格", "appendix": "附录标题"}
+_FLAG_LABEL = {"clamped": "缺上级已压缩", "no_caption": "没有题注", "stray_caption": "像题注但没被识别",
+               "bold_guess": "按加粗短行识别", "demoted": "超出四级", "manual": "用户已改"}
+
+
+def analysis_lines(rows, max_lines=MAX_LINES):
+    """把 docx2tex.analyze 的 rows 压成给模型看的文本行。返回 (行列表, 是否被截断)。
+
+    行格式：idx | 类型 | 文字 | 备注。连续的正文段落合并成一行「正文 N 段 共 M 字」。
+    """
+    lines, body_run = [], None
+
+    def flush():
+        nonlocal body_run
+        if body_run:
+            lines.append("%d-%d | 正文 | ［%d 段，共 %d 字］ |" % (body_run[0], body_run[1], body_run[2], body_run[3]))
+        body_run = None
+
+    for row in rows:
+        kind = row["kind"]
+        if kind == "body":
+            if body_run:
+                body_run = (body_run[0], row["idx"], body_run[2] + 1, body_run[3] + row.get("chars", 0))
+            else:
+                body_run = (row["idx"], row["idx"], 1, row.get("chars", 0))
+            continue
+        flush()
+        notes = [_FLAG_LABEL[f] for f in row.get("flags", []) if f in _FLAG_LABEL]
+        if kind == "heading":
+            label, text = "标题%d级" % row["level"], row["text"][:60]
+            if row.get("num"):
+                notes.insert(0, "原编号 %s" % row["num"])
+        elif kind == "zone":
+            label, text = "区域", "［%s，以下不参与识别］" % row["text"]
+        elif kind in ("figure", "table"):
+            label, text = _ROLE_LABEL[kind], "［%s］ 题注：%s" % (_ROLE_LABEL[kind], (row.get("title") or "无")[:60])
+        elif kind in ("figure_caption", "table_caption", "appendix", "note"):
+            label, text = _ROLE_LABEL[kind], row["text"][:60]
+        else:                                          # candidate
+            label, text = _ROLE_LABEL.get(kind, kind), row["text"][:MAX_HEADING_CHARS]
+        lines.append("%d | %s | %s | %s" % (row["idx"], label, text, "，".join(notes)))
+        if len(lines) >= max_lines:
+            return lines + ["…（后续内容已截断）"], True
+    flush()
+    return lines, False

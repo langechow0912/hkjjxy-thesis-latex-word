@@ -203,7 +203,7 @@ async function updateCommission(id, status, payoutRef = "") {
 }
 
 async function reload() {
-  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals(), loadServicePrices(), loadServiceOrders()]);
+  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals(), loadServicePrices(), loadServiceOrders(), loadPointsSettings(), loadPointsLedger()]);
 }
 
 async function loadServicePrices() {
@@ -212,6 +212,8 @@ async function loadServicePrices() {
   $('detectTextPrice').value = (prices.detect_text_cents / 100).toFixed(2);
   $('detectFilePrice').value = (prices.detect_file_cents / 100).toFixed(2);
   $('rewritePrice').value = (prices.rewrite_per_1000_cents / 100).toFixed(2);
+  const pts = cents => { const v = cents / 10; return Number.isInteger(v) ? v : v.toFixed(1); };
+  $('servicePointsHint').textContent = `对应的积分价（1 元 = 10 积分，与人民币价一致）：Word 导出 ${pts(prices.format_export_cents)} · 文本检测 ${pts(prices.detect_text_cents)} · 文件检测 ${pts(prices.detect_file_cents)} · 改写 ${pts(prices.rewrite_per_1000_cents)} / 千字`;
 }
 async function loadServiceOrders() {
   const result = await api('/api/admin/service-orders');
@@ -225,6 +227,60 @@ async function loadServiceOrders() {
     body.append(row);
   }
 }
+async function loadPointsSettings() {
+  const cfg = await api('/api/admin/points-settings');
+  $('pointsEnabled').checked = !!cfg.enabled;
+  $('signupBonus').value = cfg.signup_bonus;
+  $('signupBonusCap').value = cfg.signup_bonus_daily_cap;
+  $('topupPackages').value = cfg.topup_packages.join(',');
+  $('aiRate').value = cfg.ai_points_per_1k_tokens;
+  $('aiMin').value = cfg.ai_min_charge;
+  $('aiMaxOut').value = cfg.ai_max_output_tokens;
+}
+async function loadPointsLedger() {
+  const result = await api('/api/admin/points/ledger');
+  const body = $('pointsLedgerRows'); body.replaceChildren();
+  const kinds = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还'};
+  for (const row of result.ledger) {
+    const tr = node('tr');
+    tr.append(node('td', new Date(row.created_at * 1000).toLocaleString()), node('td', row.email || row.username),
+      node('td', kinds[row.kind] || row.kind), node('td', (row.delta > 0 ? '+' : '') + row.delta),
+      node('td', String(row.balance_after)), node('td', row.note || ''));
+    body.append(tr);
+  }
+}
+$('pointsSettingsForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button'); button.disabled = true;
+  try {
+    const packages = $('topupPackages').value.split(',').map(item => item.trim()).filter(Boolean).map(Number);
+    await api('/api/admin/points-settings', {method:'PUT', body:JSON.stringify({
+      enabled:$('pointsEnabled').checked,
+      signup_bonus:Number($('signupBonus').value),
+      signup_bonus_daily_cap:Number($('signupBonusCap').value),
+      topup_packages:packages,
+      ai_points_per_1k_tokens:Number($('aiRate').value),
+      ai_min_charge:Number($('aiMin').value),
+      ai_max_output_tokens:Number($('aiMaxOut').value),
+    })});
+    setMessage($('pointsSettingsMessage'), '积分设置已保存，立即生效。');
+    await loadPointsSettings();
+  } catch (error) { setMessage($('pointsSettingsMessage'), error.message, true); }
+  finally { button.disabled = false; }
+});
+$('pointsAdjustForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button'); button.disabled = true;
+  try {
+    const result = await api('/api/admin/points/adjust', {method:'POST', body:JSON.stringify({
+      email:$('adjustEmail').value.trim(), delta:Number($('adjustDelta').value), note:$('adjustNote').value.trim(),
+    })});
+    setMessage($('pointsAdjustMessage'), `已调整，该用户现有 ${result.balance} 积分。`);
+    $('adjustDelta').value = ''; $('adjustNote').value = '';
+    await loadPointsLedger();
+  } catch (error) { setMessage($('pointsAdjustMessage'), error.message, true); }
+  finally { button.disabled = false; }
+});
 $('downloadServiceOrders').addEventListener('click', async () => {
   try {
     const response = await fetch('/api/admin/service-orders.csv', {headers: authHeaders()});

@@ -128,6 +128,7 @@ def read_items(doc):
                           "text": _para_text(child).strip(), "imgs": imgs,
                           "style": p.style.name if p.style is not None else "",
                           "bold": _all_bold(p),
+                          "size": _font_size(p), "align": _align(p),
                           "heading_level": level if level in (1, 2, 3, 4) else None})
             pno += 1
         elif tag == "tbl":
@@ -142,6 +143,27 @@ def read_items(doc):
                               "style": "", "bold": False, "heading_level": None,
                               "from_table": True})
     return items
+
+
+def _font_size(p):
+    """段落字号（pt）：先看第一段有字的 run，再看段落样式；读不到返回 None。只用来找相似行。"""
+    try:
+        for r in p.runs:
+            if r.text.strip() and r.font.size:
+                return r.font.size.pt
+        if p.style is not None and p.style.font is not None and p.style.font.size:
+            return p.style.font.size.pt
+    except Exception:                                  # noqa: BLE001 — 样式链异常不该影响识别
+        pass
+    return None
+
+
+def _align(p):
+    try:
+        value = p.alignment
+        return None if value is None else int(getattr(value, "value", value))
+    except Exception:                                  # noqa: BLE001
+        return None
 
 
 def _all_bold(p):
@@ -291,6 +313,8 @@ def _unph(s):
 def _heading_block(d):
     """headings.plan 的决定 → 文档块。level 超过 4 的降为加粗正文，保留原文含编号。"""
     level = d["level"]
+    if d.get("kind") == headings.UNNUM_KIND:
+        return {"t": "sec1u", "text": d["text"], "src": None}
     if level <= 3:
         return {"t": "sec%d" % level, "text": d["text"], "src": d["src"]}
     if level == 4:
@@ -298,8 +322,108 @@ def _heading_block(d):
     return {"t": "body", "text": d["orig"], "bold": True}
 
 
-def scan(items, marks, figmap):
-    """扫描文档流，产出 blocks / refs / ack / 标题调整说明"""
+ROLES = ("heading", "figure_caption", "table_caption", "body")
+MAX_OVERRIDES = 5000
+MAX_OVERRIDE_TEXT = 200
+
+
+def normalize_overrides(raw, items):
+    """校验用户提交的手动修改，返回 (干净的列表, 被丢弃的说明)。
+
+    每项 {idx, role?, level?, text?}：idx 是 items 下标，必须是有文字的普通段落；
+    role 只能是 ROLES；role=heading 必须带 1-4 的 level；text 去掉换行、不超过 MAX_OVERRIDE_TEXT。
+    非法的整条丢弃（不猜测、不部分接受），原因返回给前端。
+    """
+    clean, rejected = {}, []
+    if not isinstance(raw, list):
+        return [], ["修改列表格式不对"] if raw else []
+    for n, o in enumerate(raw[:MAX_OVERRIDES]):
+        if not isinstance(o, dict):
+            rejected.append("第 %d 条格式不对" % (n + 1)); continue
+        idx = o.get("idx")
+        if type(idx) is not int or not 0 <= idx < len(items) or items[idx]["kind"] != "p":
+            rejected.append("第 %d 条：位置无效" % (n + 1)); continue
+        if not items[idx]["text"] or items[idx].get("imgs"):
+            rejected.append("第 %d 条：这一行没有可修改的文字" % (n + 1)); continue
+        role = o.get("role")
+        if role is not None and role not in ROLES:
+            rejected.append("第 %d 条：类型无效" % (n + 1)); continue
+        level = o.get("level")
+        if role == "heading" and (type(level) is not int or not 1 <= level <= 4):
+            rejected.append("第 %d 条：标题级别须为 1–4" % (n + 1)); continue
+        text = o.get("text")
+        if text is not None:
+            if not isinstance(text, str):
+                rejected.append("第 %d 条：文字无效" % (n + 1)); continue
+            text = " ".join(text.split())
+            if not text or len(text) > MAX_OVERRIDE_TEXT:
+                rejected.append("第 %d 条：文字不能为空且不超过 %d 字" % (n + 1, MAX_OVERRIDE_TEXT)); continue
+        if role is None and text is None:
+            rejected.append("第 %d 条：没有任何修改" % (n + 1)); continue
+        item = {"idx": idx}
+        if role is not None:
+            item["role"] = role
+        if role == "heading":
+            item["level"] = level
+        if text is not None:
+            item["text"] = text
+        clean[idx] = item
+    if len(raw) > MAX_OVERRIDES:
+        rejected.append("修改过多，只接受前 %d 条" % MAX_OVERRIDES)
+    return list(clean.values()), rejected
+
+
+def _caption_forced(text, kind, key):
+    """用户指定「这行是图题/表题」：能认出「图X」前缀就剥掉，认不出就整行当题名。"""
+    pats = ((RE_TABTITLE, RE_TABTITLE_EN) if kind == "table" else (RE_FIGTITLE, RE_FIGTITLE_EN))
+    for pat in pats:
+        m = pat.match(text)
+        if m and (m.group(3) or "").strip():
+            return _label_key(m.group(1), m.group(2)), m.group(3).strip()
+    title = text.strip()
+    return (key, title) if title else None
+
+
+def scan(items, marks, figmap, overrides=None, trace=None):
+    """扫描文档流，产出 blocks / refs / ack / 标题调整说明
+
+    overrides  用户的手动修改（normalize_overrides 的结果）：改文字、强制标题级别、
+               强制是图题/表题/正文。None 时与以前完全一致。
+    trace      传一个 dict 进来，会被填成 {条目下标: 判定}，给 analyze 做预览用。
+    """
+    ov = {o["idx"]: o for o in (overrides or [])}
+    if any("text" in o for o in ov.values()):
+        items = [dict(it, text=ov[n]["text"]) if n in ov and "text" in ov[n] else it
+                 for n, it in enumerate(items)]
+    idx_of = {id(it): n for n, it in enumerate(items)}
+    force = {}                       # 标题：下标 → 级别（0 = 不是标题）
+    cap_role = {}                    # 下标 → figure / table / body：这一行被用户指定成什么
+    for n, o in ov.items():
+        role = o.get("role")
+        if role == "heading":
+            force[n] = o["level"]
+            cap_role[n] = "body"     # 标题不是题注
+        elif role in ("figure_caption", "table_caption"):
+            force[n] = 0
+            cap_role[n] = "figure" if role == "figure_caption" else "table"
+        elif role == "body":
+            force[n] = 0
+            cap_role[n] = "body"
+    used_caps = set()
+    trace = trace if trace is not None else {}
+
+    def mark_cap(n, role):
+        used_caps.add(n)
+        trace[n] = {"role": role + "_caption"}
+
+    def cap(n, text, kind):
+        role = cap_role.get(n)
+        if role is None:
+            return _caption_match(text, kind)
+        if role != kind:
+            return None
+        return _caption_forced(text, kind, "manual-%d" % n)
+
     body_start = marks["body_start"]
     ref_pno = items[marks["ref"]]["pno"] if marks["ref"] is not None else None
     ack_pno = items[marks["ack"]]["pno"] if marks["ack"] is not None else None
@@ -333,19 +457,25 @@ def scan(items, marks, figmap):
         pno, text = it["pno"], it["text"]
         if zone(pno) or RE_NOTE.match(text):
             return True
-        mt = _caption_match(text, "table")
-        return bool(mt and mt[1].strip()) or bool(_caption_match(text, "figure"))
+        n = idx_of[id(it)]
+        mt = cap(n, text, "table")
+        return bool(mt and mt[1].strip()) or bool(cap(n, text, "figure"))
 
     # 先通读全文给标题定级（编号体系、缺上级、超层级都在这里处理）
-    hplan, hnotes = headings.plan(items, body_start, not_heading_candidate)
+    hplan, hnotes = headings.plan(items, body_start, not_heading_candidate, force=force or None)
 
     # ---- 先建「表 X-Y / 表 X → 全文序号」映射（按表出现顺序）----
     tabmap, keys = {}, []
-    for it in items:
+    for n, it in enumerate(items):
         if it["kind"] == "p":
-            m = _caption_match(it["text"], "table")
+            m = cap(n, it["text"], "table")
             if m and it["pno"] >= body_start:
-                keys.append(m[0])
+                key = m[0]
+                if key.startswith("manual-") and str(len(keys) + 1) not in keys:
+                    # 用户手动指定的题注没有原编号：按出现顺序给它下一个序号，
+                    # 正文里「如表 2」才能对到它，而不是落到默认的表 1
+                    key = str(len(keys) + 1)
+                keys.append(key)
     for i, k in enumerate(keys, 1):
         tabmap.setdefault(k, i)
     # 图的映射在扫描时随图出现顺序填：图题的位置有三种写法，提前数不准。
@@ -386,6 +516,7 @@ def scan(items, marks, figmap):
                 blocks.append({"t": "table", "no": tab_seq,
                                "title": pending_title, "note": pend_note,
                                "rows": it["rows"]})
+                trace[i] = {"role": "table", "no": tab_seq, "caption": pending_title}
                 pending_title, pend_note = "", ""
             i += 1
             continue
@@ -397,13 +528,16 @@ def scan(items, marks, figmap):
         # 位置按优先级：图上方已经出现的图题 > 图和题注同一段 > 图下方紧邻的一段。
         if pno >= body_start and it.get("imgs"):
             cap_key, cap_title, end = None, "", i + 1
+            cap_idx = None
             if pending_fig:
-                cap_key, cap_title = pending_fig
+                cap_key, cap_title, cap_idx = pending_fig
                 pending_fig = None
             else:
-                same = _caption_match(t, "figure") if t else None
+                same = cap(i, t, "figure") if t else None
                 if same:
                     cap_key, cap_title = same
+                    cap_idx = i
+                    used_caps.add(i)
                     t = ""
                 else:
                     nxt_i = i + 1
@@ -412,9 +546,11 @@ def scan(items, marks, figmap):
                         nxt_i += 1
                     if (nxt_i < len(items) and items[nxt_i]["kind"] == "p"
                             and not items[nxt_i].get("imgs")):
-                        below = _caption_match(items[nxt_i]["text"], "figure")
+                        below = cap(nxt_i, items[nxt_i]["text"], "figure")
                         if below:
                             cap_key, cap_title = below
+                            cap_idx = nxt_i
+                            mark_cap(nxt_i, "figure")
                             end = nxt_i + 1
             for index, image in enumerate(it["imgs"]):
                 nm = image.split("/")[-1]
@@ -428,6 +564,9 @@ def scan(items, marks, figmap):
                                "path": "figures/" + figmap[nm],
                                "cap": cap_title if index == 0 else "",
                                "from_table": bool(it.get("from_table"))})
+                trace.setdefault(i, {"role": "figure", "no": fig_seq,
+                                     "caption": cap_title if index == 0 else "",
+                                     "caption_idx": cap_idx if index == 0 else None})
             if t:
                 blocks.append({"t": "body", "text": t})
             i = end
@@ -436,11 +575,22 @@ def scan(items, marks, figmap):
         # ---------- 附录标题：另起一页，格式同「参考文献」标题 ----------
         if pno in app_titles:
             blocks.append({"t": "appendix", "text": app_titles[pno]})
+            trace[i] = {"role": "appendix", "text": app_titles[pno]}
+            i += 1
+            continue
+
+        # ---------- 用户强制设为标题的行：不受参考文献 / 致谢区拦截 ----------
+        if pno >= body_start and force.get(i) and hplan.get(pno):
+            decision = hplan[pno]
+            blocks.append(_heading_block(decision))
+            trace[i] = {"role": "heading", "level": decision["level"], "text": decision["text"],
+                        "kind": decision["kind"], "orig": decision["orig"], "clamped": decision.get("clamped")}
             i += 1
             continue
 
         # ---------- 参考文献区 ----------
         if zone(pno) == "ref":
+            trace[i] = {"role": "zone", "zone": "ref"}
             if t and not RE_REF_HEAD.match(t):
                 refs.append(t)
             i += 1
@@ -448,6 +598,7 @@ def scan(items, marks, figmap):
 
         # ---------- 致谢区 ----------
         if zone(pno) == "ack":
+            trace[i] = {"role": "zone", "zone": "ack"}
             if t and not RE_ACK_HEAD.match(t):
                 ack.append(t)
             i += 1
@@ -456,18 +607,20 @@ def scan(items, marks, figmap):
         # ---------- 图上方的图题 ----------
         # 紧跟着（隔着空段落也算）就是一张图，这行就是它的题注，先存着等图出现。
         if pno >= body_start and not it.get("imgs"):
-            mf = _caption_match(t, "figure")
+            mf = cap(i, t, "figure")
             if mf:
                 nxt = figures.next_nonempty(items, i)
                 if nxt is not None and nxt["kind"] == "p" and nxt.get("imgs"):
-                    pending_fig = mf
+                    pending_fig = (mf[0], mf[1], i)
+                    mark_cap(i, "figure")
                     i += 1
                     continue
 
         # ---------- 表题 / 表注 ----------
         # 题名不能为空，否则宁可当正文留着，不要吞掉一句话。
-        mt = _caption_match(t, "table")
+        mt = cap(i, t, "table")
         if mt and pno >= body_start and mt[1].strip():
+            mark_cap(i, "table")
             # 题注在表上方的稿子占多数；但如果这张表已经在上面出现、且还没有题名，
             # 说明原稿是「表 + 题注在下方」，回填给它，而不是丢给下一张表。
             if (blocks and blocks[-1]["t"] == "table"
@@ -478,6 +631,7 @@ def scan(items, marks, figmap):
             i += 1
             continue
         if RE_NOTE.match(t) and pno >= body_start:
+            trace[i] = {"role": "note"}
             if blocks and blocks[-1]["t"] == "table":
                 blocks[-1]["note"] = " ".join(filter(None, [blocks[-1]["note"], t]))
             elif i + 1 < len(items) and items[i + 1]["kind"] == "tbl":
@@ -492,8 +646,12 @@ def scan(items, marks, figmap):
             decision = hplan.get(pno)
             if decision:
                 blocks.append(_heading_block(decision))
+                trace[i] = {"role": "heading" if decision["level"] <= headings.MAX_LEVEL else "demoted",
+                            "level": decision["level"], "text": decision["text"],
+                            "kind": decision["kind"], "orig": decision["orig"],
+                            "clamped": decision.get("clamped")}
             elif t:
-                blocks.append({"t": "body", "text": t})
+                blocks.append({"t": "body", "text": t, **({"manual": True} if i in cap_role else {})})
         i += 1
 
     # 正文里的「如表 1 所示」「见图 2-1」统一换成 \ref，编号跟着重排而非硬编码。
@@ -501,9 +659,15 @@ def scan(items, marks, figmap):
     for b in blocks:
         if b["t"] == "body":
             # 长得像题注却没被消费的行（题名为空、或图/表不在预期位置），audit 要提示
-            if _caption_match(b["text"], "figure") or _caption_match(b["text"], "table"):
+            if not b.get("manual") and (_caption_match(b["text"], "figure") or _caption_match(b["text"], "table")):
                 b["stray_caption"] = True
             b["text"] = resolve(b["text"])
+
+    for n, role in cap_role.items():
+        if role in ("figure", "table") and n not in used_caps:
+            hnotes.append("你把「%s」设成了%s，但它旁边没有对应的%s，已按正文处理。"
+                          % (items[n]["text"][:20], "图题" if role == "figure" else "表题",
+                             "图片" if role == "figure" else "表格"))
 
     # 附录不管在原稿的哪个位置，都从第一个附录标题起单独成组，最后统一输出
     cut = next((n for n, b in enumerate(blocks) if b["t"] == "appendix"), None)
@@ -606,9 +770,13 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order, appendix=(), ack_fir
                 out.extend([r"\newpage", r"\vspace*{3\baselineskip}",
                             r"\unnumsec{%s}" % E(b["text"]), ""])
                 continue
-            if k in ("sec1", "sec2", "sec3"):
+            if k in ("sec1", "sec1u", "sec2", "sec3"):
                 out.append(r"\setcounter{paragraph}{0}")
-            if k == "sec1":
+            if k == "sec1u":
+                # 引言/绪论：一级标题，不编号、不占章序号
+                out.extend([r"\section*{%s}" % E(b["text"]), r"\phantomsection",
+                            r"\addcontentsline{toc}{section}{%s}" % E(b["text"]), ""])
+            elif k == "sec1":
                 out.append(r"\section{%s}" % E(b["text"]))
             elif k == "sec2":
                 out.append(r"\subsection{%s}" % E(b["text"]))
@@ -671,15 +839,20 @@ def render(blocks, refs, ack, meta, cfg, figmap, fig_order, appendix=(), ack_fir
     return "\n".join(out)
 
 
-def convert(docx_path, out_dir, cfg=None, log=print):
-    """docx → out_dir/main.tex + out_dir/figures/。返回 (tex 文本, 统计 dict)"""
+def convert(docx_path, out_dir, cfg=None, log=print, overrides=None):
+    """docx → out_dir/main.tex + out_dir/figures/。返回 (tex 文本, 统计 dict)
+
+    overrides 是用户在预览里做的手动修改（见 normalize_overrides）；不传就与以前完全一致。
+    """
     doc = Document(docx_path)
     items = read_items(doc)
     marks = locate(items)
     marks["body_start"] = _body_start(items, marks)
     figmap, fig_order = extract_figures(docx_path, items, out_dir,
                                         marks["body_start"], log=log)
-    blocks, refs, ack, heading_notes, appendix = scan(items, marks, figmap)
+    if overrides:
+        overrides, _ = normalize_overrides(overrides, items)
+    blocks, refs, ack, heading_notes, appendix = scan(items, marks, figmap, overrides or None)
     numbering, problem = number_headings(blocks)
     if problem:
         log("  标题编号有误（%s），已继续排版，请核对标题与目录" % problem)
@@ -711,6 +884,149 @@ def convert(docx_path, out_dir, cfg=None, log=print):
     return tex, stat
 
 
+_NUMBER_KINDS = ("cn_chapter", "cn_dun", "arabic3", "arabic2", "cn_paren", "arabic_paren",
+                 "circled", "arabic_dot", "arabic1")
+MAX_ROWS = 3000
+CANDIDATE_LEN = 40
+
+
+def _is_candidate_line(text):
+    """没被认成标题、但长得像标题的短行（标题疑似行）：用户可能想把它设成标题"""
+    t = text.strip()
+    return bool(t) and len(t) <= CANDIDATE_LEN and not t.endswith(("。", "；", "！", "？", "…")) and "。" not in t
+
+
+def analyze(docx_path, overrides=None):
+    """只读识别：不生成 tex、不抽图、不排版，返回给「识别结果预览」用的逐条结果。
+
+    overrides 传用户的手动修改，就能看到「按这些修改，实际会识别成什么」
+    （例如越级的标题会被压缩层级，旁边没有图的题注会被当成正文）。
+    行里的 idx 是 items 下标：同一份文件两次读取下标一致，排版时按它定位。
+    """
+    return analyze_items(docx_path, overrides)[0]
+
+
+def analyze_items(docx_path, overrides=None):
+    """同 analyze，但多返回 (items, marks)，调用方要缓存下标或找相似行时用。"""
+    doc = Document(docx_path)
+    items = read_items(doc)
+    marks = locate(items)
+    marks["body_start"] = _body_start(items, marks)
+    clean, rejected = normalize_overrides(overrides, items) if overrides else ([], [])
+    figmap = {}
+    for it in items:
+        for target in it.get("imgs") or ():
+            figmap[target.split("/")[-1]] = target.split("/")[-1]
+    trace = {}
+    blocks, refs, ack, notes, appendix = scan(items, marks, figmap, clean or None, trace)
+    notes = notes + audit(blocks + appendix)
+    return analysis_rows(items, marks, trace, clean, notes, rejected), items, marks
+
+
+def analysis_rows(items, marks, trace, clean, notes, rejected):
+    by_idx = {o["idx"]: o for o in clean}
+    rows, zone_open = [], None
+    for i, it in enumerate(items):
+        if it["pno"] < marks["body_start"]:
+            continue
+        tr = trace.get(i)
+        text = by_idx.get(i, {}).get("text", it.get("text", ""))
+        if tr and tr["role"] == "zone":
+            if zone_open != tr["zone"]:
+                rows.append({"idx": i, "kind": "zone", "zone": tr["zone"], "text": "参考文献区" if tr["zone"] == "ref" else "致谢区",
+                             "level": 0, "flags": []})
+                zone_open = tr["zone"]
+            continue
+        zone_open = None
+        row = {"idx": i, "level": 0, "text": text, "flags": [], "manual": i in by_idx}
+        if it["kind"] == "tbl":
+            if not tr:
+                continue
+            row.update(kind="table", text="表格 %d" % tr["no"], title=tr["caption"], no=tr["no"])
+            if not tr["caption"]:
+                row["flags"].append("no_caption")
+        elif it.get("imgs"):
+            if not tr:
+                continue
+            row.update(kind="figure", text="图片 %d" % tr["no"], title=tr["caption"], no=tr["no"],
+                       caption_idx=tr["caption_idx"])
+            if not tr["caption"]:
+                row["flags"].append("no_caption")
+        elif not text:
+            continue
+        elif tr and tr["role"] == "heading":
+            orig = tr["orig"]
+            number = orig[: len(orig) - len(tr["text"])].strip() if orig.endswith(tr["text"]) else ""
+            src = "numbering" if tr["kind"] in _NUMBER_KINDS else tr["kind"]
+            row.update(kind="heading", level=tr["level"], text=tr["text"], num=number, src=src, orig=orig)
+            if tr.get("clamped"):
+                row["flags"].append("clamped")
+                row["clamped_from"] = tr["clamped"]
+            if src == "bold":
+                row["flags"].append("bold_guess")
+        elif tr and tr["role"] in ("figure_caption", "table_caption"):
+            row.update(kind=tr["role"])
+        elif tr and tr["role"] == "appendix":
+            row.update(kind="appendix", text=tr["text"])
+        elif tr and tr["role"] == "note":
+            # 「数据来源：」「注：」这类表注：规则已经把它归到表格下面了，不是漏识别的标题
+            row.update(kind="note", chars=len(text))
+        else:
+            row.update(chars=len(text))
+            if tr and tr["role"] == "demoted":
+                row["flags"].append("demoted")
+            if _is_candidate_line(text):
+                row["kind"] = "candidate"
+                if _caption_match(text, "figure") or _caption_match(text, "table"):
+                    row["flags"].append("stray_caption")
+            else:
+                row["kind"] = "body"
+        row["style"] = it.get("style", "") if it["kind"] == "p" else ""
+        row["bold"] = bool(it.get("bold"))
+        rows.append(row)
+    truncated = len(rows) > MAX_ROWS
+    summary = {"headings": sum(1 for r in rows if r["kind"] == "heading"),
+               "figures": sum(1 for r in rows if r["kind"] == "figure"),
+               "tables": sum(1 for r in rows if r["kind"] == "table"),
+               "issues": sum(1 for r in rows if r["flags"] and r["flags"] != ["manual"])}
+    return {"rows": rows[:MAX_ROWS], "truncated": truncated, "summary": summary,
+            "notes": notes, "rejected": rejected}
+
+
+def similar_items(items, idx, body_start, stop=None, limit=200):
+    """找和 items[idx] 「长得一样」的段落：同样式、同加粗、同编号形式，字号和对齐都读得到时也要一致。
+
+    给预览里的「找相似行」用：用户认出一个没被识别的标题，一键把同类的都找出来。
+    只看短行（≤ 60 字），句末有标点的和没有的不混；stop 是参考文献/致谢区的起点，之后不找。
+    """
+    if not 0 <= idx < len(items) or items[idx]["kind"] != "p" or not items[idx]["text"]:
+        return []
+    src = items[idx]
+
+    def feature(it):
+        num = headings.parse_numbering(it["text"])
+        return (it.get("style", ""), bool(it.get("bold")), num["kind"] if num else None,
+                it["text"].rstrip().endswith(("。", "；", "！", "？", "…")))
+
+    want = feature(src)
+    found = []
+    for n, it in enumerate(items):
+        if n == idx or it["kind"] != "p" or not it["text"] or it.get("imgs") or it["pno"] < body_start:
+            continue
+        if stop is not None and n >= stop:
+            break
+        if len(it["text"]) > 60 or feature(it) != want:
+            continue
+        if src.get("size") is not None and it.get("size") is not None and src["size"] != it["size"]:
+            continue
+        if src.get("align") is not None and it.get("align") is not None and src["align"] != it["align"]:
+            continue
+        found.append(n)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def _ack_before_appendix(items, marks):
     """致谢在附录之前吗？没有致谢或没有附录时无所谓，按默认（致谢在前）。"""
     if marks["ack"] is None:
@@ -723,7 +1039,7 @@ def _ack_before_appendix(items, marks):
     return True
 
 
-_SEC_LEVEL_NAME = {"sec1": 1, "sec2": 2, "sec3": 3, "sec4": 4}
+_SEC_LEVEL_NAME = {"sec1": 1, "sec1u": 1, "sec2": 2, "sec3": 3, "sec4": 4}
 
 
 def _resolved_levels(blocks):

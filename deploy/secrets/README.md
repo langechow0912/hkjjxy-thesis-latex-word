@@ -17,6 +17,8 @@ credentials you intend the server to use here:
   `THESIS_AUTH_PASS_FILE` path in `.env` to enable it.
 - `dayipaper_pat` — optional Dayipaper PAT, raw token or `PAT=...`
 - `tabword_api_key` — optional separate Tabword API key
+- `smtp_password` — SMTP authorization code (not the mailbox login password) used to send
+  email login codes; set `SMTP_HOST`, `SMTP_USER` and `SMTP_FROM` in `.env`
 - `alipay_app_private_key.pem` — optional Alipay app private key
 - `alipay_platform_public_key.pem` — optional Alipay platform public key for
   callback signature verification (not the app public key)

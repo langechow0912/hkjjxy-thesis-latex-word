@@ -54,6 +54,52 @@ def login(body: Credentials, request: Request, response: Response):
     return _signed_in(request, response, token, user)
 
 
+class EmailReq(BaseModel):
+    email: str
+
+
+class EmailCodeReq(BaseModel):
+    email: str
+    code: str
+
+
+def _fail(exc):
+    raise HTTPException(exc.status, str(exc)) from None
+
+
+@router.post('/email/send')
+def email_send(body: EmailReq):
+    try:
+        return accounts.send_email_code(body.email, 'login')
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
+@router.post('/email/login')
+def email_login(body: EmailCodeReq, request: Request, response: Response):
+    try:
+        token, user, created = accounts.login_with_email(body.email, body.code)
+    except accounts.AccountError as exc:
+        _fail(exc)
+    return {**_signed_in(request, response, token, user), 'created': created}
+
+
+@router.post('/email/bind/send')
+def email_bind_send(body: EmailReq, user=Depends(current_user)):
+    try:
+        return accounts.send_email_code(body.email, 'bind', user['id'])
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
+@router.post('/email/bind/verify')
+def email_bind_verify(body: EmailCodeReq, user=Depends(current_user)):
+    try:
+        return accounts.bind_email(user['id'], body.email, body.code)
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
 @router.post('/logout')
 def logout(request: Request, response: Response):
     accounts.logout(request.cookies.get(accounts.COOKIE))
