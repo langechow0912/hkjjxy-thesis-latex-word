@@ -170,7 +170,7 @@ class HeadingOverrides(unittest.TestCase):
     def test_forced_heading_inside_the_reference_zone_is_not_swallowed(self):
         specs = ['一、引言', LONG, '参考文献', '[1] 张三. 论文[J]. 期刊, 2020.', '补充说明标题', '[2] 李四. 论文[J]. 期刊, 2021.']
         _, _, struct = convert(specs, [{'idx': 4, 'role': 'heading', 'level': 1}])
-        self.assertIn('1　补充说明标题', heads(struct))
+        self.assertIn('2　补充说明标题', heads(struct))   # 引言算第 1 章，所以这里是第 2 章
 
     def test_level_four_becomes_a_subheading(self):
         specs = ['一、甲', '（一）乙', '1. 丙', LONG, '丁']
