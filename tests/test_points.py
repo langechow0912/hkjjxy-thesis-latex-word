@@ -464,5 +464,92 @@ class PayRoutes(PointsBase):
         self.assertEqual(data['rate'], 10)
 
 
+
+class RedeemCodes(PointsBase):
+    def make_code(self, **kw):
+        body = {'points': 20, 'count': 1, 'max_uses': 1, **kw}
+        r = self.client.post('/api/admin/redeem-codes', json=body, auth=self.auth)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()['codes']
+
+    def redeem(self, user, code):
+        self.as_user(user)
+        return self.client.post('/api/points/redeem', json={'code': code})
+
+    def test_redeem_credits_once_and_ignores_case_and_hyphens(self):
+        user = make_user()
+        code = self.make_code(points=12.5)[0]
+        r = self.redeem(user, code.lower().replace('-', ' '))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), {'points': 12.5, 'balance': 12.5})
+        again = self.redeem(user, code)
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(points.balance(user['id']), 12.5)
+        self.assertEqual(points.ledger(user['id'])[0]['kind'], 'redeem')
+
+    def test_max_uses_is_enforced_and_failed_redeem_leaves_no_credit(self):
+        first, second = make_user(), make_user()
+        code = self.make_code(max_uses=1)[0]
+        self.assertEqual(self.redeem(first, code).status_code, 200)
+        r = self.redeem(second, code)
+        self.assertEqual(r.status_code, 410)
+        self.assertEqual(points.balance(second['id']), 0)
+        self.assertEqual(points.ledger(second['id']), [])
+
+    def test_concurrent_redeem_of_a_single_use_code_succeeds_once(self):
+        users = [make_user() for _ in range(8)]
+        code = self.make_code(max_uses=1)[0]
+
+        def go(user):
+            try:
+                return points.redeem(user['id'], code)['points']
+            except points.PointsError as exc:
+                return exc.status
+        with ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(go, users))
+        self.assertEqual(results.count(20), 1, results)
+        self.assertEqual(sum(points.balance(u['id']) for u in users), 20)
+
+    def test_disabled_expired_and_unknown_codes_are_rejected(self):
+        user = make_user()
+        code = self.make_code()[0]
+        put = self.client.put('/api/admin/redeem-codes/' + code, json={'disabled': True}, auth=self.auth)
+        self.assertEqual(put.status_code, 200)
+        self.assertEqual(self.redeem(user, code).status_code, 410)
+        self.client.put('/api/admin/redeem-codes/' + code, json={'disabled': False}, auth=self.auth)
+        with closing(points._connect()) as conn, conn:
+            conn.execute("UPDATE redeem_codes SET expires_at=? WHERE code=?", (int(time.time()) - 1, points.normalize_code(code)))
+        self.assertEqual(self.redeem(user, code).status_code, 410)
+        self.assertEqual(self.redeem(user, 'NOSUCHCODE99').status_code, 404)
+        self.assertEqual(points.balance(user['id']), 0)
+
+    def test_wrong_guesses_are_rate_limited(self):
+        user = make_user()
+        code = self.make_code()[0]
+        for _ in range(points.REDEEM_FAIL_LIMIT):
+            self.assertEqual(self.redeem(user, 'WRONGCODE123').status_code, 404)
+        self.assertEqual(self.redeem(user, code).status_code, 429)
+
+    def test_admin_validation_custom_code_and_listing(self):
+        for bad in ({'points': 0}, {'points': 1.25}, {'count': 501}, {'max_uses': 0},
+                    {'expires_at': 1}, {'code': 'ab'}, {'code': 'ABCD1234', 'count': 2}):
+            r = self.client.post('/api/admin/redeem-codes', json={'points': 5, **bad}, auth=self.auth)
+            self.assertEqual(r.status_code, 422, bad)
+        self.assertEqual(self.make_code(code='spring-2026', points=3), ['SPRING2026'])
+        dup = self.client.post('/api/admin/redeem-codes', json={'points': 3, 'code': 'SPRING2026'}, auth=self.auth)
+        self.assertEqual(dup.status_code, 409)
+        batch = self.make_code(count=30)
+        self.assertEqual(len(set(batch)), 30)
+        listed = self.client.get('/api/admin/redeem-codes', auth=self.auth).json()['codes']
+        self.assertEqual(len(listed), 31)
+        self.assertEqual(self.client.get('/api/admin/redeem-codes').status_code, 401)
+
+    def test_redeem_requires_points_enabled(self):
+        user = make_user()
+        code = self.make_code()[0]
+        points.save_settings({'enabled': False})
+        self.assertEqual(self.redeem(user, code).status_code, 503)
+
+
 if __name__ == '__main__':
     unittest.main()

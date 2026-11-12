@@ -49,6 +49,18 @@ def topup(body: TopupReq, request: Request, user=Depends(current_user)):
         _fail(exc)
 
 
+class RedeemReq(BaseModel):
+    code: str
+
+
+@router.post('/redeem')
+def redeem(body: RedeemReq, user=Depends(current_user)):
+    try:
+        return points.redeem(user['id'], body.code[:64])
+    except points.PointsError as exc:
+        _fail(exc)
+
+
 def _own_topup(user, order_id):
     with closing(points._connect()) as conn:
         row = conn.execute('SELECT user_id FROM point_topups WHERE order_no=?', (order_id,)).fetchone()

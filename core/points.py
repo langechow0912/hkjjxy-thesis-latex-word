@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 import uuid
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 UNITS_PER_POINT = 10                  # 1 积分 = 10 个单位（0.1 积分）
 UNITS_PER_YUAN = 100                  # 1 元 = 10 积分 = 100 个单位 = 100 分
 DEFAULT_PACKAGES = (5, 10, 20, 50, 100)
-KINDS = ("topup", "spend", "signup_bonus", "admin", "refund")
+KINDS = ("topup", "spend", "signup_bonus", "admin", "refund", "redeem")
 
 
 class PointsError(Exception):
@@ -82,6 +83,19 @@ def _connect():
             amount_cents INTEGER NOT NULL,
             created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS points_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY,
+            units INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS redeem_failures (
+            user_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS redeem_failures_by_user ON redeem_failures(user_id, created_at);
         CREATE TABLE IF NOT EXISTS ai_holds (
             ref TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id),
@@ -260,6 +274,135 @@ def admin_ledger(email=None, limit=100):
             args.append(key)
         rows = conn.execute(sql + " ORDER BY l.id DESC LIMIT ?", (*args, limit)).fetchall()
     return [{**dict(r), "delta": _show(r["delta"]), "balance_after": _show(r["balance_after"])} for r in rows]
+
+
+# ---- 兑换码 ----
+# 一个码 = 固定积分数 + 总可用次数（max_uses）+ 可选过期时间；每个用户每个码只能兑一次。
+# 入账走 points_ledger（kind='redeem'，ref='码:用户号'），所以「同一人重复兑换」由 UNIQUE(kind, ref) 兜底，
+# 「总次数」靠带条件的原子更新兜底，二者与入账在同一事务里：任何一步失败整笔回滚。
+
+REDEEM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # 去掉 I O 0 1，抄写不易错
+REDEEM_FAIL_LIMIT, REDEEM_FAIL_WINDOW = 10, 15 * 60  # 15 分钟内输错 10 次就先停一停，防暴力猜码
+REDEEM_MAX_COUNT = 500
+
+
+def normalize_code(raw):
+    """用户输入 / 后台自定义的码统一成大写字母数字：忽略空格、连字符和大小写。"""
+    return re.sub(r"[^0-9A-Z]", "", str(raw or "").upper())
+
+
+def _show_code(code):
+    return "-".join(code[i:i + 4] for i in range(0, 12, 4)) if len(code) == 12 else code
+
+
+def _code_row(row):
+    return {"code": _show_code(row["code"]), "points": _show(row["units"]), "max_uses": row["max_uses"],
+            "used": row["used"], "expires_at": row["expires_at"], "disabled": bool(row["disabled"]),
+            "note": row["note"], "created_at": row["created_at"]}
+
+
+def create_redeem_codes(points_each, count=1, max_uses=1, expires_at=None, note="", code=None):
+    """后台批量生成兑换码（也可指定一个自定义码）。返回新建的码列表。"""
+    units = _units(points_each, "兑换积分")
+    if not 1 <= units <= 10000 * UNITS_PER_POINT:
+        raise PointsError("每个码的积分须为 0.1–10000", 422)
+    if type(count) is not int or not 1 <= count <= REDEEM_MAX_COUNT:
+        raise PointsError("一次最多生成 %d 个码" % REDEEM_MAX_COUNT, 422)
+    if type(max_uses) is not int or not 1 <= max_uses <= 1000000:
+        raise PointsError("可兑换次数须为 1–1000000 的整数", 422)
+    now = int(time.time())
+    if expires_at is not None and (type(expires_at) is not int or expires_at <= now):
+        raise PointsError("过期时间须晚于现在", 422)
+    custom = normalize_code(code) if code else None
+    if code and not 4 <= len(custom) <= 32:
+        raise PointsError("自定义兑换码须为 4–32 位字母或数字", 422)
+    if custom and count != 1:
+        raise PointsError("自定义兑换码一次只能建一个", 422)
+    note = str(note or "")[:100]
+
+    def run(conn):
+        made = []
+        attempts = 0
+        while len(made) < count:
+            attempts += 1
+            if attempts > count * 20 + 20:
+                raise PointsError("生成兑换码失败，请重试", 500)
+            candidate = custom or "".join(secrets.choice(REDEEM_ALPHABET) for _ in range(12))
+            added = conn.execute("""INSERT OR IGNORE INTO redeem_codes
+                                    (code,units,max_uses,expires_at,note,created_at) VALUES (?,?,?,?,?,?)""",
+                                 (candidate, units, max_uses, expires_at, note, now)).rowcount
+            if added:
+                made.append(candidate)
+            elif custom:
+                raise PointsError("这个兑换码已经存在", 409)
+        return made
+    return [_show_code(c) for c in _transaction(run)]
+
+
+def list_redeem_codes(limit=200):
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT * FROM redeem_codes ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                            (limit,)).fetchall()
+    return [_code_row(r) for r in rows]
+
+
+def set_redeem_disabled(code, disabled):
+    key = normalize_code(code)
+    with closing(_connect()) as conn, conn:
+        changed = conn.execute("UPDATE redeem_codes SET disabled=? WHERE code=?",
+                               (1 if disabled else 0, key)).rowcount
+    if not changed:
+        raise PointsError("没有这个兑换码", 404)
+    return {"code": _show_code(key), "disabled": bool(disabled)}
+
+
+def _redeem_blocked(user_id):
+    since = int(time.time()) - REDEEM_FAIL_WINDOW
+    with closing(_connect()) as conn:
+        failed = conn.execute("SELECT COUNT(*) FROM redeem_failures WHERE user_id=? AND created_at>?",
+                              (user_id, since)).fetchone()[0]
+    return failed >= REDEEM_FAIL_LIMIT
+
+
+def _note_redeem_failure(user_id):
+    with closing(_connect()) as conn, conn:
+        conn.execute("INSERT INTO redeem_failures VALUES (?,?)", (user_id, int(time.time())))
+        conn.execute("DELETE FROM redeem_failures WHERE created_at<?", (int(time.time()) - REDEEM_FAIL_WINDOW,))
+
+
+def redeem(user_id, raw_code):
+    """兑换。成功返回 {'points': 到账积分, 'balance': 余额}；码无效、过期、领完、已兑换过都抛 PointsError。"""
+    if not get_settings()["enabled"]:
+        raise PointsError("积分功能暂未开放", 503)
+    code = normalize_code(raw_code)
+    if not 4 <= len(code) <= 32:
+        raise PointsError("兑换码格式不对", 422)
+    if _redeem_blocked(user_id):
+        raise PointsError("兑换码输错次数过多，请 15 分钟后再试", 429)
+
+    def run(conn):
+        row = conn.execute("SELECT * FROM redeem_codes WHERE code=?", (code,)).fetchone()
+        if not row:
+            raise PointsError("兑换码无效", 404)
+        if row["disabled"]:
+            raise PointsError("该兑换码已停用", 410)
+        if row["expires_at"] and row["expires_at"] <= time.time():
+            raise PointsError("该兑换码已过期", 410)
+        try:
+            new_balance = _apply(conn, user_id, row["units"], "redeem", "%s:%d" % (code, user_id),
+                                 "兑换码 " + _show_code(code))
+        except _Duplicate:
+            raise PointsError("你已经兑换过这个码了", 409) from None
+        if conn.execute("UPDATE redeem_codes SET used=used+1 WHERE code=? AND used<max_uses",
+                        (code,)).rowcount != 1:
+            raise PointsError("该兑换码已被领完", 410)      # 抛出后整笔回滚，上面的入账一起撤销
+        return {"points": _show(row["units"]), "balance": _show(new_balance)}
+    try:
+        return _transaction(run)
+    except PointsError as exc:
+        if exc.status == 404:
+            _note_redeem_failure(user_id)
+        raise
 
 
 # ---- 充值 ----

@@ -63,6 +63,22 @@
       <div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>类型</th><th>变动</th><th>余额</th><th>备注</th></tr></thead><tbody id="pointsLedgerRows"></tbody></table></div>
     </section>
     <section class="section">
+      <div class="head"><h2>积分兑换码</h2></div>
+      <form class="form" id="redeemForm">
+        <div class="field"><label for="redeemPoints">每个码兑换多少积分（最多一位小数）</label><input id="redeemPoints" type="number" min="0.1" max="10000" step="0.1" required></div>
+        <div class="field"><label for="redeemCount">生成几个码（1–500）</label><input id="redeemCount" type="number" min="1" max="500" step="1" value="1" required></div>
+        <div class="field"><label for="redeemUses">每个码最多可被几个用户兑换（每人限兑一次）</label><input id="redeemUses" type="number" min="1" max="1000000" step="1" value="1" required></div>
+        <div class="field"><label for="redeemExpires">有效期至（留空为长期有效）</label><input id="redeemExpires" type="date"></div>
+        <div class="field"><label for="redeemCustom">自定义码（可选，4–32 位字母数字；填了就只能生成 1 个）</label><input id="redeemCustom" maxlength="32" autocomplete="off"></div>
+        <div class="field"><label for="redeemNote">备注（例如：双十一活动）</label><input id="redeemNote" maxlength="100"></div>
+        <button class="btn primary" type="submit">生成兑换码</button>
+      </form>
+      <p class="message" id="redeemMessage" role="status"></p>
+      <div id="redeemOutputBox" hidden><textarea id="redeemOutput" rows="6" readonly style="width:100%"></textarea></div>
+      <p>码不区分大小写，用户输入时带不带连字符都行。已兑换的积分不会因停用而收回；兑换记录在上面的积分流水里（类型「兑换码」）。</p>
+      <div class="table-wrap"><table><thead><tr><th>兑换码</th><th>积分</th><th>已用 / 总数</th><th>有效期</th><th>状态</th><th>备注</th><th>操作</th></tr></thead><tbody id="redeemRows"></tbody></table></div>
+    </section>
+    <section class="section">
       <div class="head"><h2>最近服务订单</h2><button class="btn" id="downloadServiceOrders" type="button">下载订单 CSV</button></div>
       <p>付款后调用失败或处理中断的订单需人工核查并安排退款，不会自动再次调用。</p>
       <div class="table-wrap"><table><thead><tr><th>支付订单号</th><th>服务</th><th>金额</th><th>字符数</th><th>支付状态</th><th>处理状态</th></tr></thead><tbody id="serviceOrderRows"></tbody></table></div>

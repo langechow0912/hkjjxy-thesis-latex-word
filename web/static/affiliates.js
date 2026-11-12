@@ -203,7 +203,7 @@ async function updateCommission(id, status, payoutRef = "") {
 }
 
 async function reload() {
-  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals(), loadServicePrices(), loadServiceOrders(), loadPointsSettings(), loadPointsLedger()]);
+  await Promise.all([loadAffiliates(), loadCommissions(), loadCoupons(), loadWithdrawals(), loadServicePrices(), loadServiceOrders(), loadPointsSettings(), loadPointsLedger(), loadRedeemCodes()]);
 }
 
 async function loadServicePrices() {
@@ -240,7 +240,7 @@ async function loadPointsSettings() {
 async function loadPointsLedger() {
   const result = await api('/api/admin/points/ledger');
   const body = $('pointsLedgerRows'); body.replaceChildren();
-  const kinds = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还'};
+  const kinds = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还', redeem:'兑换码'};
   for (const row of result.ledger) {
     const tr = node('tr');
     tr.append(node('td', new Date(row.created_at * 1000).toLocaleString()), node('td', row.email || row.username),
@@ -249,6 +249,45 @@ async function loadPointsLedger() {
     body.append(tr);
   }
 }
+async function loadRedeemCodes() {
+  const result = await api('/api/admin/redeem-codes');
+  const body = $('redeemRows'); body.replaceChildren();
+  for (const item of result.codes) {
+    const tr = node('tr');
+    const expired = item.expires_at && item.expires_at * 1000 < Date.now();
+    const state = item.disabled ? '已停用' : expired ? '已过期' : item.used >= item.max_uses ? '已领完' : '可用';
+    const toggle = node('button', item.disabled ? '启用' : '停用'); toggle.type = 'button'; toggle.className = 'btn';
+    toggle.addEventListener('click', async () => {
+      toggle.disabled = true;
+      try {
+        await api('/api/admin/redeem-codes/' + encodeURIComponent(item.code), {method:'PUT', body:JSON.stringify({disabled:!item.disabled})});
+        await loadRedeemCodes();
+      } catch (error) { setMessage($('redeemMessage'), error.message, true); toggle.disabled = false; }
+    });
+    const action = node('td'); action.append(toggle);
+    tr.append(node('td', item.code), node('td', String(item.points)), node('td', `${item.used} / ${item.max_uses}`),
+      node('td', item.expires_at ? new Date(item.expires_at * 1000).toLocaleDateString() : '长期有效'),
+      node('td', state), node('td', item.note || ''), action);
+    body.append(tr);
+  }
+}
+$('redeemForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button[type=submit]'); button.disabled = true;
+  try {
+    const date = $('redeemExpires').value;
+    const payload = {points:Number($('redeemPoints').value), count:Number($('redeemCount').value),
+      max_uses:Number($('redeemUses').value), note:$('redeemNote').value.trim(),
+      expires_at: date ? Math.floor(new Date(date + 'T23:59:59').getTime() / 1000) : null,
+      code: $('redeemCustom').value.trim() || null};
+    const result = await api('/api/admin/redeem-codes', {method:'POST', body:JSON.stringify(payload)});
+    $('redeemOutput').value = result.codes.join('\n'); $('redeemOutputBox').hidden = false;
+    setMessage($('redeemMessage'), `已生成 ${result.codes.length} 个兑换码，复制保存后发给用户。`);
+    $('redeemCustom').value = '';
+    await loadRedeemCodes(); await loadPointsLedger();
+  } catch (error) { setMessage($('redeemMessage'), error.message, true); }
+  finally { button.disabled = false; }
+});
 $('pointsSettingsForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = event.target.querySelector('button'); button.disabled = true;

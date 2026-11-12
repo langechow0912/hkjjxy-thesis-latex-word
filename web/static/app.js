@@ -1067,7 +1067,7 @@ $('bindForm').addEventListener('submit', async event => {
 });
 
 // ---- 积分 ----
-const ledgerLabels = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还'};
+const ledgerLabels = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还', redeem:'兑换码'};
 let topupTimer = null;
 async function loadPoints() {
   if (!currentUser) { pointsInfo = null; updatePointButtons(); return null; }
@@ -1131,6 +1131,19 @@ function watchTopup(orderId, tries = 0) {
     if (tries < 400) watchTopup(orderId, tries + 1);
   }, 3000);
 }
+$('redeemForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const code = $('redeemCode').value.trim();
+  if (!code) { pointsMessage('请输入兑换码。', true); return; }
+  $('redeemSubmit').disabled = true;
+  try {
+    const result = await request('/api/points/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code})});
+    $('redeemCode').value = '';
+    await loadPoints(); renderPointsDialog();
+    pointsMessage(`兑换成功，到账 ${fmtPoints(result.points)} 积分。`);
+  } catch (error) { pointsMessage(error.message, true); }
+  finally { $('redeemSubmit').disabled = false; }
+});
 $('pointsBtn').onclick = () => openPoints();
 // Closing the dialog must not stop watching: the top-up may still be paid and should then show up.
 $('pointsClose').onclick = () => $('pointsDialog').close();

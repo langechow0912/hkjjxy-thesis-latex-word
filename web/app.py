@@ -529,6 +529,30 @@ def adjust_points(body: dict):
                         str(body.get('note') or ''))
 
 
+@app.post('/api/admin/redeem-codes')
+def create_redeem_codes(body: dict):
+    _require_affiliate_admin()
+    from core import points
+    codes = _points_call(lambda: points.create_redeem_codes(
+        body.get('points'), body.get('count', 1), body.get('max_uses', 1), body.get('expires_at'),
+        str(body.get('note') or ''), body.get('code') or None))
+    return {'codes': codes}
+
+
+@app.get('/api/admin/redeem-codes')
+def list_redeem_codes():
+    _require_affiliate_admin()
+    from core import points
+    return {'codes': _points_call(points.list_redeem_codes)}
+
+
+@app.put('/api/admin/redeem-codes/{code}')
+def update_redeem_code(code: str, body: dict):
+    _require_affiliate_admin()
+    from core import points
+    return _points_call(points.set_redeem_disabled, code, bool(body.get('disabled')))
+
+
 @app.get('/api/admin/points/ledger')
 def points_ledger(email: str = Query('', max_length=254)):
     _require_affiliate_admin()
@@ -1034,8 +1058,7 @@ async def api_dp_format(file: UploadFile | None = File(None),
     analysis = None
     if analysisId.strip():
         # 先在预览里确认过识别结果：排版用服务端保存的那份字节，下标才和预览对得上
-        if not local_rule:
-            raise HTTPException(400, "识别结果预览只适用于海口经济学院本地排版")
+        # 本地排版按它排；云端排版则把确认后的标题级别写回 Word 再上传（core/docx_retag.py）
         analysis = format_ai_routes.get_analysis(analysisId.strip(), user["id"])
         data, suffix = format_ai_routes.read_source(analysis), ".docx"
     else:
@@ -1098,9 +1121,22 @@ async def api_dp_format(file: UploadFile | None = File(None),
                 "statusLabel": "", "taskId": None, "suggestions": [],
                 "preview": None, "exported": False})
     accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip())
-    threading.Thread(target=_run_cloud,
-                     args=(job, data, file.filename or "source.docx", meta),
-                     daemon=True).start()
+    retag = None
+    if analysis is not None:
+        from core import docx2tex
+        try:
+            raw = json.loads(overrides) if overrides.strip() else []
+        except ValueError:
+            raise HTTPException(400, "识别结果的修改格式不对") from None
+        clean, rejected = docx2tex.normalize_overrides(raw, analysis["items"])
+        if rejected:
+            raise HTTPException(400, "有 %d 处修改无效（%s），请刷新预览后重试" % (len(rejected), rejected[0]))
+        retag = clean
+    filename = (file.filename if file is not None else "") or "source.docx"
+    args = (job, data, filename, meta) + ((retag,) if retag is not None else ())
+    threading.Thread(target=_run_cloud, args=args, daemon=True).start()
+    if analysis is not None:
+        format_ai_routes.discard(analysis["id"])
     return {"job": job["id"], "title": meta["title"]}
 
 
@@ -1116,12 +1152,21 @@ def _run_school(job, payload, meta):
         job['log'].append(traceback.format_exc())
 
 
-def _run_cloud(job, payload, filename, meta):
+def _run_cloud(job, payload, filename, meta, retag=None):
     def log(*a):
         job["log"].append(" ".join(str(x) for x in a))
 
     extra = {k: v for k, v in meta.items() if k not in ("title", "authorName", "ruleId")}
     try:
+        if retag is not None:
+            # 用确认过的识别结果给每个标题重新打上 Word 标题级别；失败就退回原稿，不影响排版
+            try:
+                from core import docx_retag
+                payload, rep = docx_retag.retag(payload, retag)
+                log("已按识别结果重新标注标题：%(retagged)d 个标题打上级别（其中 %(changed)d 个与原稿不同），"
+                    "取消 %(demoted)d 个误判标题样式" % rep)
+            except Exception as exc:                      # noqa: BLE001
+                log("重新标注标题失败，改用原稿上传：%s" % exc)
         file_uri = dayipaper.upload_document(payload, filename)
         log("上传完成：fileUri = %s" % file_uri)
 
