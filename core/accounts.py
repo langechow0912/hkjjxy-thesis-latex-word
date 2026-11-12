@@ -164,16 +164,18 @@ def _record_failure(key):
 def login(username, password):
     """校验密码并新建会话。返回 (会话令牌, 用户)"""
     username = (username or "").strip()
-    key = username.lower()
+    email_key = normalize_email(username)[1] if "@" in username else None
+    key = email_key or username.lower()
     if _throttled(key):
         raise AccountError("密码错误次数过多，请 15 分钟后再试", 429)
     password = (password or "")[:PASSWORD_MAX + 1]
     with closing(_connect()) as conn, conn:
-        row = conn.execute("SELECT id, username, password_hash FROM users WHERE username=?",
-                           (username,)).fetchone()
+        row = conn.execute("SELECT id, username, password_hash FROM users WHERE "
+                           + ("email_key=?" if email_key else "username=?"),
+                           (email_key or username,)).fetchone()
         if not _check_password(password, row["password_hash"] if row else _DUMMY_HASH) or not row:
             _record_failure(key)
-            raise AccountError("用户名或密码错误", 401)
+            raise AccountError("邮箱、用户名或密码错误", 401)
         return _new_session(conn, row["id"]), {"id": row["id"], "username": row["username"]}
 
 
@@ -244,13 +246,15 @@ def send_email_code(email, purpose="login", user_id=None):
             taken = conn.execute("SELECT id FROM users WHERE email_key=? AND id!=?", (key, user_id)).fetchone()
             if taken:
                 return {"sent": True}            # 看起来一样，但不发信
+        if purpose == "reset" and not conn.execute("SELECT id FROM users WHERE email_key=?", (key,)).fetchone():
+            return {"sent": True}                # 没有这个邮箱的账号：看起来一样，但不发信
         code = "%06d" % secrets.randbelow(10 ** 6)
         salt = secrets.token_hex(8)
         row_id = conn.execute("""INSERT INTO email_codes (email_key,purpose,salt,code_hash,created_at,expires_at)
                                  VALUES (?,?,?,?,?,?)""",
                               (key, purpose, salt, _code_hash(salt, key, code), now, now + CODE_TTL)).lastrowid
     try:
-        mailer.send_code(email, code, "绑定邮箱" if purpose == "bind" else "登录")
+        mailer.send_code(email, code, {"bind": "绑定邮箱", "reset": "重设密码"}.get(purpose, "登录"))
     except mailer.MailError as exc:
         with closing(_connect()) as conn, conn:        # 没发出去就别占用冷却时间
             conn.execute("DELETE FROM email_codes WHERE id=?", (row_id,))
@@ -277,31 +281,61 @@ def _consume_code(key, purpose, code):
 _BAD_CODE = "验证码错误或已失效"
 
 
-def login_with_email(email, code):
-    """验证码登录；邮箱第一次出现就自动注册。返回 (会话令牌, 用户, 是否新建)"""
+def login_with_email(email, code, password=None):
+    """邮箱验证码登录或注册。返回 (会话令牌, 用户, 是否新建)
+
+    password 为 None：验证码登录，邮箱必须已注册。
+    password 有值：注册，邮箱必须是第一次出现；已注册的邮箱不会被覆盖密码。"""
     email, key = normalize_email(email)
+    if password is not None and not PASSWORD_MIN <= len(password) <= PASSWORD_MAX:
+        raise AccountError("密码长度为 %d–%d 位" % (PASSWORD_MIN, PASSWORD_MAX))
     if not _consume_code(key, "login", code):
         raise AccountError(_BAD_CODE, 401)
     now = int(time.time())
     created = False
     with closing(_connect()) as conn, conn:
         row = conn.execute("SELECT id, username, email, points FROM users WHERE email_key=?", (key,)).fetchone()
+        if row and password is not None:
+            raise AccountError("该邮箱已注册，请直接登录", 409)
         if row:
             user_id = row["id"]
         else:
+            if password is None:
+                raise AccountError("该邮箱还没有注册，请先注册并设置密码")
             try:
                 user_id = conn.execute("""INSERT INTO users (username,password_hash,created_at,email,email_key,email_verified_at)
                                           VALUES (?,?,?,?,?,?)""",
-                                       (email, UNUSABLE_HASH, now, email, key, now)).lastrowid
+                                       (email, _hash_password(password), now, email, key, now)).lastrowid
                 created = True
             except sqlite3.IntegrityError:
-                raise AccountError("登录失败，请重试", 409) from None
+                raise AccountError("注册失败，请重试", 409) from None
         token = _new_session(conn, user_id)
     if created:
         from core import points
         points.grant_signup_bonus(user_id)
     user = session_user(token)
     return token, user, created
+
+
+def reset_password(email, code, password):
+    """用邮箱验证码设置新密码（旧版没有密码的邮箱账号、忘记密码都走这里）。
+    成功后踢掉该账号所有旧会话并直接登录。返回 (会话令牌, 用户)"""
+    email, key = normalize_email(email)
+    if not PASSWORD_MIN <= len(password or "") <= PASSWORD_MAX:
+        raise AccountError("密码长度为 %d–%d 位" % (PASSWORD_MIN, PASSWORD_MAX))
+    if not _consume_code(key, "reset", code):
+        raise AccountError(_BAD_CODE, 401)
+    with closing(_connect()) as conn, conn:
+        row = conn.execute("SELECT id, username FROM users WHERE email_key=?", (key,)).fetchone()
+        if not row:
+            raise AccountError(_BAD_CODE, 401)
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_password(password), row["id"]))
+        conn.execute("DELETE FROM user_sessions WHERE user_id=?", (row["id"],))
+        token = _new_session(conn, row["id"])
+    with _FAIL_LOCK:
+        _FAILS.pop(key, None)
+        _FAILS.pop(row["username"].lower(), None)
+    return token, session_user(token)
 
 
 def bind_email(user_id, email, code):

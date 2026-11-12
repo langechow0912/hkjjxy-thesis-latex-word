@@ -43,8 +43,13 @@ class EmailLogin(unittest.TestCase):
     def send(self, email):
         return self.client.post('/api/account/email/send', json={'email': email})
 
-    def login(self, email, code):
+    def signup(self, email, code, password='email-test-password'):
+        return self.client.post('/api/account/email/register', json={'email': email, 'code': code, 'password': password})
+
+    def code_login(self, email, code):
         return self.client.post('/api/account/email/login', json={'email': email, 'code': code})
+
+    login = signup      # 大多数用例只需要「这个邮箱有了账号」
 
     def last_code(self):
         return self.sent[-1][1]
@@ -53,7 +58,151 @@ class EmailLogin(unittest.TestCase):
         with closing(accounts._connect()) as conn, conn:
             conn.execute('UPDATE email_codes SET created_at=created_at-?', (seconds,))
 
-    def test_code_login_creates_account_and_sets_cookie(self):
+    def test_registration_requires_a_valid_password(self):
+        for password in (None, '', 'short', 'x' * (accounts.PASSWORD_MAX + 1)):
+            email = mail()
+            self.send(email)
+            payload = {'email': email, 'code': self.last_code()}
+            if password is not None:
+                payload['password'] = password
+            result = self.client.post('/api/account/email/register', json=payload)
+            self.assertIn(result.status_code, (400, 422), result.text)
+            with closing(accounts._connect()) as conn:
+                self.assertIsNone(conn.execute('SELECT id FROM users WHERE email_key=?', (email,)).fetchone())
+
+    def test_bad_password_does_not_burn_the_code(self):
+        email = mail(); self.send(email); code = self.last_code()
+        self.assertEqual(self.signup(email, code, 'short').status_code, 400)
+        self.assertEqual(self.signup(email, code).status_code, 200)
+
+    def test_registration_needs_a_valid_code(self):
+        email = mail(); self.send(email)
+        self.assertEqual(self.signup(email, 'invalid').status_code, 401)
+        with closing(accounts._connect()) as conn:
+            self.assertIsNone(conn.execute('SELECT id FROM users WHERE email_key=?', (email,)).fetchone())
+
+    def test_registered_user_logs_in_with_password_in_any_case_or_plus_tag(self):
+        email = mail()
+        self.send(email)
+        user_id = self.signup(email, self.last_code(), 'new-password-123').json()['user']['id']
+        self.client.post('/api/account/logout')
+        local, domain = email.split('@')
+        for username in (email, email.upper(), local + '+tag@' + domain):
+            result = self.client.post('/api/account/login', json={'username': username, 'password': 'new-password-123'})
+            self.assertEqual(result.status_code, 200, (username, result.text))
+            self.assertEqual(result.json()['user']['id'], user_id)
+            self.client.post('/api/account/logout')
+
+    def test_registering_an_existing_email_cannot_overwrite_the_password(self):
+        email = mail()
+        self.send(email); self.signup(email, self.last_code(), 'original-pass-1')
+        self.client.post('/api/account/logout')
+        self.age_codes(61)
+        self.send(email)
+        result = self.signup(email, self.last_code(), 'attacker-pass-1')
+        self.assertEqual(result.status_code, 409)
+        self.assertIsNone(self.client.get('/api/account/me').json()['user'])
+        good = self.client.post('/api/account/login', json={'username': email, 'password': 'original-pass-1'})
+        self.assertEqual(good.status_code, 200)
+
+    def test_code_login_works_for_registered_email_and_keeps_password(self):
+        email = mail()
+        self.send(email); user_id = self.signup(email, self.last_code(), 'original-pass-1').json()['user']['id']
+        self.client.post('/api/account/logout')
+        self.age_codes(61)
+        self.send(email)
+        result = self.code_login(email, self.last_code())
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertFalse(result.json()['created'])
+        self.assertEqual(result.json()['user']['id'], user_id)
+        self.client.post('/api/account/logout')
+        good = self.client.post('/api/account/login', json={'username': email, 'password': 'original-pass-1'})
+        self.assertEqual(good.status_code, 200)
+
+    def legacy_email_account(self):
+        """旧版（没有密码）的邮箱账号：密码是不可用的占位值。"""
+        email = mail()
+        self.send(email); user_id = self.signup(email, self.last_code()).json()['user']['id']
+        with closing(accounts._connect()) as conn, conn:
+            conn.execute('UPDATE users SET password_hash=? WHERE id=?', (accounts.UNUSABLE_HASH, user_id))
+        self.client.post('/api/account/logout')
+        self.age_codes(61)
+        return email, user_id
+
+    def reset(self, email, code, password='brand-new-pass-1'):
+        return self.client.post('/api/account/email/reset', json={'email': email, 'code': code, 'password': password})
+
+    def test_legacy_email_account_can_set_a_password_with_a_code(self):
+        email, user_id = self.legacy_email_account()
+        res = self.client.post('/api/account/login', json={'username': email, 'password': 'brand-new-pass-1'})
+        self.assertEqual(res.status_code, 401)
+        self.assertEqual(self.client.post('/api/account/email/reset/send', json={'email': email}).status_code, 200)
+        self.assertEqual(self.sent[-1][2], '重设密码')
+        result = self.reset(email, self.last_code())
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()['user']['id'], user_id)
+        self.client.post('/api/account/logout')
+        res = self.client.post('/api/account/login', json={'username': email.upper(), 'password': 'brand-new-pass-1'})
+        self.assertEqual(res.status_code, 200, res.text)
+
+    def test_reset_signs_out_other_sessions(self):
+        email, _ = self.legacy_email_account()
+        self.send(email); self.code_login(email, self.last_code())
+        old_cookie = self.client.cookies.get(accounts.COOKIE)
+        self.age_codes(61)
+        self.client.post('/api/account/email/reset/send', json={'email': email})
+        self.assertEqual(self.reset(email, self.last_code()).status_code, 200)
+        self.assertIsNone(accounts.session_user(old_cookie))
+
+    def test_reset_code_and_login_code_are_not_interchangeable(self):
+        email, _ = self.legacy_email_account()
+        self.send(email)                                    # 登录用验证码
+        self.assertEqual(self.reset(email, self.last_code()).status_code, 401)
+        self.age_codes(61)
+        self.client.post('/api/account/email/reset/send', json={'email': email})
+        self.assertEqual(self.code_login(email, self.last_code()).status_code, 401)
+
+    def test_reset_for_unknown_email_sends_nothing_and_looks_the_same(self):
+        known, _ = self.legacy_email_account()
+        before = len(self.sent)
+        a = self.client.post('/api/account/email/reset/send', json={'email': mail()})
+        self.assertEqual(len(self.sent), before)
+        self.age_codes(61)
+        b = self.client.post('/api/account/email/reset/send', json={'email': known})
+        self.assertEqual((a.status_code, a.json()), (b.status_code, b.json()))
+        self.assertEqual(len(self.sent), before + 1)
+
+    def test_reset_validates_password_and_does_not_burn_the_code(self):
+        email, _ = self.legacy_email_account()
+        self.client.post('/api/account/email/reset/send', json={'email': email})
+        code = self.last_code()
+        self.assertEqual(self.reset(email, code, 'short').status_code, 400)
+        self.assertEqual(self.reset(email, 'invalid').status_code, 401)
+        self.assertEqual(self.reset(email, code).status_code, 200)
+
+    def test_mail_template_wording(self):
+        sent = []
+        class Fake:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def login(self, *a): pass
+            def send_message(self, message): sent.append(message)
+        env = {'SMTP_HOST': 'smtp.test', 'SMTP_USER': 'a@test', 'SMTP_PASSWORD': 'x', 'SMTP_SECURITY': 'ssl'}
+        with patch.dict(os.environ, env), patch('core.mailer.smtplib.SMTP_SSL', Fake):
+            REAL_SEND('a@example.com', '123456')
+        body = sent[0].get_content()
+        self.assertIn('验证码10分钟内有效，请勿告诉任何人。', body)
+        self.assertNotIn('10 分钟内有效', body)
+
+    def test_code_login_does_not_create_an_account(self):
+        email = mail(); self.send(email)
+        result = self.code_login(email, self.last_code())
+        self.assertEqual(result.status_code, 400)
+        with closing(accounts._connect()) as conn:
+            self.assertIsNone(conn.execute('SELECT id FROM users WHERE email_key=?', (email,)).fetchone())
+
+    def test_registration_creates_account_and_sets_cookie(self):
         email = mail()
         self.assertEqual(self.send(email).status_code, 200)
         res = self.login(email, self.last_code())
@@ -85,7 +234,7 @@ class EmailLogin(unittest.TestCase):
         self.client.post('/api/account/logout')
         self.age_codes()
         self.send(email)
-        res = self.login(email, self.last_code())
+        res = self.code_login(email, self.last_code())
         self.assertFalse(res.json()['created'])
         self.assertEqual(res.json()['user']['id'], first)
 
@@ -127,7 +276,7 @@ class EmailLogin(unittest.TestCase):
         self.client.post('/api/account/logout')
         self.age_codes()
         self.send(local + '+x@example.com')
-        b = self.login(local + '+x@example.com', self.last_code()).json()['user']['id']
+        b = self.code_login(local + '+x@example.com', self.last_code()).json()['user']['id']
         self.assertEqual(a, b)
 
     def test_bad_address_is_rejected_and_nothing_sent(self):
@@ -169,7 +318,8 @@ class EmailLogin(unittest.TestCase):
 
     def test_bind_email_to_password_account(self):
         name = 'bind' + uuid.uuid4().hex[:6]
-        user = self.client.post('/api/account/register', json={'username': name, 'password': 'correct-horse'}).json()['user']
+        accounts.register(name, 'correct-horse')
+        user = self.client.post('/api/account/login', json={'username': name, 'password': 'correct-horse'}).json()['user']
         self.assertIsNone(user.get('email'))
         email = mail()
         self.assertEqual(self.client.post('/api/account/email/bind/send', json={'email': email}).status_code, 200)
@@ -180,7 +330,9 @@ class EmailLogin(unittest.TestCase):
     def test_bind_to_a_taken_email_sends_nothing_and_fails_generically(self):
         taken = mail(); self.send(taken); self.login(taken, self.last_code())
         self.client.post('/api/account/logout')
-        self.client.post('/api/account/register', json={'username': 'b' + uuid.uuid4().hex[:6], 'password': 'correct-horse'})
+        other = 'b' + uuid.uuid4().hex[:6]
+        accounts.register(other, 'correct-horse')
+        self.client.post('/api/account/login', json={'username': other, 'password': 'correct-horse'})
         self.age_codes(120)           # 避开 60 秒冷却，单测「已被占用」这个分支
         before = len(self.sent)
         res = self.client.post('/api/account/email/bind/send', json={'email': taken})
@@ -193,7 +345,7 @@ class EmailLogin(unittest.TestCase):
         self.client.post('/api/account/logout')
         self.assertEqual(self.client.post('/api/account/email/bind/send', json={'email': mail()}).status_code, 401)
 
-    def test_email_account_cannot_log_in_with_a_password(self):
+    def test_email_account_rejects_incorrect_password(self):
         email = mail(); self.send(email); self.login(email, self.last_code())
         self.client.post('/api/account/logout')
         for password in ('!', 'correct-horse', '        '):
@@ -204,14 +356,15 @@ class EmailLogin(unittest.TestCase):
         points.save_settings({'enabled': True, 'signup_bonus': 30, 'signup_bonus_daily_cap': 100,
                               'topup_packages': [5, 10]})
         name = 'pw' + uuid.uuid4().hex[:6]
-        pw = self.client.post('/api/account/register', json={'username': name, 'password': 'correct-horse'}).json()['user']
+        accounts.register(name, 'correct-horse')
+        pw = self.client.post('/api/account/login', json={'username': name, 'password': 'correct-horse'}).json()['user']
         self.assertEqual(points.balance(pw['id']), 0)
         self.client.post('/api/account/logout')
         email = mail(); self.send(email); self.login(email, self.last_code())
         self.assertEqual(self.client.get('/api/account/me').json()['user']['points'], 30)
         self.client.post('/api/account/logout')
         self.age_codes()
-        self.send(email); self.login(email, self.last_code())
+        self.send(email); self.code_login(email, self.last_code())
         self.assertEqual(self.client.get('/api/account/me').json()['user']['points'], 30)
 
     def test_signup_bonus_respects_daily_cap(self):

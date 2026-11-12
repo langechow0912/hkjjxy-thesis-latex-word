@@ -59,7 +59,7 @@ def send_code(to, code, purpose="登录"):
     message["To"] = to
     message["Subject"] = "Paper Layout %s验证码" % purpose
     message.set_content(
-        "您的%s验证码是：%s\n\n10 分钟内有效，请勿告诉任何人。\n如果不是您本人操作，请忽略这封邮件。" % (purpose, code))
+        "您的%s验证码是：%s\n\n验证码10分钟内有效，请勿告诉任何人。\n如果不是您本人操作，请忽略这封邮件。" % (purpose, code))
     host = _setting("SMTP_HOST")
     security = _setting("SMTP_SECURITY", "ssl").lower()
     try:

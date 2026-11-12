@@ -5,7 +5,7 @@ let selectedRule = null, searchTimer = null, searchVersion = 0, composing = fals
 let selectedFile = null, busy = false, searching = false, job = null, timer = null;
 let paymentJob = null, paymentOrder = null, paymentTimer = null, finished = false, autoTitle = '';
 // Declared up here: pricing code that runs while the page loads reads these.
-let currentUser = null, afterLogin = null, pointsInfo = null, loginTab = 'email';
+let currentUser = null, afterLogin = null, pointsInfo = null, loginTab = 'password';
 // 识别结果预览的状态：controls() 在页面加载时就会读它，所以必须声明在文件最前面。
 const aiState = {id:null, base:new Map(), rows:[], edits:new Map(), suggestions:new Map(), filter:'issues', similar:null,
   info:null, notes:[], seq:0, busy:false, confirmed:false, truncated:false};
@@ -983,22 +983,28 @@ function renderAccount() {
   $('bindEmailBtn').hidden = !currentUser || !!currentUser.email;
   updatePointButtons();
 }
+const LOGIN_TABS = {password:'登录', code:'登录', register:'注册', reset:'重设密码'};
 function setLoginTab(name) {
-  loginTab = name === 'password' ? 'password' : 'email';
+  loginTab = LOGIN_TABS[name] ? name : 'password';
   for (const button of document.querySelectorAll('[data-login-tab]')) {
     const active = button.dataset.loginTab === loginTab;
     button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active));
   }
-  $('paneEmail').hidden = loginTab !== 'email'; $('panePassword').hidden = loginTab !== 'password';
-  $('emailLoginSubmit').hidden = loginTab !== 'email';
-  $('loginSubmit').hidden = $('registerSubmit').hidden = loginTab !== 'password';
+  $('panePassword').hidden = loginTab !== 'password';
+  $('paneCode').hidden = loginTab === 'password';
+  $('paneRegister').hidden = loginTab !== 'register' && loginTab !== 'reset';
+  $('newPasswordLabel').textContent = loginTab === 'reset' ? '新密码' : '设置密码';
+  $('newPasswordHint').textContent = loginTab === 'reset'
+    ? '验证邮箱后设置新密码，之前的登录会失效。旧版邮箱账号也在这里设置密码。'
+    : '注册需要验证邮箱并设置密码，之后可用密码或验证码登录。';
+  $('loginTitle').textContent = $('loginSubmit').textContent = LOGIN_TABS[loginTab];
   $('loginMsg').textContent = '';
 }
 function openLogin(then = null) {
   afterLogin = then; $('loginMsg').textContent = '';
   setLoginTab(loginTab);
   if (!$('loginDialog').open) $('loginDialog').showModal();
-  (loginTab === 'email' ? $('loginEmail') : $('loginUser')).focus();
+  $('loginEmail').focus();
 }
 // Uploading needs an account so the work shows up in 我的记录.
 function requireLogin(then) {
@@ -1027,29 +1033,34 @@ async function sendEmailCode(url, emailInput, button, messageNode) {
 $('loginOpen').onclick = () => openLogin();
 $('loginCancel').onclick = () => { afterLogin = null; $('loginDialog').close(); };
 for (const button of document.querySelectorAll('[data-login-tab]')) button.addEventListener('click', () => setLoginTab(button.dataset.loginTab));
-$('emailCodeSend').addEventListener('click', () => sendEmailCode('/api/account/email/send', $('loginEmail'), $('emailCodeSend'), $('loginMsg')));
+$('resetLink').addEventListener('click', () => setLoginTab('reset'));
+$('emailCodeSend').addEventListener('click', () => sendEmailCode(
+  loginTab === 'reset' ? '/api/account/email/reset/send' : '/api/account/email/send',
+  $('loginEmail'), $('emailCodeSend'), $('loginMsg')));
 $('loginForm').addEventListener('submit', async event => {
   event.preventDefault();
-  const buttons = ['emailLoginSubmit','loginSubmit','registerSubmit'];
-  for (const id of buttons) $(id).disabled = true;
-  $('loginMsg').textContent = '';
+  $('loginSubmit').disabled = true; $('loginMsg').textContent = '';
+  const post = (url, body) => request(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   try {
+    const email = $('loginEmail').value.trim();
     let result;
-    if (loginTab === 'email') {
-      result = await request('/api/account/email/login', {method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({email:$('loginEmail').value.trim(), code:$('loginCode').value.trim()})});
+    if (loginTab === 'password') {
+      result = await post('/api/account/login', {username: email, password: $('loginPass').value});
+    } else if (loginTab === 'code') {
+      result = await post('/api/account/email/login', {email, code: $('loginCode').value.trim()});
     } else {
-      const mode = event.submitter?.value === 'register' ? 'register' : 'login';
-      result = await request('/api/account/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({username:$('loginUser').value.trim(), password:$('loginPass').value})});
+      const password = $('emailPassword').value;
+      if (password.length < 8 || password.length > 128) throw new Error('请设置 8–128 位密码');
+      result = await post(loginTab === 'reset' ? '/api/account/email/reset' : '/api/account/email/register',
+        {email, code: $('loginCode').value.trim(), password});
     }
     currentUser = result.user; renderAccount();
-    $('loginPass').value = ''; $('loginCode').value = ''; $('loginDialog').close();
+    $('loginPass').value = ''; $('emailPassword').value = ''; $('loginCode').value = ''; $('loginDialog').close();
     loadPoints().catch(() => {});
     const then = afterLogin; afterLogin = null;
     if (then) then();
   } catch (error) { $('loginMsg').textContent = error.message; }
-  finally { for (const id of buttons) $(id).disabled = false; }
+  finally { $('loginSubmit').disabled = false; }
 });
 
 // ---- 绑定邮箱 ----
