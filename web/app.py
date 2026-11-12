@@ -29,6 +29,7 @@ import csv
 import io
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -64,6 +65,11 @@ PRODUCTION = os.environ.get("THESIS_ENV", "").lower() == "production"
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
+    try:
+        from core import points
+        points._connect().close()          # 一次性数据迁移 + 建表
+    except Exception:
+        logging.getLogger(__name__).exception("points schema init failed")
     # 每 SWEEP_INTERVAL 秒删一次过期成品；访问时另有即时检查，所以不必更频繁。
     stop = threading.Event()
     threading.Thread(target=_sweep, args=(stop,), daemon=True, name="result-sweeper").start()
@@ -77,10 +83,14 @@ app = FastAPI(title="毕业论文格式流水线", lifespan=_lifespan,
               openapi_url=None if PRODUCTION else "/openapi.json")
 from web.tabword_routes import router as tabword_router
 from web import dsh_routes
+from web import points_routes
+from web import format_ai_routes
 from web import account_routes
 from web.account_routes import current_user
 app.include_router(tabword_router)
 app.include_router(dsh_routes.router)
+app.include_router(points_routes.router)
+app.include_router(format_ai_routes.router)
 app.include_router(account_routes.router)
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -268,7 +278,8 @@ def _reap_jobs():
 
 
 def _purge_expired():
-    """付款满 RESULT_TTL 的排版成品连同上传的原稿一起删除"""
+    """付款满 RESULT_TTL 的排版成品连同上传的原稿一起删除；顺带清掉过期的识别预览记录"""
+    format_ai_routes.purge_expired()
     for job in list(JOBS.values()):
         if job["state"] != "running" and alipay.result_expired(job["id"]):
             _drop_job(job)
@@ -414,6 +425,16 @@ def favicon_ico():
     return FileResponse(STATIC / "favicon.ico", media_type="image/x-icon")
 
 
+@app.get("/ui.css")
+def frontend_style():
+    return FileResponse(STATIC / "ui.css", media_type="text/css")
+
+
+@app.get("/support-qq.jpg")
+def support_qr():
+    return FileResponse(STATIC / "support-qq.jpg", media_type="image/jpeg")
+
+
 @app.get("/app.js")
 def frontend_script():
     return FileResponse(STATIC / "app.js", media_type="application/javascript")
@@ -442,7 +463,7 @@ def service_orders():
 def service_orders_csv():
     _require_affiliate_admin()
     from core import service_billing
-    fields = ('订单号', '服务', '金额(元)', '字符数', '支付状态', '处理状态',
+    fields = ('订单号', '服务', '金额(元)', '字符数', '支付状态', '支付方式', '处理状态',
               '推广员', '推广员邮箱', '推广码', '活动', '佣金(元)', '佣金状态', '创建时间')
     output = io.StringIO(newline='')
     writer = csv.writer(output)
@@ -456,6 +477,7 @@ def service_orders_csv():
             order.get('out_trade_no') or '', labels.get(order['operation'], '论文改写'),
             f"{int(order['amount_cents'] or 0) / 100:.2f}", order.get('characters') or 0,
             '已支付' if order.get('payment_status') == 'TRADE_SUCCESS' else '未支付',
+            '积分' if order.get('payment_product') == 'points' else '支付宝',
             states.get(order.get('state'), order.get('state') or ''),
             order.get('affiliate_name') or '', order.get('affiliate_email') or '',
             order.get('affiliate_code') or '', order.get('affiliate_campaign') or '',
@@ -475,6 +497,67 @@ def update_service_prices(body: dict):
         return service_billing.save_prices(body)
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
+
+
+def _points_call(fn, *args):
+    from core import accounts, points
+    try:
+        return fn(*args)
+    except (points.PointsError, accounts.AccountError) as exc:
+        raise HTTPException(exc.status, str(exc)) from None
+
+
+@app.get('/api/admin/points-settings')
+def get_points_settings():
+    _require_affiliate_admin()
+    from core import points
+    return points.get_settings()
+
+
+@app.put('/api/admin/points-settings')
+def update_points_settings(body: dict):
+    _require_affiliate_admin()
+    from core import points
+    return _points_call(points.save_settings, body)
+
+
+@app.post('/api/admin/points/adjust')
+def adjust_points(body: dict):
+    _require_affiliate_admin()
+    from core import points
+    return _points_call(points.admin_adjust, str(body.get('email') or ''), body.get('delta'),
+                        str(body.get('note') or ''))
+
+
+@app.post('/api/admin/redeem-codes')
+def create_redeem_codes(body: dict):
+    _require_affiliate_admin()
+    from core import points
+    codes = _points_call(lambda: points.create_redeem_codes(
+        body.get('points'), body.get('count', 1), body.get('max_uses', 1), body.get('expires_at'),
+        str(body.get('note') or ''), body.get('code') or None))
+    return {'codes': codes}
+
+
+@app.get('/api/admin/redeem-codes')
+def list_redeem_codes():
+    _require_affiliate_admin()
+    from core import points
+    return {'codes': _points_call(points.list_redeem_codes)}
+
+
+@app.put('/api/admin/redeem-codes/{code}')
+def update_redeem_code(code: str, body: dict):
+    _require_affiliate_admin()
+    from core import points
+    return _points_call(points.set_redeem_disabled, code, bool(body.get('disabled')))
+
+
+@app.get('/api/admin/points/ledger')
+def points_ledger(email: str = Query('', max_length=254)):
+    _require_affiliate_admin()
+    from core import points
+    return {'ledger': _points_call(points.admin_ledger, email or None)}
 
 
 @app.get("/admin/affiliates", response_class=HTMLResponse)
@@ -805,6 +888,9 @@ def _format_job(job_id):
     return job
 
 
+points_routes.bind(_format_job)
+
+
 def _cloud_job(job_id):
     job = _format_job(job_id)
     if job.get("kind") != "cloud":
@@ -942,7 +1028,7 @@ def _is_haikou_rule(rule):
 
 @app.post("/api/format")
 @app.post("/api/dayipaper/format")
-async def api_dp_format(file: UploadFile = File(...),
+async def api_dp_format(file: UploadFile | None = File(None),
                         ruleId: str = Form(...),
                         title: str = Form(...),
                         authorName: str = Form(...),
@@ -955,6 +1041,8 @@ async def api_dp_format(file: UploadFile = File(...),
                         subjectName: str = Form(""),
                         subjectNameEn: str = Form(""),
                         ruleLabel: str = Form(""),
+                        analysisId: str = Form(""),
+                        overrides: str = Form(""),
                         user=Depends(current_user)):
     local_rule = ruleId.strip() in ('hkjjxy', 'school:hkjjxy')
     if local_rule and not LOCAL_FORMAT:
@@ -967,10 +1055,19 @@ async def api_dp_format(file: UploadFile = File(...),
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
                             % (_cloud_running_count(), MAX_CLOUD))
 
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in (".docx", ".doc"):
-        raise HTTPException(400, "云端排版只收 .docx / .doc 源文件")
-    data = await file.read()
+    analysis = None
+    if analysisId.strip():
+        # 先在预览里确认过识别结果：排版用服务端保存的那份字节，下标才和预览对得上
+        # 本地排版按它排；云端排版则把确认后的标题级别写回 Word 再上传（core/docx_retag.py）
+        analysis = format_ai_routes.get_analysis(analysisId.strip(), user["id"])
+        data, suffix = format_ai_routes.read_source(analysis), ".docx"
+    else:
+        if file is None:
+            raise HTTPException(422, "请选择要排版的文件")
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in (".docx", ".doc"):
+            raise HTTPException(400, "云端排版只收 .docx / .doc 源文件")
+        data = await file.read()
     if not data:
         raise HTTPException(400, "上传的文件是空的")
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
@@ -988,12 +1085,25 @@ async def api_dp_format(file: UploadFile = File(...),
 
     if meta['ruleId'] in ('hkjjxy', 'school:hkjjxy'):
         meta['sourceSuffix'] = suffix
+        if analysis is not None and overrides.strip():
+            from core import docx2tex
+            try:
+                raw = json.loads(overrides)
+            except ValueError:
+                raise HTTPException(400, "识别结果的修改格式不对") from None
+            clean, rejected = docx2tex.normalize_overrides(raw, analysis["items"])
+            if rejected:
+                raise HTTPException(400, "有 %d 处修改无效（%s），请刷新预览后重试" % (len(rejected), rejected[0]))
+            if clean:
+                meta['overrides'] = clean
         job = _new_job(kind='school')
         job.update({'name': meta['title'], 'school_key': 'school:hkjjxy',
                     'stage': '准备本地排版', 'status': None, 'statusLabel': '',
                     'taskId': None, 'suggestions': [], 'preview': None, 'exported': False})
         accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip() or LOCAL_SCHOOL['name'])
         threading.Thread(target=_run_school, args=(job, data, meta), daemon=True).start()
+        if analysis is not None:
+            format_ai_routes.discard(analysis["id"])
         return {'job': job['id'], 'title': meta['title']}
 
     school_key = meta['ruleId']
@@ -1011,9 +1121,22 @@ async def api_dp_format(file: UploadFile = File(...),
                 "statusLabel": "", "taskId": None, "suggestions": [],
                 "preview": None, "exported": False})
     accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip())
-    threading.Thread(target=_run_cloud,
-                     args=(job, data, file.filename or "source.docx", meta),
-                     daemon=True).start()
+    retag = None
+    if analysis is not None:
+        from core import docx2tex
+        try:
+            raw = json.loads(overrides) if overrides.strip() else []
+        except ValueError:
+            raise HTTPException(400, "识别结果的修改格式不对") from None
+        clean, rejected = docx2tex.normalize_overrides(raw, analysis["items"])
+        if rejected:
+            raise HTTPException(400, "有 %d 处修改无效（%s），请刷新预览后重试" % (len(rejected), rejected[0]))
+        retag = clean
+    filename = (file.filename if file is not None else "") or "source.docx"
+    args = (job, data, filename, meta) + ((retag,) if retag is not None else ())
+    threading.Thread(target=_run_cloud, args=args, daemon=True).start()
+    if analysis is not None:
+        format_ai_routes.discard(analysis["id"])
     return {"job": job["id"], "title": meta["title"]}
 
 
@@ -1029,12 +1152,21 @@ def _run_school(job, payload, meta):
         job['log'].append(traceback.format_exc())
 
 
-def _run_cloud(job, payload, filename, meta):
+def _run_cloud(job, payload, filename, meta, retag=None):
     def log(*a):
         job["log"].append(" ".join(str(x) for x in a))
 
     extra = {k: v for k, v in meta.items() if k not in ("title", "authorName", "ruleId")}
     try:
+        if retag is not None:
+            # 用确认过的识别结果给每个标题重新打上 Word 标题级别；失败就退回原稿，不影响排版
+            try:
+                from core import docx_retag
+                payload, rep = docx_retag.retag(payload, retag)
+                log("已按识别结果重新标注标题：%(retagged)d 个标题打上级别（其中 %(changed)d 个与原稿不同），"
+                    "取消 %(demoted)d 个误判标题样式" % rep)
+            except Exception as exc:                      # noqa: BLE001
+                log("重新标注标题失败，改用原稿上传：%s" % exc)
         file_uri = dayipaper.upload_document(payload, filename)
         log("上传完成：fileUri = %s" % file_uri)
 
@@ -1111,6 +1243,18 @@ def api_dp_preview(job_id: str):
     return RedirectResponse(url, status_code=303)
 
 
+def _require_paid_export(payment_order, job_id):
+    """Word 导出必须有这个任务的已付款订单。积分付款不依赖支付宝是否启用。"""
+    order = alipay.get_order(payment_order, job_id)
+    if order and order["status"] == "TRADE_SUCCESS" and order.get("payment_product") == "points":
+        return
+    if not alipay.public_status()["enabled"]:
+        raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
+    order = alipay.sync_order(payment_order, job_id)
+    if not order or order["status"] != "TRADE_SUCCESS":
+        raise HTTPException(402, "请先完成支付宝电脑网站支付")
+
+
 @app.get("/api/format/jobs/{job_id}/download")
 @app.get("/api/dayipaper/download/{job_id}")
 def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
@@ -1125,21 +1269,13 @@ def api_dp_download(job_id: str, fmt: int = Query(1, ge=1, le=2),
                                 filename=sanitize(local['name']) + '.pdf')
         if fmt != 1 or 'docx' not in local['files']:
             raise HTTPException(409, 'Word 尚未生成或格式不支持')
-        if not alipay.public_status()["enabled"]:
-            raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
-        order = alipay.sync_order(payment_order, job_id)
-        if not order or order["status"] != "TRADE_SUCCESS":
-            raise HTTPException(402, "请先完成支付宝电脑网站支付")
+        _require_paid_export(payment_order, job_id)
         return FileResponse(local['files']['docx'], filename=sanitize(local['name']) + '.docx')
     job = _cloud_job(job_id)
     with _LOCK:
         export_lock = job.setdefault("exportLock", threading.Lock())
     with export_lock:
-        if not alipay.public_status()["enabled"]:
-            raise HTTPException(503, "支付宝电脑网站支付尚未配置完成，暂不能下载 Word")
-        order = alipay.sync_order(payment_order, job_id)
-        if not order or order["status"] != "TRADE_SUCCESS":
-            raise HTTPException(402, "请先完成支付宝电脑网站支付")
+        _require_paid_export(payment_order, job_id)
         confirm = True
         return _export_job(job, fmt, confirm)
 

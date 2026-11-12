@@ -49,6 +49,7 @@ heading:
     2: {font: 黑体, size: 14, before: 8,  after: 4}      # 四号
     3: {font: 黑体, size: 12, before: 6,  after: 3}      # 小四
   unnum: {font: 黑体, size: 12, before: 54, after: 6}    # 参考文献 / 致谢
+  intro: {font: 黑体, size: 15, before: 0, after: 0, justify: true}   # 引言/绪论：小三、顶格、两端对齐、1.5 倍行距、段前后 0（一级标题，不带编号）
 
 # ---------------- 摘要区 ----------------
 abstract:
@@ -132,6 +133,7 @@ dsh:
   # 启用的检查点（只跑实现了的；cp4_quality 还是占位，别开）
   checkpoints:
     - cp1_preprocess  # 文档预处理
+    - cpx_analyze     # 识别结果预览里的 AI 助手（按 token 计费，用户主动触发）
 
   # API 配置
   api:

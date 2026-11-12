@@ -4,12 +4,28 @@ const fields = ['title','authorName','titleEn','authorNameEn','tutorName','tutor
 let selectedRule = null, searchTimer = null, searchVersion = 0, composing = false;
 let selectedFile = null, busy = false, searching = false, job = null, timer = null;
 let paymentJob = null, paymentOrder = null, paymentTimer = null, finished = false, autoTitle = '';
+// Declared up here: pricing code that runs while the page loads reads these.
+let currentUser = null, afterLogin = null, pointsInfo = null, loginTab = 'email';
+// 识别结果预览的状态：controls() 在页面加载时就会读它，所以必须声明在文件最前面。
+const aiState = {id:null, base:new Map(), rows:[], edits:new Map(), suggestions:new Map(), filter:'issues', similar:null,
+  info:null, notes:[], seq:0, busy:false, confirmed:false, truncated:false};
+const yuan = cents => `¥${(cents / 100).toFixed(2)}`;
+// 价格同时用人民币和积分显示：¥0.99（10 积分）
+const dualPrice = cents => `${yuan(cents)}（${fmtPoints(pointsFor(cents))} 积分）`;
+// 积分最多一位小数：10 显示 10，9.9 显示 9.9
+const fmtPoints = value => Number.isInteger(value) ? String(value) : (Math.round(value * 10) / 10).toFixed(1);
 function message(text, kind = '') { $('msg').textContent = text; $('msg').className = 'msg ' + kind; }
+function formReady() {
+  return !busy && !searching && !!selectedRule?.id && !!$('title').value.trim() && !!$('authorName').value.trim();
+}
 function controls() {
   for (const id of [...fields, 'query','drop']) $(id).disabled = busy;
   for (const button of $('schoolResults').querySelectorAll('button')) button.disabled = busy;
   $('schoolResults').setAttribute('aria-busy', String(searching));
-  $('go').disabled = busy || searching || !selectedFile || !selectedRule?.id || !$('title').value.trim() || !$('authorName').value.trim();
+  $('go').disabled = !formReady() || !selectedFile;
+  const docx = !!selectedFile && /\.docx$/i.test(selectedFile.name);
+  $('checkStructure').disabled = busy || searching || !docx || aiState.busy;
+  $('checkStructure').title = !selectedFile ? '先选择 .docx 论文' : docx ? '' : '识别结果预览暂只支持 .docx，.doc 请直接点「开始排版」';
   $('bar').hidden = !busy;
   $('result').setAttribute('aria-busy', String(busy));
 }
@@ -93,6 +109,7 @@ async function searchRules() {
 }
 function selectFile(file) {
   if (busy) return;
+  aiClose();
   clearResult(); selectedFile = null; $('filename').hidden = true; $('file').value = '';
   if (!/\.(docx|doc)$/i.test(file.name)) message('请上传 .docx / .doc 格式的 Word 论文。', 'error');
   else if (!file.size || file.size > 20 * 1024 * 1024) message('文件不能为空，且不能超过 20 MB。', 'error');
@@ -105,11 +122,15 @@ function selectFile(file) {
   }
   controls();
 }
-async function submit() {
-  if ($('go').disabled || !requireLogin(submit)) return;
+async function submit(extra = null) {
+  if (!extra?.analysisId) extra = null;       // 只有带识别结果编号的才算「按预览排版」，其余一律走原来的上传流程
+  if ((extra ? !formReady() : $('go').disabled) || !requireLogin(() => submit(extra))) return;
   // The previous result (paid or not) stays in 我的记录, so no confirmation is needed.
   busy = true; clearResult(true); controls(); $('state').textContent = '提交中';
-  const data = new FormData(); data.append('file', selectedFile); data.append('ruleId', selectedRule.id);
+  const data = new FormData();
+  if (extra) { data.append('analysisId', extra.analysisId); data.append('overrides', JSON.stringify(extra.overrides)); }
+  else data.append('file', selectedFile);
+  data.append('ruleId', selectedRule.id);
   data.append('ruleLabel', selectedRule.label || '');
   for (const id of fields) data.append(id, $(id).value.trim());
   message('正在上传稿件并提交排版…');
@@ -117,13 +138,18 @@ async function submit() {
     const result = await request('/api/format', {method:'POST',body:data});
     if (!result.job) throw new Error('未收到任务编号，请确认服务状态。');
     job = result.job; sessionStorage.setItem('thesisJob', job);
+    if (extra) aiClose();
     sessionStorage.setItem('thesisDraft', JSON.stringify({query:$('query').value, ruleId:selectedRule.id,
       ruleLabel:selectedRule.label,
       fields:Object.fromEntries(fields.map(id => [id, $(id).value]))}));
     poll();
   } catch (e) {
     // A lost response may still have created a task. Avoid automatic resubmission.
-    busy = false; controls(); $('state').textContent = '提交未确认';
+    busy = false; controls();
+    if (extra && e.status === 404) {                     // 识别结果过期了：文件还在，重新检查即可
+      $('state').textContent = '待排版'; aiClose(); message('识别结果已过期，请点「检查识别结果」重新检查。', 'error'); return;
+    }
+    $('state').textContent = '提交未确认';
     message(e.message + ' 若提交时网络中断，请先确认任务是否已创建，避免重复提交。', 'error');
   }
 }
@@ -164,13 +190,16 @@ async function setupPayment(id) {
     const config = await request('/api/alipay');
     if (paymentJob !== id) return;
     if (!config.enabled) {
-      $('paymentInfo').textContent = '支付宝支付尚未配置完成，暂不能下载 Word。';
+      const cents = pointsInfo?.prices_cents?.format_export;
+      $('paymentInfo').textContent = '支付宝支付尚未开放' + (cents ? `；Word 成品 ${dualPrice(cents)}，可用积分付款后下载。` : '，暂不能下载 Word。');
+      updatePointButtons();
       return;
     }
     formatPrice = config.amount_cents; formatPayLabel();
-    $('paymentInfo').textContent = '付款后即可下载 Word 成品。成品保存 24 小时，到期自动删除。';
+    $('paymentInfo').textContent = `Word 成品 ${dualPrice(formatPrice)}。付款后即可下载，成品保存 24 小时，到期自动删除。`;
     $('couponControls').hidden = false;
     $('createPayment').hidden = false;
+    updatePointButtons();
     const saved = sessionStorage.getItem('thesisPaymentOrder');
     if (saved) {
       try {
@@ -205,7 +234,7 @@ async function createPayment() {
     button.hidden = true;
     $('couponCode').disabled = true; $('applyCoupon').disabled = true;
     if (result.coupon_code) $('couponInfo').textContent = `已使用优惠码 ${result.coupon_code}`;
-    const amount = `应付 ¥${(result.amount_cents / 100).toFixed(2)}`;
+    const amount = `应付 ${dualPrice(result.amount_cents)}`;
     if (result.status === 'TRADE_SUCCESS') closePayWindow(win);
     else $('paymentInfo').textContent = sendToCheckout(win, result.checkout_url, $('paymentCheckout'))
       ? `已打开支付宝收银台（${amount}）。付款后回到本页，会自动出现下载按钮。`
@@ -213,6 +242,25 @@ async function createPayment() {
     checkPayment(id, paymentOrder);
   } catch (error) { closePayWindow(win); if (paymentJob === id) $('paymentInfo').textContent = error.message; }
   finally { button.disabled = false; }
+}
+async function createPointsPayment() {
+  if (!paymentJob || !requireLogin(createPointsPayment)) return;
+  const id = paymentJob, button = $('createPointsPayment'); button.disabled = true;
+  $('paymentInfo').textContent = '正在用积分付款…';
+  try {
+    const result = await request('/api/points/pay', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:id})});
+    if (paymentJob !== id) return;
+    paymentOrder = result.order_id;
+    sessionStorage.setItem('thesisPaymentOrder', JSON.stringify({job:id, orderId:paymentOrder}));
+    $('createPayment').hidden = true; $('paymentCheckout').hidden = true;
+    $('couponCode').disabled = true; $('applyCoupon').disabled = true;
+    if (currentUser) { currentUser.points = result.balance; renderAccount(); }
+    checkPayment(id, paymentOrder);
+  } catch (error) {
+    if (paymentJob === id) $('paymentInfo').textContent = error.message;
+    if (error.status === 402) openPoints(error.message);
+  } finally { button.disabled = false; updatePointButtons(); }
 }
 async function checkPayment(id, order) {
   if (paymentJob !== id || paymentOrder !== order) return;
@@ -263,7 +311,7 @@ async function applyCoupon() {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({code:$('couponCode').value.trim()}),
     });
-    $('couponInfo').textContent = `${quote.coupon_code} 已应用：优惠 ¥${(quote.discount_cents / 100).toFixed(2)}，应付 ¥${(quote.amount_cents / 100).toFixed(2)}。`;
+    $('couponInfo').textContent = `${quote.coupon_code} 已应用：优惠 ${yuan(quote.discount_cents)}，应付 ${dualPrice(quote.amount_cents)}。优惠券只用于支付宝付款，积分支付按原价。`;
     formatPayLabel(quote.amount_cents);
   } catch (error) { $('couponInfo').textContent = error.message; }
   finally { button.disabled = false; }
@@ -348,8 +396,9 @@ $('drop').addEventListener('drop', e => {
   const file = e.dataTransfer.files[0];
   if (file && requireLogin(() => selectFile(file))) selectFile(file);
 });
-$('go').onclick = submit;
+$('go').onclick = () => submit();          // 不能直接绑 submit：点击事件对象会被当成 extra 传进去
 $('createPayment').onclick = createPayment;
+$('createPointsPayment').onclick = createPointsPayment;
 $('paidDownload').onclick = downloadPaid;
 $('applyCoupon').onclick = applyCoupon;
 $('couponCode').addEventListener('input', () => { $('couponInfo').textContent = ''; formatPayLabel(); });
@@ -366,6 +415,10 @@ $('resume').onclick = () => { $('resume').hidden = true; controls(); poll(); };
   if (/^TW-[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')
       && sessionStorage.getItem('twPayment') === null) {
     sessionStorage.setItem('twReturned', JSON.stringify({quote_id:returnedJob, order_id:returnedOrder}));
+  }
+  // Points top-up: Alipay returns to a fresh tab; keep confirming the order there.
+  if (/^PT-[0-9a-f]{32}$/.test(returnedJob || '') && /^[A-Za-z0-9_-]{8,64}$/.test(returnedOrder || '')) {
+    sessionStorage.setItem('pointsReturned', returnedOrder);
   }
   if (params.has('job') || params.has('out_trade_no')) history.replaceState(null, '', location.pathname);
 }
@@ -611,22 +664,30 @@ function twShowOrder(order) {
   if (!order) return;
   $('twBillInfo').textContent = order.paid
     ? `订单 ${order.order_id} 已付款，正在处理。`
-    : `应付 ¥${(order.amount_cents / 100).toFixed(2)} · 订单 ${order.order_id}。在支付宝付款后，这里会自动开始处理。`;
+    : `应付 ${dualPrice(order.amount_cents)} · 订单 ${order.order_id}。在支付宝付款后，这里会自动开始处理；也可以改用积分支付。`;
   // The cashier opens by itself; this link is only for a closed or blocked tab.
   $('twCheckout').href = order.checkout_url || '#'; $('twCheckout').hidden = order.paid || !order.checkout_url;
   if (!order.blocked) { $('twCheckout').classList.remove('blocked'); $('twCheckout').textContent = '没看到付款页？重新打开'; }
   $('twPaidRun').hidden = !order.paid && !order.waiting;
 }
-function twRefresh() {
+function twPriceCents() {
   const p = twConfig?.prices, service = $('twService').value;
-  let price = '';
-  if (p && service === 'detect_text') price = ` ¥${(p.detect_text_cents / 100).toFixed(2)}`;
-  else if (p && service === 'detect_file') price = ` ¥${(p.detect_file_cents / 100).toFixed(2)}`;
-  else if (p && service === 'paraphrase_stream') {
+  if (!p) return null;
+  if (service === 'detect_text') return p.detect_text_cents;
+  if (service === 'detect_file') return p.detect_file_cents;
+  if (service === 'paraphrase_stream') {
     const count = [...$('twText').value].filter(char => !/\s/.test(char)).length;
-    if (count) price = ` ¥${(Math.max(1, Math.ceil(count * p.rewrite_per_1000_cents / 1000)) / 100).toFixed(2)}`;
+    return count ? Math.max(1, Math.ceil(count * p.rewrite_per_1000_cents / 1000)) : null;
   }
-  $('twPrepare').innerHTML = `付款${price}并开始 <span aria-hidden="true">↗</span>`;
+  return null;
+}
+function twPointsPrice() { const cents = twPriceCents(); return cents == null ? null : pointsFor(cents); }
+function twRefresh() {
+  const cents = twPriceCents();
+  const price = cents == null ? '' : ` ${yuan(cents)}`;
+  $('twPrepare').innerHTML = `支付宝支付${price}并开始 <span aria-hidden="true">↗</span>`;
+  $('twPriceNow').textContent = cents == null ? '' : `本次费用：${dualPrice(cents)}`;
+  updatePointButtons();
   if (!twBusy) twShowOrder(twCurrentOrder());
 }
 function twSendToCheckout(order, win) {
@@ -637,11 +698,12 @@ function twSendToCheckout(order, win) {
     ? '浏览器拦截了付款页，请点「打开支付宝付款」。'
     : '已打开支付宝收银台。付款后本页会自动开始处理，请不要关闭本页。';
 }
-async function twBuy() {
-  if (twBusy || !requireLogin(twBuy)) return;
+async function twBuy(method = 'alipay') {
+  if (twBusy || !requireLogin(() => twBuy(method))) return;
   const existing = twCurrentOrder();
   if (existing) {
     if (existing.paid) { twShowOrder(existing); $('twMessage').textContent = '这份内容已付款，正在处理。'; twRunPaid(existing); }
+    else if (method === 'points') await twPayWithPoints(existing);
     else twSendToCheckout(existing, openPayWindow());
     return;
   }
@@ -651,13 +713,20 @@ async function twBuy() {
   if (needsFile ? !file : !String(values.text || '').trim()) {
     $('twMessage').textContent = needsFile ? '请先选择 Word 文档。' : '请先输入或粘贴要处理的文本。'; return;
   }
-  const win = openPayWindow();
-  twBusy = true; $('twPrepare').disabled = true; $('twMessage').textContent = '正在打开支付宝…';
+  const win = method === 'points' ? null : openPayWindow();
+  let pending = null;
+  twBusy = true; $('twPrepare').disabled = true; $('twMessage').textContent = method === 'points' ? '正在计价…' : '正在打开支付宝…';
   try {
     const key = twKey();
     const body = new FormData(); body.append('operation', operation); body.append('params', JSON.stringify(values));
     if (file) body.append('file', file);
     const quote = await request('/api/tabword/billing/quote', {method:'POST', body});
+    if (method === 'points') {
+      // The order only exists once the points are paid; until then nothing is watched.
+      pending = {quote_id:quote.quote_id, order_id:'', checkout_url:'', amount_cents:quote.amount_cents, operation, values, key,
+        fileName:file ? file.name : '', created:Date.now(), paid:false, done:false, file};
+      return;
+    }
     const payment = await request(`/api/tabword/billing/${quote.quote_id}/payment`, {method:'POST'});
     const order = {quote_id:quote.quote_id, order_id:payment.order_id, checkout_url:payment.checkout_url,
       amount_cents:quote.amount_cents, operation, values, key, fileName:file ? file.name : '', created:Date.now(), paid:false, done:false};
@@ -666,7 +735,28 @@ async function twBuy() {
     twSendToCheckout(order, win);
     twWatchPayment();
   } catch (error) { closePayWindow(win); $('twMessage').textContent = error.message; }
-  finally { twBusy = false; $('twPrepare').disabled = false; }
+  finally {
+    twBusy = false; $('twPrepare').disabled = false;
+    // Inside finally: the `return` in the points branch above would skip anything placed after it.
+    if (pending) await twPayWithPoints(pending);
+  }
+}
+async function twPayWithPoints(order) {
+  $('twPayPoints').disabled = true; $('twMessage').textContent = '正在用积分付款…';
+  try {
+    const result = await request('/api/points/pay', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({quote_id:order.quote_id})});
+    order.order_id = result.order_id; order.paid = true; order.waiting = false;
+    if (order.file) { twFiles.set(order.order_id, order.file); delete order.file; }
+    if (!twOrders.includes(order)) twOrders = [...twOrders.filter(twOpen), order];
+    twSaveOrders();
+    if (currentUser) { currentUser.points = result.balance; renderAccount(); }
+    twShowOrder(order);
+    await twRunPaid(order);
+  } catch (error) {
+    $('twMessage').textContent = error.message;
+    if (error.status === 402) openPoints(error.message);
+  } finally { $('twPayPoints').disabled = false; }
 }
 function twWatchPayment() {
   clearTimeout(twWatchTimer);
@@ -761,6 +851,7 @@ async function twEstimate() {
 }
 $('twService').addEventListener('change', twChange);
 $('twPrepare').addEventListener('click', () => twAction(true));
+$('twPayPoints').addEventListener('click', () => twBuy('points'));
 $('twSubmit').addEventListener('click', () => { $('twMessage').textContent = '付费任务提交暂未开放。'; });
 $('twPoll').addEventListener('click', () => twAction(true, true));
 $('twEstimate').addEventListener('click', twEstimate);
@@ -824,7 +915,7 @@ $('twCompare').addEventListener('click', () => {
 fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); return response.json(); }).then(data => {
   twConfig = data; twChange();
   const p = data.prices;
-  $('twPriceInfo').textContent = `文本检测 ¥${(p.detect_text_cents/100).toFixed(2)}/次 · 文件检测 ¥${(p.detect_file_cents/100).toFixed(2)}/次 · 改写 ¥${(p.rewrite_per_1000_cents/100).toFixed(2)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。`;
+  $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。1 元 = 10 积分。`;
 }).catch(() => { $('twMessage').textContent = '服务配置加载失败。'; });
 // Any change to what will be bought updates the price and which order is shown.
 $('twText').addEventListener('input', twRefresh);
@@ -857,43 +948,216 @@ for (const button of document.querySelectorAll('[data-view]')) button.addEventLi
 for (const button of document.querySelectorAll('[data-school]')) button.addEventListener('click', () => {
   if (busy) return; $('query').value = button.dataset.school; queueSearch(); searchRules();
 });
-for (const link of document.querySelectorAll('.flow-step')) link.addEventListener('click', () => {
-  for (const item of document.querySelectorAll('.flow-step')) item.classList.toggle('active', item === link);
+// 左侧引导：点击高亮 + 随滚动高亮；第 4 步「AI预览标题」可跳过
+const flowSteps = [...document.querySelectorAll('.flow-step')];
+function flowActivate(link) { for (const item of flowSteps) item.classList.toggle('active', item === link); }
+for (const link of flowSteps) link.addEventListener('click', () => flowActivate(link));
+(function flowSpy() {
+  if (!('IntersectionObserver' in window)) return;
+  const targets = ['chooseSchool', 'paperInfo', 'upload', 'result'].map(id => document.getElementById(id));
+  const seen = new Set();
+  const spy = new IntersectionObserver(entries => {
+    for (const entry of entries) entry.isIntersecting ? seen.add(entry.target) : seen.delete(entry.target);
+    const current = targets.find(el => seen.has(el));
+    if (!current) return;
+    // 'result' 对应第 4 步；已跳过 / 面板未打开时仍落在第 4 步，用户点第 5 步再切换
+    flowActivate(flowSteps[targets.indexOf(current)]);
+  }, {rootMargin: '-96px 0px -55% 0px'});
+  for (const el of targets) if (el) spy.observe(el);
+})();
+$('flowSkip').addEventListener('click', () => {
+  $('flowPreview').classList.add('skipped');
+  const confirmStep = flowSteps.find(el => el.dataset.flow === 'confirm');
+  flowActivate(confirmStep);
+  $('result').scrollIntoView({behavior: 'smooth', block: 'center'});
+  if (!$('go').disabled) $('go').focus({preventScroll: true});
 });
 
 // ---- 账号 ----
-let currentUser = null, afterLogin = null;
 function renderAccount() {
-  $('accountName').hidden = !currentUser; $('accountName').textContent = currentUser ? currentUser.username : '';
+  $('accountName').hidden = !currentUser;
+  $('accountName').textContent = currentUser ? (currentUser.email || currentUser.username) : '';
   $('loginOpen').hidden = !!currentUser; $('logout').hidden = !currentUser; $('historyNav').hidden = !currentUser;
+  $('pointsBtn').hidden = !currentUser;
+  if (currentUser) $('pointsBtn').textContent = `积分 ${fmtPoints(currentUser.points ?? 0)} · 充值`;
+  $('bindEmailBtn').hidden = !currentUser || !!currentUser.email;
+  updatePointButtons();
+}
+function setLoginTab(name) {
+  loginTab = name === 'password' ? 'password' : 'email';
+  for (const button of document.querySelectorAll('[data-login-tab]')) {
+    const active = button.dataset.loginTab === loginTab;
+    button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active));
+  }
+  $('paneEmail').hidden = loginTab !== 'email'; $('panePassword').hidden = loginTab !== 'password';
+  $('emailLoginSubmit').hidden = loginTab !== 'email';
+  $('loginSubmit').hidden = $('registerSubmit').hidden = loginTab !== 'password';
+  $('loginMsg').textContent = '';
 }
 function openLogin(then = null) {
   afterLogin = then; $('loginMsg').textContent = '';
+  setLoginTab(loginTab);
   if (!$('loginDialog').open) $('loginDialog').showModal();
-  $('loginUser').focus();
+  (loginTab === 'email' ? $('loginEmail') : $('loginUser')).focus();
 }
 // Uploading needs an account so the work shows up in 我的记录.
 function requireLogin(then) {
   if (currentUser) return true;
   openLogin(then); return false;
 }
+function startCountdown(button, seconds = 60) {
+  clearInterval(button._timer);
+  let left = seconds; button.disabled = true; button.textContent = `${left} 秒后重发`;
+  button._timer = setInterval(() => {
+    left -= 1;
+    if (left <= 0) { clearInterval(button._timer); button.disabled = false; button.textContent = '发送验证码'; }
+    else button.textContent = `${left} 秒后重发`;
+  }, 1000);
+}
+async function sendEmailCode(url, emailInput, button, messageNode) {
+  const email = emailInput.value.trim();
+  if (!email) { messageNode.textContent = '请先输入邮箱。'; return; }
+  button.disabled = true; messageNode.textContent = '';
+  try {
+    await request(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
+    startCountdown(button);
+    messageNode.textContent = '验证码已发送，请查收邮件（可能在垃圾箱里）。';
+  } catch (error) { messageNode.textContent = error.message; button.disabled = false; }
+}
 $('loginOpen').onclick = () => openLogin();
 $('loginCancel').onclick = () => { afterLogin = null; $('loginDialog').close(); };
+for (const button of document.querySelectorAll('[data-login-tab]')) button.addEventListener('click', () => setLoginTab(button.dataset.loginTab));
+$('emailCodeSend').addEventListener('click', () => sendEmailCode('/api/account/email/send', $('loginEmail'), $('emailCodeSend'), $('loginMsg')));
 $('loginForm').addEventListener('submit', async event => {
   event.preventDefault();
-  const mode = event.submitter?.value === 'register' ? 'register' : 'login';
-  for (const id of ['loginSubmit','registerSubmit']) $(id).disabled = true;
+  const buttons = ['emailLoginSubmit','loginSubmit','registerSubmit'];
+  for (const id of buttons) $(id).disabled = true;
   $('loginMsg').textContent = '';
   try {
-    const result = await request('/api/account/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username:$('loginUser').value.trim(), password:$('loginPass').value})});
+    let result;
+    if (loginTab === 'email') {
+      result = await request('/api/account/email/login', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email:$('loginEmail').value.trim(), code:$('loginCode').value.trim()})});
+    } else {
+      const mode = event.submitter?.value === 'register' ? 'register' : 'login';
+      result = await request('/api/account/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:$('loginUser').value.trim(), password:$('loginPass').value})});
+    }
     currentUser = result.user; renderAccount();
-    $('loginPass').value = ''; $('loginDialog').close();
+    $('loginPass').value = ''; $('loginCode').value = ''; $('loginDialog').close();
+    loadPoints().catch(() => {});
     const then = afterLogin; afterLogin = null;
     if (then) then();
   } catch (error) { $('loginMsg').textContent = error.message; }
-  finally { for (const id of ['loginSubmit','registerSubmit']) $(id).disabled = false; }
+  finally { for (const id of buttons) $(id).disabled = false; }
 });
+
+// ---- 绑定邮箱 ----
+$('bindEmailBtn').onclick = () => { $('bindMsg').textContent = ''; $('bindDialog').showModal(); $('bindEmail').focus(); };
+$('bindCancel').onclick = () => $('bindDialog').close();
+$('bindSend').addEventListener('click', () => sendEmailCode('/api/account/email/bind/send', $('bindEmail'), $('bindSend'), $('bindMsg')));
+$('bindForm').addEventListener('submit', async event => {
+  event.preventDefault(); $('bindSubmit').disabled = true; $('bindMsg').textContent = '';
+  try {
+    const result = await request('/api/account/email/bind/verify', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:$('bindEmail').value.trim(), code:$('bindCode').value.trim()})});
+    currentUser.email = result.email; renderAccount(); $('bindCode').value = ''; $('bindDialog').close();
+  } catch (error) { $('bindMsg').textContent = error.message; }
+  finally { $('bindSubmit').disabled = false; }
+});
+
+// ---- 积分 ----
+const ledgerLabels = {topup:'充值', spend:'消费', signup_bonus:'注册赠送', admin:'管理员调整', refund:'退还', redeem:'兑换码'};
+let topupTimer = null;
+async function loadPoints() {
+  if (!currentUser) { pointsInfo = null; updatePointButtons(); return null; }
+  pointsInfo = await request('/api/points');
+  currentUser.points = pointsInfo.balance; renderAccount();
+  return pointsInfo;
+}
+function pointsMessage(text, error = false) { $('pointsMsg').textContent = text; $('pointsMsg').className = 'msg' + (error ? ' error' : ''); }
+function renderPointsDialog() {
+  if (!pointsInfo) return;
+  $('pointsBalance').textContent = fmtPoints(pointsInfo.balance);
+  const box = $('pointsPackages'); box.replaceChildren();
+  for (const pack of pointsInfo.enabled ? pointsInfo.packages : []) {
+    const button = document.createElement('button'); button.type = 'button';
+    button.textContent = `¥${pack.yuan} → ${fmtPoints(pack.points)} 积分`;
+    button.disabled = !pointsInfo.alipay_enabled;
+    button.addEventListener('click', () => startTopup(pack.yuan));
+    box.append(button);
+  }
+  const list = $('pointsLedger'); list.replaceChildren();
+  if (!pointsInfo.ledger.length) { const li = document.createElement('li'); li.textContent = '暂无记录'; list.append(li); }
+  for (const row of pointsInfo.ledger) {
+    const li = document.createElement('li');
+    const left = document.createElement('span'); left.textContent = `${ledgerLabels[row.kind] || row.kind} · ${new Date(row.created_at * 1000).toLocaleString()}`;
+    const right = document.createElement('span'); right.className = row.delta > 0 ? 'plus' : 'minus';
+    right.textContent = (row.delta > 0 ? '+' : '') + fmtPoints(row.delta);
+    li.append(left, right); list.append(li);
+  }
+}
+async function openPoints(note = '') {
+  if (!requireLogin(() => openPoints(note))) return;
+  if (!$('pointsDialog').open) $('pointsDialog').showModal();
+  $('pointsCheckout').hidden = true; pointsMessage(note, !!note);
+  try {
+    await loadPoints(); renderPointsDialog();
+    if (!note && !pointsInfo.alipay_enabled) pointsMessage('支付宝支付暂未开放，暂时无法充值；已有积分仍可正常使用。', true);
+  } catch (error) { pointsMessage(error.message, true); }
+}
+async function startTopup(yuan) {
+  const win = openPayWindow();
+  pointsMessage('正在打开支付宝…');
+  try {
+    const order = await request('/api/points/topup', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({yuan})});
+    const opened = sendToCheckout(win, order.checkout_url, $('pointsCheckout'));
+    pointsMessage(opened ? '已打开支付宝收银台，付款后积分会自动到账，请不要关闭本页。' : '浏览器拦截了付款页，请点下面的链接打开支付宝。');
+    watchTopup(order.order_id);
+  } catch (error) { closePayWindow(win); pointsMessage(error.message, true); }
+}
+function watchTopup(orderId, tries = 0) {
+  clearTimeout(topupTimer);
+  topupTimer = setTimeout(async () => {
+    try {
+      const state = await request(`/api/points/topup/${encodeURIComponent(orderId)}`);
+      if (state.paid) {
+        if (currentUser) { currentUser.points = state.balance; renderAccount(); }
+        await loadPoints(); renderPointsDialog(); $('pointsCheckout').hidden = true;
+        pointsMessage('充值成功，积分已到账。'); return;
+      }
+      if (state.expired) { $('pointsCheckout').hidden = true; pointsMessage('付款页已超时，请重新选择档位。', true); return; }
+    } catch {}
+    if (tries < 400) watchTopup(orderId, tries + 1);
+  }, 3000);
+}
+$('redeemForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const code = $('redeemCode').value.trim();
+  if (!code) { pointsMessage('请输入兑换码。', true); return; }
+  $('redeemSubmit').disabled = true;
+  try {
+    const result = await request('/api/points/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code})});
+    $('redeemCode').value = '';
+    await loadPoints(); renderPointsDialog();
+    pointsMessage(`兑换成功，到账 ${fmtPoints(result.points)} 积分。`);
+  } catch (error) { pointsMessage(error.message, true); }
+  finally { $('redeemSubmit').disabled = false; }
+});
+$('pointsBtn').onclick = () => openPoints();
+// Closing the dialog must not stop watching: the top-up may still be paid and should then show up.
+$('pointsClose').onclick = () => $('pointsDialog').close();
+// 积分价与人民币价一致，不取整：99 分 = 9.9 积分
+function pointsFor(cents) { return cents / 10; }
+function updatePointButtons() {
+  const usable = !!currentUser && pointsInfo?.enabled !== false;
+  const tw = $('twPayPoints'), pts = twPointsPrice();
+  tw.hidden = !usable || pts == null;
+  if (!tw.hidden) tw.textContent = `积分支付 ${fmtPoints(pts)} 积分`;
+  const fmt = $('createPointsPayment'), exportPts = pointsInfo?.prices?.format_export;
+  fmt.hidden = !usable || !paymentJob || !!paymentOrder || exportPts == null;
+  if (!fmt.hidden) fmt.textContent = `积分支付 ${fmtPoints(exportPts)} 积分`;
+}
 $('logout').onclick = async () => {
   await request('/api/account/logout', {method:'POST'}).catch(() => {});
   // The next person on this computer must not see this account's orders.
@@ -961,4 +1225,343 @@ $('historyRefresh').onclick = loadHistory;
     $('historyMsg').textContent = `订单 ${returned.order_id} 已从支付宝返回。付款确认后，下单的那个页面会自动开始处理；处理完的结果也可以在下面打开。`;
   } else showWorkspace('format');
 }
-request('/api/account/me').then(data => { currentUser = data.user; renderAccount(); }).catch(() => renderAccount());
+request('/api/account/me').then(data => {
+  currentUser = data.user; renderAccount();
+  const returnedTopup = sessionStorage.getItem('pointsReturned');
+  if (returnedTopup && currentUser) {
+    sessionStorage.removeItem('pointsReturned');
+    openPoints().then(() => { pointsMessage('正在确认支付宝付款，请稍候…'); watchTopup(returnedTopup); });
+  }
+  return currentUser && loadPoints();
+}).then(() => aiRestore()).catch(() => renderAccount());
+
+
+// ---- 识别结果预览 + AI 助手 ----
+// 规则先识别（免费），用户直接改；AI 只给「待确认的修改」，按实际 token 扣积分。
+const AI_OPTIONS = [['h1','一级标题'],['h2','二级标题'],['h3','三级标题'],['h4','四级标题'],['body','正文'],['fig','图题'],['tab','表题']];
+const AI_EDITABLE = ['heading','candidate','note','figure_caption','table_caption'];
+const AI_FLAG_TEXT = {no_caption:'没有识别到题注', stray_caption:'像题注，但没被识别', bold_guess:'按加粗短行识别', demoted:'超出四级，按加粗正文'};
+const aiEl = (tag, className, text) => { const n = document.createElement(tag); if (className) n.className = className; if (text != null) n.textContent = text; return n; };
+const aiValueOf = row => row.kind === 'heading' ? 'h' + row.level : row.kind === 'figure_caption' ? 'fig' : row.kind === 'table_caption' ? 'tab' : 'body';
+const aiRoleFor = value => value.startsWith('h') ? {role:'heading', level:Number(value[1])}
+  : {role: value === 'fig' ? 'figure_caption' : value === 'tab' ? 'table_caption' : 'body'};
+function aiOverrides() {
+  return [...aiState.edits.values()].map(edit => {
+    const out = {...edit};
+    if (out.text !== undefined && !out.role) {            // 只改了文字：把原来的身份一起写上，免得改完文字就不再被认成标题/题注
+      const base = aiState.base.get(out.idx);
+      if (base) Object.assign(out, aiRoleFor(aiValueOf(base)));
+      if (out.role === 'body') delete out.role;
+    }
+    return out;
+  });
+}
+function aiSave() {
+  try { sessionStorage.setItem('thesisAnalysis', JSON.stringify({id:aiState.id, edits:[...aiState.edits.values()]})); } catch {}
+}
+function aiStatus(text, error = false) { $('aiStatus').textContent = text; $('aiStatus').className = 'msg' + (error ? ' error' : ''); }
+function aiExpired() {
+  aiClose(); message('识别结果已过期，请点「检查识别结果」重新检查。', 'error');
+}
+function aiClose(keepStorage = false) {
+  aiState.id = null; aiState.base = new Map(); aiState.rows = []; aiState.edits = new Map(); aiState.suggestions = new Map();
+  aiState.similar = null; aiState.filter = 'issues'; aiState.confirmed = false; aiState.seq += 1;
+  $('aiPanel').hidden = true; $('go').hidden = false; $('checkStructure').hidden = false;
+  $('aiLog').replaceChildren(); $('aiMsg').value = '';
+  if (!keepStorage) { try { sessionStorage.removeItem('thesisAnalysis'); } catch {} }
+  controls();
+}
+function aiLoad(data) {
+  aiState.id = data.analysis_id; aiState.rows = data.rows; aiState.info = data.ai; aiState.notes = data.notes || [];
+  aiState.truncated = !!data.truncated; aiState.summary = data.summary;
+  if (data.rejected?.length) aiStatus('有 ' + data.rejected.length + ' 处修改无效，已忽略：' + data.rejected[0], true);
+}
+async function aiOpen() {
+  if (!selectedFile || !/\.docx$/i.test(selectedFile.name) || aiState.busy || !requireLogin(aiOpen)) return;
+  aiState.busy = true; controls(); message('正在识别标题、图题和表题…');
+  try {
+    const body = new FormData(); body.append('file', selectedFile);
+    const data = await request('/api/format/analyze', {method:'POST', body});
+    aiClose(); aiLoad(data);
+    aiState.base = new Map(data.rows.map(row => [row.idx, row]));
+    $('aiPanel').hidden = false; $('go').hidden = true; $('checkStructure').hidden = true;
+    message(''); aiStatus(''); aiRender(); aiSave();
+    $('aiPanel').scrollIntoView({behavior:'smooth', block:'start'});
+  } catch (error) { message(error.message, 'error'); }
+  finally { aiState.busy = false; controls(); }
+}
+async function aiRestore() {
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem('thesisAnalysis') || 'null'); } catch {}
+  if (!saved?.id || sessionStorage.getItem('thesisJob') || !currentUser) return;
+  try {
+    const data = await request('/api/format/analyze/' + encodeURIComponent(saved.id));
+    aiLoad(data);
+    aiState.base = new Map(data.rows.map(row => [row.idx, row]));
+    aiState.edits = new Map((saved.edits || []).map(edit => [edit.idx, edit]));
+    $('aiPanel').hidden = false; $('go').hidden = true; $('checkStructure').hidden = true;
+    aiStatus('已恢复上次的识别结果。'); await aiRefreshNow();
+  } catch { try { sessionStorage.removeItem('thesisAnalysis'); } catch {} }
+}
+let aiTimer = null;
+function aiRefresh(immediate = false) {
+  // 先按本地修改立刻刷新（改动数、下拉框），不让用户干等服务器；连续编辑合并成一次请求
+  clearTimeout(aiTimer);
+  aiRender();
+  aiTimer = setTimeout(aiRefreshNow, immediate ? 0 : 350);
+}
+async function aiRefreshNow() {
+  // 把用户的修改交给服务器重新识别一遍，看到的才是「实际会变成什么」（越级标题被压缩、没图的题注被当成正文…）
+  const seq = ++aiState.seq;
+  aiStatus('正在按你的修改重新识别…');
+  try {
+    const data = await request('/api/format/analyze/' + encodeURIComponent(aiState.id) + '/preview',
+      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({overrides:aiOverrides()})});
+    if (seq !== aiState.seq) return;
+    aiStatus('');
+    aiLoad(data);
+  } catch (error) {
+    if (error.status === 404) { aiExpired(); return; }
+    aiStatus(error.message, true);
+  }
+  if (seq === aiState.seq) aiRender();
+}
+function aiCommit(edit) {
+  if (!edit.role && edit.text === undefined) aiState.edits.delete(edit.idx); else aiState.edits.set(edit.idx, edit);
+  aiState.suggestions.delete(edit.idx);
+  aiSave(); aiRefresh();
+}
+function aiSetRole(idx, value, refresh = true) {
+  const base = aiState.base.get(idx);
+  const edit = {...(aiState.edits.get(idx) || {idx})};
+  delete edit.role; delete edit.level;
+  if (base && value !== aiValueOf(base)) Object.assign(edit, aiRoleFor(value));
+  if (!edit.role && edit.text === undefined) aiState.edits.delete(idx); else aiState.edits.set(idx, edit);
+  aiState.suggestions.delete(idx);
+  if (refresh) { aiSave(); aiRefresh(); }
+}
+function aiSetText(idx, text) {
+  const base = aiState.base.get(idx), clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) { aiStatus('文字不能为空。', true); aiRender(); return; }
+  const edit = {...(aiState.edits.get(idx) || {idx})};
+  if (clean === base?.text) delete edit.text; else edit.text = clean;
+  aiCommit(edit);
+}
+function aiRowFlags(row) {
+  const out = [];
+  if (row.flags?.includes('clamped')) out.push(['缺上级，已按 ' + row.level + ' 级处理（原稿 ' + row.clamped_from + ' 级）']);
+  for (const flag of row.flags || []) if (AI_FLAG_TEXT[flag]) out.push([AI_FLAG_TEXT[flag]]);
+  const base = aiState.base.get(row.idx);
+  if (row.manual && base && aiState.edits.get(row.idx)?.text !== undefined) out.push(['原：' + base.text.slice(0, 30), 'orig']);
+  return out;
+}
+function aiIsIssue(row) { return (row.flags || []).some(flag => flag !== 'manual') || aiState.suggestions.has(row.idx); }
+function aiVisible(row) {
+  switch (aiState.filter) {
+    case 'issues': return aiIsIssue(row) || !!row.manual;
+    case 'headings': return row.kind === 'heading';
+    case 'figs': return row.kind === 'figure' || row.kind === 'figure_caption';
+    case 'tabs': return row.kind === 'table' || row.kind === 'table_caption';
+    case 'candidates': return row.kind === 'candidate';
+    default: return true;
+  }
+}
+function aiRenderStats() {
+  const rows = aiState.rows, box = $('aiStats'); box.replaceChildren();
+  const issues = rows.filter(aiIsIssue).length;
+  const chips = [['issues', '待确认 ' + issues, issues ? 'warn' : ''], ['all', '全部'],
+    ['headings', '标题 ' + rows.filter(r => r.kind === 'heading').length],
+    ['figs', '图 ' + rows.filter(r => r.kind === 'figure').length], ['tabs', '表 ' + rows.filter(r => r.kind === 'table').length],
+    ['candidates', '标题疑似行 ' + rows.filter(r => r.kind === 'candidate').length]];
+  for (const [key, label, extra] of chips) {
+    const b = aiEl('button', (aiState.filter === key ? 'active ' : '') + (extra || ''), label); b.type = 'button';
+    if (key === 'candidates') b.title = '没被识别成标题、但长得像标题的短行（比如没有编号、没用标题样式的小标题），可能是漏识别的标题，可以在这里挑出来设成标题。';
+    if (key === 'issues') b.title = '规则识别时发现可能有问题的地方（缺上级、没有题注、像题注但没被识别等）和 AI 的建议。';
+    b.addEventListener('click', () => { aiState.filter = key; aiRender(); });
+    box.append(b);
+  }
+}
+function aiRenderNumbering() {
+  const list = $('aiNumbering'); list.replaceChildren();
+  const counts = [0, 0, 0]; let sub = 0;
+  for (const row of aiState.rows) {
+    if (row.kind !== 'heading') continue;
+    let label;
+    if (row.level <= 3) { counts[row.level - 1] += 1; for (let i = row.level; i < 3; i++) counts[i] = 0; sub = 0; label = counts.slice(0, row.level).join('.'); }
+    else { sub += 1; label = '（' + sub + '）'; }
+    const li = aiEl('li', '', label + '　' + row.text); li.style.paddingLeft = Math.min(row.level - 1, 3) * 14 + 'px';
+    list.append(li);
+  }
+  if (!list.children.length) list.append(aiEl('li', '', '还没有识别到标题'));
+}
+function aiBuildRow(row) {
+  const edit = aiState.edits.get(row.idx), suggestion = aiState.suggestions.get(row.idx);
+  const plain = row.kind === 'candidate' || row.kind === 'note';
+  const el = aiEl('div', 'ai-row' + (plain ? ' candidate' : '') + (edit ? ' manual' : '')
+    + (aiState.similar?.set.has(row.idx) ? ' similar' : '') + (suggestion ? ' suggest' : ''));
+  el.setAttribute('role', 'listitem'); el.dataset.idx = row.idx;
+  const select = document.createElement('select'); select.setAttribute('aria-label', '这一行的类型');
+  for (const [value, label] of AI_OPTIONS) select.append(new Option(label, value));
+  const pending = edit?.role ? (edit.role === 'heading' ? 'h' + edit.level : edit.role === 'figure_caption' ? 'fig' : edit.role === 'table_caption' ? 'tab' : 'body') : null;
+  select.value = pending || aiValueOf(row);
+  if (plain && !pending) select.options[select.selectedIndex].text = '设为…';
+  select.addEventListener('change', () => aiSetRole(row.idx, select.value));
+  el.append(select);
+  const cell = aiEl('div'); cell.style.cssText = 'display:flex;align-items:center;min-width:0';
+  if (row.num) cell.append(aiEl('span', 'num', row.num));
+  if (row.kind === 'note') cell.append(aiEl('span', 'num', '表注'));
+  if (plain) cell.append(aiEl('span', '', row.text));
+  else {
+    const input = document.createElement('input'); input.value = edit?.text ?? row.text; input.maxLength = 200; input.style.flex = '1';
+    input.setAttribute('aria-label', '文字');
+    input.addEventListener('change', () => aiSetText(row.idx, input.value));
+    cell.append(input);
+  }
+  el.append(cell);
+  const tools = aiEl('div', 'tools');
+  const similar = aiEl('button', '', '找同格式行'); similar.type = 'button'; similar.title = '按格式（样式、加粗、编号形式、字号）找出文档里和这一行格式相同的行，可以一次设成同一级别'; similar.addEventListener('click', () => aiFindSimilar(row.idx));
+  tools.append(similar);
+  if (edit) { const undo = aiEl('button', '', '撤销'); undo.type = 'button'; undo.addEventListener('click', () => { aiState.edits.delete(row.idx); aiSave(); aiRefresh(); }); tools.append(undo); }
+  el.append(tools);
+  const flags = aiRowFlags(row);
+  if (flags.length) { const f = aiEl('div', 'ai-flags'); for (const [text, kind] of flags) f.append(aiEl('span', kind || '', text)); el.append(f); }
+  if (suggestion) {
+    const box = aiEl('div', 'ai-suggest');
+    const target = suggestion.role === 'heading' ? AI_OPTIONS.find(o => o[0] === 'h' + suggestion.level)[1]
+      : suggestion.role === 'figure_caption' ? '图题' : suggestion.role === 'table_caption' ? '表题' : '正文';
+    box.append(aiEl('span', '', 'AI 建议设为「' + target + '」' + (suggestion.reason ? '：' + suggestion.reason : '')));
+    const yes = aiEl('button', 'primary', '采纳'), no = aiEl('button', 'secondary', '忽略'); yes.type = no.type = 'button';
+    yes.style.cssText = no.style.cssText = 'min-height:30px;padding:2px 12px;font-size:13px';
+    yes.addEventListener('click', () => aiSetRole(row.idx, suggestion.role === 'heading' ? 'h' + suggestion.level : suggestion.role === 'figure_caption' ? 'fig' : suggestion.role === 'table_caption' ? 'tab' : 'body'));
+    no.addEventListener('click', () => { aiState.suggestions.delete(row.idx); aiRender(); });
+    box.append(yes, no); el.append(box);
+  }
+  return el;
+}
+function aiRenderList() {
+  const list = $('aiList'), keep = list.scrollTop; list.replaceChildren();
+  let body = null;
+  const flush = () => { if (body && aiState.filter === 'all') list.append(aiEl('div', 'ai-row muted', '正文 ' + body.n + ' 段 · 共 ' + body.chars + ' 字')); body = null; };
+  for (const row of aiState.rows) {
+    if (row.kind === 'body') { body = body ? {n:body.n + 1, chars:body.chars + (row.chars || 0)} : {n:1, chars:row.chars || 0}; if (aiIsIssue(row) && aiState.filter === 'issues') { flush(); } continue; }
+    flush();
+    if (!aiVisible(row)) continue;
+    if (AI_EDITABLE.includes(row.kind)) list.append(aiBuildRow(row));
+    else if (row.kind === 'figure' || row.kind === 'table') {
+      const warn = (row.flags || []).includes('no_caption');
+      list.append(aiEl('div', 'ai-row muted', '［' + row.text + '］题注：' + (row.title || '没有识别到') + (warn ? '　⚠ 请把紧挨着它的题注行设为' + (row.kind === 'figure' ? '图题' : '表题') : '')));
+    } else list.append(aiEl('div', 'ai-row muted', '——' + row.text + (row.zone ? '（以下不参与识别）' : '')));
+  }
+  flush();
+  if (!list.children.length) list.append(aiEl('div', 'ai-row muted', aiState.filter === 'issues'
+    ? '没有发现需要确认的行 ✓ 可以直接点下面的「确认并排版」；想自己看一遍，点上面的「全部」。' : '没有符合条件的行'));
+  list.scrollTop = keep;
+}
+function aiRender() {
+  if (!aiState.id) return;
+  aiRenderStats(); aiRenderList(); aiRenderNumbering();
+  const n = aiState.edits.size, issueCount = aiState.rows.filter(aiIsIssue).length;
+  $('aiHint').textContent = issueCount
+    ? '系统发现 ' + issueCount + ' 处可能需要你确认，已为你筛在下面；其余按规则识别的结果没有发现问题。想看完整列表点「全部」。'
+    : '没有发现需要确认的地方，可以直接排版。想自己看一遍，点「全部」。';
+  $('aiDirty').textContent = n ? '已修改 ' + n + ' 处' : '还没有修改';
+  $('aiNotes').replaceChildren(...aiState.notes.slice(0, 4).map(text => aiEl('li', '', text)));
+  if (aiState.truncated) $('aiNotes').append(aiEl('li', '', '文档较长，只显示前面一部分；没显示的部分仍按规则识别。'));
+  const info = aiState.info || {};
+  $('aiScan').disabled = aiState.busy || !info.available;
+  $('aiScanFoot').disabled = $('aiScan').disabled;
+  $('aiSend').disabled = aiState.busy || !info.available;
+  $('aiPrice').textContent = info.available
+    ? '按实际 token 用量计费：每 1000 token ' + fmtPoints(info.rate) + ' 积分，每次至少 ' + fmtPoints(info.min_charge) + ' 积分。每次先预留，用多少扣多少，出错全额退还。'
+    : 'AI 助手暂未开放。你仍然可以手动修改。';
+  $('aiBalance').textContent = currentUser ? '积分余额 ' + fmtPoints(currentUser.points ?? 0) : '';
+  aiRenderSimilar();
+}
+function aiRenderSimilar() {
+  const bar = $('aiSimilarBar'); bar.replaceChildren();
+  if (!aiState.similar) { bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.append(aiEl('span', '', '找到 ' + aiState.similar.set.size + ' 个和所选行格式相同的行（黄色高亮，只看格式，不看上下文）。把它们和所选行一起设为：'));
+  const select = document.createElement('select'); select.style.minHeight = '32px';
+  for (const [value, label] of AI_OPTIONS) select.append(new Option(label, value));
+  select.value = 'h3';
+  const apply = aiEl('button', 'primary', '应用'), cancel = aiEl('button', 'secondary', '取消'); apply.type = cancel.type = 'button';
+  apply.style.cssText = cancel.style.cssText = 'min-height:32px;padding:2px 12px;font-size:13px';
+  apply.addEventListener('click', () => {
+    for (const idx of [aiState.similar.source, ...aiState.similar.set]) aiSetRole(idx, select.value, false);
+    aiState.similar = null; aiSave(); aiRefresh();
+  });
+  cancel.addEventListener('click', () => { aiState.similar = null; aiRender(); });
+  bar.append(select, apply, cancel);
+}
+async function aiFindSimilar(idx) {
+  try {
+    const data = await request('/api/format/analyze/' + encodeURIComponent(aiState.id) + '/similar',
+      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({idx})});
+    if (!data.idx.length) { aiStatus('没有找到和这一行格式相同的行。', true); return; }
+    aiState.filter = 'all'; aiState.similar = {source:idx, set:new Set(data.idx)}; aiStatus(''); aiRender();
+  } catch (error) { if (error.status === 404) aiExpired(); else aiStatus(error.message, true); }
+}
+// ---- AI 助手 ----
+function aiLog(kind, text, small = '') {
+  const log = $('aiLog'), m = aiEl('div', 'm ' + kind, text);
+  if (small) m.append(aiEl('small', '', small));
+  log.append(m); log.scrollTop = log.scrollHeight;
+}
+function aiAskConfirm() {
+  return new Promise(resolve => {
+    $('aiConfirmReserve').textContent = fmtPoints(aiState.info?.reserve ?? 0);
+    const dialog = $('aiConfirmDialog'); dialog.returnValue = '';
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), {once:true});
+    dialog.showModal();
+  });
+}
+async function aiCall(path, payload, shown) {
+  if (aiState.busy || !aiState.id) return;
+  if (!aiState.confirmed) { if (!await aiAskConfirm()) return; aiState.confirmed = true; }
+  aiState.busy = true; aiRender(); controls(); aiStatus('AI 正在分析，请稍候…');
+  aiLog('u', shown);
+  try {
+    const data = await request('/api/format/analyze/' + encodeURIComponent(aiState.id) + path,
+      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...payload, overrides:aiOverrides()})});
+    for (const change of data.changes) aiState.suggestions.set(change.idx, change);
+    aiLog('a', data.reply || (data.changes.length ? '我找到了几处可能认错的地方，已在左侧标出。' : '没有发现明显问题（这不代表一定没问题，你可以用「找同格式行」或直接手动修改）。'),
+      '本次 ' + data.usage.total.toLocaleString() + ' tokens · 扣 ' + fmtPoints(data.charged) + ' 积分 · 本文档累计 ' + fmtPoints(data.total_charged)
+      + ' 积分 · 还可调用 ' + data.calls_left + ' 次');
+    if (currentUser) { currentUser.points = data.balance; renderAccount(); }
+    if (aiState.info) { aiState.info.calls_left = data.calls_left; }
+    aiStatus(data.changes.length ? 'AI 给出 ' + data.changes.length + ' 条建议，请逐条采纳或忽略。' : '');
+    if (data.truncated) aiLog('e', '文档较长，AI 只看了前面一部分。');
+  } catch (error) {
+    if (error.status === 404) { aiExpired(); return; }
+    aiLog('e', error.message);
+    if (error.status === 402) openPoints(error.message);
+    aiStatus('');
+  } finally { aiState.busy = false; controls(); if (aiState.id) aiRender(); }
+}
+$('checkStructure').addEventListener('click', aiOpen);
+$('aiCancel').addEventListener('click', () => aiClose());
+$('aiReset').addEventListener('click', () => { aiState.edits = new Map(); aiState.suggestions = new Map(); aiState.similar = null; aiSave(); aiStatus(''); aiRefresh(); });
+$('aiConfirm').addEventListener('click', () => {
+  if (!formReady()) { aiStatus('请先在上面填好题目、作者并选择排版规范。', true); return; }
+  submit({analysisId:aiState.id, overrides:aiOverrides()});
+});
+$('aiScanFoot').addEventListener('click', () => $('aiScan').click());
+$('aiScan').addEventListener('click', () => aiCall('/ai', {}, '请扫描整份结构，找出可能识别错的地方。'));
+$('aiSend').addEventListener('click', () => {
+  const text = $('aiMsg').value.trim();
+  if (!text) return;
+  $('aiMsg').value = '';
+  aiCall('/chat', {message:text}, text);
+});
+$('aiConfirmNo').addEventListener('click', () => $('aiConfirmDialog').close('no'));
+$('aiMsg').addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) $('aiSend').click(); });
+
+// ---- 售后群 ----
+$('supportBtn').onclick = () => $('supportDialog').showModal();
+$('supportCopy').onclick = async () => {
+  const num = $('supportNum').textContent, button = $('supportCopy');
+  try { await navigator.clipboard.writeText(num); button.textContent = '已复制'; }
+  catch { getSelection().selectAllChildren($('supportNum')); button.textContent = '请手动复制'; }
+  setTimeout(() => { button.textContent = '复制'; }, 2000);
+};

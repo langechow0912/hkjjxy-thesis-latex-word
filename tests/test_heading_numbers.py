@@ -38,7 +38,8 @@ class HeadingNumbers(unittest.TestCase):
             doc.save(source)
             tex, _ = docx2tex.convert(str(source), tmp, P.load('hkjjxy'), log=lambda *a: None)
             headings = [b['text'] for b in texparse.parse(tex)['blocks'] if b['kind'] == 'heading']
-            self.assertEqual(headings, ['1　绪论', '1.1　背景'])
+            # 绪论是不带编号的一级标题，下面的小节从 0.1 起
+            self.assertEqual(headings, ['绪论', '0.1　背景'])
 
     def test_latex_fourth_level_keeps_numbering_and_references_do_not_force_page(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,8 +61,15 @@ class HeadingNumbers(unittest.TestCase):
         stat, headings, _ = convert(['引言', '这里是正文。', '企业筹资风险相关理论基础',
                                     '0.1 企业筹资风险的内涵与分类', '0.1.1 企业筹资风险',
                                     '1 比亚迪风险识别', '1.1 概况'])
-        self.assertEqual(stat['numbering'], 'auto')
-        self.assertEqual(headings, ['1', '1.1', '1.1.1', '2', '2.1'])
+        self.assertEqual(stat['numbering'], 'user')
+        # 引言是不带编号的一级标题，不占章序号：后面的正式章仍从 1 起
+        self.assertEqual(headings, ['引言', '0.1', '0.1.1', '1', '1.1'])
+
+    def test_intro_is_unnumbered_level1_and_does_not_take_chapter_number(self):
+        for intro in ('引言', '绪论', '1 引言', '一、前言'):
+            stat, headings, _ = convert([intro, '这里是正文。', '1.1 背景', '2 理论', '2.1 概念'])
+            self.assertEqual(headings[0], intro.split()[-1].lstrip('一、'), intro)
+            self.assertEqual(stat['sec1'], 1, intro)   # 只有「理论」是带号的章
 
     def test_bracket_titles_follow_parent_level_and_keep_fourth_numbers(self):
         with tempfile.TemporaryDirectory() as tmp:

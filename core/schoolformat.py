@@ -42,8 +42,10 @@ def run(job, payload, cfg, meta):
         else:
             source.write_bytes(payload)
         job['stage'] = '识别论文结构'
+        # 用户在预览里改过的识别结果；没改过就不传，行为与以前完全一致
+        extra = {'overrides': meta['overrides']} if meta.get('overrides') else {}
         tex, stat = docx2tex.convert(str(source), str(work), cfg,
-                                     log=feedback)
+                                     log=feedback, **extra)
         struct = texparse.parse(tex)
         # 规则层能认定「这张表/这张图没有题名」时直接告诉用户，
         # 不要等到看 PDF 才发现少了个表题。

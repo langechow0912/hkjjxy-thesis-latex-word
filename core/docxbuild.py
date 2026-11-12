@@ -71,7 +71,8 @@ def para(doc, align=None, before=0, after=0, ls=1.5, indent_first=None,
 
 
 def heading(doc, text, level, spec):
-    p = para(doc, before=spec.get("before", 6), after=spec.get("after", 6))
+    align = WD_ALIGN_PARAGRAPH.JUSTIFY if spec.get("justify") else None
+    p = para(doc, align=align, before=spec.get("before", 6), after=spec.get("after", 6))
     pPr = p._p.get_or_add_pPr()
     ol = OxmlElement("w:outlineLvl")
     ol.set(qn("w:val"), str(level - 1))
@@ -482,7 +483,10 @@ def _write_blocks(doc, cfg, blocks, fig_dir):
         if kind == "break":
             page_break(doc)
         elif kind == "heading":
-            heading(doc, b["text"], b["level"], cfg["heading"]["levels"][b["level"]])
+            spec = cfg["heading"]["levels"][b["level"]]
+            if b.get("unnum"):      # 引言/绪论：一级标题但不带编号，格式单独规定
+                spec = {**spec, **cfg["heading"].get("intro", {})}
+            heading(doc, b["text"], b["level"], spec)
         elif kind == "unnum":
             heading(doc, b["text"], 1, cfg["heading"]["unnum"])
         elif kind == "subheading":

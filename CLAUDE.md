@@ -37,7 +37,7 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 
 **付款后结果只保留 24 小时**（`alipay.RESULT_TTL`）：`web/app.py` 的 `_live_job` 每次访问先检查并返回 410，后台线程 `_sweep` 每 10 分钟清理，`service_billing.get_quote` 读取时也会惰性过期。订单和金额记录不删。
 
-**登录**：上传、报价、创建支付订单都要登录（`Depends(current_user)`）。管理后台是另一套认证（Basic 或一次性令牌，只显示一次，库里存哈希）。
+**登录**：上传、报价、创建支付订单都要登录（`Depends(current_user)`）。支持邮箱验证码（默认）和老的用户名密码；发信在 `core/mailer.py`（SMTP）。**积分**（1 元 = 10 积分，`core/points.py`）可抵扣所有服务，积分支付落成一笔 `payment_product='points'` 的已付款订单，下游沿用同一套「已付款」判断；详见 `docs/points.md`。管理后台是另一套认证（Basic 或一次性令牌，只显示一次，库里存哈希）。
 
 **前端**是 `web/static/` 下无构建的 `index.html` + `app.js`，每个静态文件在 `web/app.py` 里有单独的路由，没有整体挂载，新增静态文件要加路由。
 
@@ -46,6 +46,8 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 **Tabword 服务**（`core/tabword.py` + `web/tabword_routes.py`）：26 个接口涵盖降 AI/检测/格式排版，详见 `docs/tabword-api.md`。付费任务默认关闭（`TABWORD_ENABLE_CALLS=false`），只开放免费目录 GET（`presets`、`detection_options`）。需独立 `TABWORD_API_KEY`，不复用大以论文 PAT。
 
 **DSH（DeepSeek Harness，`core/dsh/`）**：排版流程里的智能检查点框架，只产出建议，不改原稿，失败不影响排版。每个功能是 `core/dsh/skills/<name>/`（`SKILL.md` + `checkpoint.py` + `prompts/`），`DSHManager` 自动扫描；新增功能只加目录。必须放在 `core/` 下，镜像不 COPY `.claude/`。模型只收到 `outline.py` 压出的结构清单（正文只给字数）。登录用户调试页 `/dsh`（`web/dsh_routes.py`）可看目录、手动运行、对话，会真调 DeepSeek，受 `dsh.chat.per_user_daily` 限制。详见 `core/dsh/README.md`。
+
+**识别结果预览 + AI 助手**（`web/format_ai_routes.py`、`docx2tex.analyze` / `overrides`、`dsh-analyze` skill）：排版前让用户先看并改标题 / 图题 / 表题，AI 只给待确认的修改、按实际 token 扣积分。覆盖项用 items 下标 `idx` 定位（不是 `pno`），排版用服务端保存的那份字节；分析记录不进 `JOBS`。详见 `docs/format-preview.md`。
 
 **优惠券与推广员**（`core/affiliates.py`）：管理后台 `/admin/affiliates` 可创建全平台或按 `school:<id>` / `dayipaper:<id>` 限定的优惠券，支付下单时服务端校验并冻结优惠金额。推广员入口 `/affiliate`，新增时显示一次性访问令牌。推广员可申请提现，管理员审核后手动转账并上传凭证（保存在 `/data` 卷）。
 
