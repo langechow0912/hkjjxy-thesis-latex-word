@@ -394,6 +394,21 @@ class PayRoutes(PointsBase):
             billing.authorize('detect_text', values, None, body['order_id'])
         self.assertEqual(caught.exception.status, 409)
 
+    def test_uploaded_document_rewrite_is_priced_by_characters_and_payable_with_points(self):
+        import io
+        from docx import Document
+        user = make_user(500); self.as_user(user)
+        buf = io.BytesIO(); doc = Document(); doc.add_paragraph('文档改写按字数计费的测试正文。' * 30); doc.save(buf)
+        with patch.dict(os.environ, {'TABWORD_ENABLE_CALLS': 'true', 'TABWORD_API_KEY': 'offline-only'}):
+            quote = self.client.post('/api/tabword/billing/quote', data={'operation': 'document_async', 'params': '{}'},
+                                     files={'file': ('a.docx', buf.getvalue())})
+            self.assertEqual(quote.status_code, 200, quote.text)
+            body = quote.json()
+            self.assertGreater(body['characters'], 0)
+            res = self.client.post('/api/points/pay', json={'quote_id': body['quote_id']})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()['points'], body['amount_cents'] / 10)
+
     def test_not_your_quote_or_unknown_quote(self):
         owner, other = make_user(100), make_user(100)
         quote = self.new_quote(owner)

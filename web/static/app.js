@@ -722,6 +722,9 @@ async function twBuy(method = 'alipay') {
     if (file) body.append('file', file);
     const quote = await request('/api/tabword/billing/quote', {method:'POST', body});
     if (method === 'points') {
+      if (twPriceCents() == null && !confirm(`文档约 ${quote.characters} 字，需 ${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？`)) {
+        $('twMessage').textContent = '已取消，未扣积分。'; return;
+      }
       // The order only exists once the points are paid; until then nothing is watched.
       pending = {quote_id:quote.quote_id, order_id:'', checkout_url:'', amount_cents:quote.amount_cents, operation, values, key,
         fileName:file ? file.name : '', created:Date.now(), paid:false, done:false, file};
@@ -1163,8 +1166,10 @@ function pointsFor(cents) { return cents / 10; }
 function updatePointButtons() {
   const usable = !!currentUser && pointsInfo?.enabled !== false;
   const tw = $('twPayPoints'), pts = twPointsPrice();
-  tw.hidden = !usable || pts == null;
-  if (!tw.hidden) tw.textContent = `积分支付 ${fmtPoints(pts)} 积分`;
+  // 文件改写按文档字数计价，字数要报价后才知道：选了文件就先给入口，确认价格后再扣积分。
+  const byFile = $('twService').value === 'document_async' && !$('twFileWrap').hidden && $('twFile').files.length > 0;
+  tw.hidden = !usable || (pts == null && !byFile);
+  if (!tw.hidden) tw.textContent = pts == null ? '积分支付（按字数计价）' : `积分支付 ${fmtPoints(pts)} 积分`;
   const fmt = $('createPointsPayment'), exportPts = pointsInfo?.prices?.format_export;
   fmt.hidden = !usable || !paymentJob || !!paymentOrder || exportPts == null;
   if (!fmt.hidden) fmt.textContent = `积分支付 ${fmtPoints(exportPts)} 积分`;
