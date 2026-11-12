@@ -173,10 +173,14 @@ class AnalyzeRoutes(unittest.TestCase):
                 self.assertEqual(res.status_code, 404, value)
         run.assert_not_called()
 
-    def test_analysis_is_only_for_the_local_school(self):
+    def test_cloud_school_retags_headings_from_the_analysis(self):
         aid = self.upload().json()['analysis_id']
-        res = self.client.post('/api/format', data={'ruleId': 'dayipaper:x', 'title': 't', 'authorName': 'a', 'analysisId': aid})
-        self.assertEqual(res.status_code, 400)
+        with patch.object(web, '_run_cloud') as run, patch.object(web.dayipaper, 'has_token', return_value=True):
+            res = self.client.post('/api/format', data={'ruleId': 'dayipaper:x', 'title': 't', 'authorName': 'a',
+                                                        'analysisId': aid, 'overrides': '[]'})
+        self.assertEqual(res.status_code, 200)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[-1], [])      # 有预览结果：把标题级别写回 Word 再上传
 
     def test_format_still_needs_a_file_when_there_is_no_analysis(self):
         with patch.object(web, 'LOCAL_FORMAT', True):

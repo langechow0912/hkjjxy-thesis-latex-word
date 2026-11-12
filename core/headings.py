@@ -39,14 +39,10 @@ _CN_DIGITS = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
 FIXED_LEVEL = {"cn_chapter": 1, "cn_dun": 1, "arabic1": 1, "arabic2": 2, "arabic3": 3}
 # 容易和正文里的列表项混淆的种类，没有标题样式时要额外验证
 LIST_LIKE = ("cn_paren", "circled", "arabic_dot")
-# 模板里没有编号、但本来就是一级的固定标题，不参与重新编号
+# 引言、绪论、前言均按正常章节编号。
 _NO_PROMOTE = ("引言", "前言", "绪论")
-# 「引言/前言/绪论」是单独的一级标题类别：级别是 1（下面可以有 X.1、X.1.1），但前面不带章号，
-# 也不占章序号，下一个正式章仍从 1 起。原稿写了「1 绪论」的按原稿，当作第 1 章；
-# 「1 引言 / 一、前言」这类写法模板不认，仍按无编号处理。
 UNNUM_KIND = "unnum_h1"
-_UNNUM_TITLES = _NO_PROMOTE
-_UNNUM_ALWAYS = ("引言", "前言")
+_CHAPTER_TITLES = _NO_PROMOTE
 _PUNCT = re.compile(r"[，。；：！？,.;:!?、]")
 _KIND_LABEL = {"cn_chapter": "第X章", "cn_dun": "一、", "cn_paren": "（一）",
                "circled": "①", "arabic_dot": "1."}
@@ -174,7 +170,7 @@ def plan(items, body_start, skip, force=None):
     stack = []                  # 当前标题路径 [(level, kind)]
     counts = [0, 0, 0]
     pending = []                # 自上一个标题以来、没被判成标题的正文段下标
-    state = {"level1": False, "chapter": None}
+    state = {"level1": False, "chapter": None, "unnum": False}
     rejected = {}               # kind → 刚被当成列表项拒掉的编号
     clamped, weak, demoted = [], [], []
     stripped = {}               # kind → 剥掉原编号的个数
@@ -198,6 +194,7 @@ def plan(items, body_start, skip, force=None):
         if level == 1:
             state["level1"] = True
             state["chapter"] = src[0] if src else None
+            state["unnum"] = kind == UNNUM_KIND
         decisions[it["pno"]] = {"level": level, "text": text, "src": src,
                                 "orig": orig, "kind": kind}
         pending[:] = []
@@ -222,14 +219,22 @@ def plan(items, body_start, skip, force=None):
         """遇到 X.Y 却没见过第 X 章：把前面被当成正文的章题找回来。"""
         if state["chapter"] == chapter and state["level1"]:
             return
-        prev = _prev_index(items, idx)
-        if not state["level1"] and prev is not None and prev in pending:
-            cand = items[prev]
-            text = cand["text"]
-            if (is_heading_line(text) and not re.search(r"[，,：:！？!?]", text)
-                    and text not in _NO_PROMOTE and parse_numbering(text) is None):
-                commit(cand, 1, "arabic1", text, (chapter,), text)
-                return
+        # X.Y 前面（上一个标题之后）没写编号的短行就是第 X 章的章题；章题和 X.1 之间可以隔着引导段。
+        # 以前只在还没出现过一级标题、且章题紧挨着 X.1 时才这么认，
+        # 结果「引言」之后的第 1 章、第 3 章之后没写编号的第 4 章都被吞成了正文。
+        # 原稿写 0.1 的，是明确挂在引言下面的小节，不去找第 0 章
+        expected = chapter >= 1 and (not state["level1"] or state["unnum"]
+                    or (state["chapter"] is not None and chapter == state["chapter"] + 1))
+        if expected:
+            for j in reversed(pending):
+                if state["level1"] and j == pending[0]:
+                    # 上一个标题后面的第一行不当章题：那样上一节就是空的，更像是上一节里的短句
+                    break
+                text = items[j]["text"]
+                if (is_heading_line(text) and not re.search(r"[，,：:！？!?。；;]", text)
+                        and text not in _NO_PROMOTE and parse_numbering(text) is None):
+                    commit(items[j], 1, "arabic1", text, (chapter,), text)
+                    return
         for j in reversed(pending):
             m = RE_H1.match(items[j]["text"])
             if m and int(m.group(1)) == chapter and len(items[j]["text"]) <= 2 * MAX_HEADING_LEN:
@@ -288,9 +293,9 @@ def plan(items, body_start, skip, force=None):
                     level = flex_level(k, styled, num["num"][0])
         elif styled:
             kind, text, level = "style", t, styled
-        elif t in _UNNUM_TITLES and not state["level1"]:
-            # 没样式也没编号的「引言」「绪论」单独占一行：按名字认
-            kind, level = UNNUM_KIND, 1
+        elif t in _CHAPTER_TITLES and not state["level1"]:
+            # 没样式也没编号的「引言」「绪论」单独占一行：按名字认并编号
+            kind, level = "named_h1", 1
         elif it.get("bold") and 2 <= len(t) <= MAX_BOLD_LEN and not _PUNCT.search(t):
             _, nxt = _next_item(items, idx)
             if nxt is not None and ((nxt["kind"] == "p" and len(nxt["text"]) >= 40
@@ -307,12 +312,6 @@ def plan(items, body_start, skip, force=None):
             continue
 
         rejected.pop(kind, None)
-
-        # 引言/前言/绪论：一级标题，不带章号
-        if (not forced and level == 1 and kind != UNNUM_KIND
-                and text.strip() in _UNNUM_TITLES
-                and (num is None or text.strip() in _UNNUM_ALWAYS)):
-            kind, src = UNNUM_KIND, None
 
         # 缺上级：压缩层级，不编造标题
         clamp_from = None
