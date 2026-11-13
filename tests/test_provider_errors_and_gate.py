@@ -69,6 +69,33 @@ class ProviderBodyErrors(DetectBase):
             self.assertEqual(self.submit(values, paid['order_id']).status_code, 200)
 
 
+class FailureContext(DetectBase):
+    def test_failure_reason_names_the_platform_but_never_the_text(self):
+        user = make_user(500); self.as_user(user)
+        quote, paid, values = self.buy(user)
+        with provider_reply({'code': 500, 'message': '检测预设不存在: gzd_0510'}):
+            self.submit(values, paid['order_id'])
+        stored = billing.get_quote(quote['quote_id'])
+        self.assertIn('平台 p1', stored['error'])
+        self.assertIn('检测预设不存在', stored['error'])
+        self.assertNotIn('论文正文', stored['error'])
+
+    def test_timeout_reason_also_carries_the_context(self):
+        import time
+        user = make_user(500); self.as_user(user)
+        quote, paid, values = self.buy(user)
+        with patch.dict('os.environ', {'TABWORD_DEADLINE_SECONDS': '1'}), \
+             patch.object(tabword, 'call', side_effect=lambda *a, **k: time.sleep(1.5)):
+            self.submit(values, paid['order_id'])
+        self.assertIn('平台 p1', billing.get_quote(quote['quote_id'])['error'])
+
+    def test_context_formats_platform_preset_and_file_size(self):
+        from web.tabword_routes import _context
+        self.assertEqual(_context({'task_platform': '格子达_zh'}, ('a.docx', b'x' * 5120)), '（平台 格子达_zh，文件 5 KB）')
+        self.assertEqual(_context({'preset': 'zh_jc_1_0325', 'text': '不应出现的正文'}, None), '（预设 zh_jc_1_0325）')
+        self.assertEqual(_context({}, None), '')
+
+
 class ConcurrencyGate(DetectBase):
     def setUp(self):
         super().setUp()

@@ -216,7 +216,10 @@ def call(name, params=None, file=None, catalog_read=False):
     # 检测接口出错时仍返回 HTTP 200，错误只在响应体里：{"code": 500, "message": "..."}；成功是 code == 0。
     if name in ('detect_text','detect_file') and isinstance(result,dict) and result.get('code') not in (None,0):
         data=result.get('data') if isinstance(result.get('data'),dict) else {}
-        raise TabwordError('服务商返回错误：%s' % str(result.get('message') or data.get('error') or ('code %s' % result.get('code')))[:200])
+        code=result.get('code')
+        # 4xx 是请求本身的问题（文件为空等），不是平台故障；其余按服务商接口错误处理（502）。
+        raise TabwordError('服务商返回错误：%s' % str(result.get('message') or data.get('error') or ('code %s' % code))[:200],
+                           422 if isinstance(code,int) and 400<=code<500 else 502)
     # Balance responses may contain a masked API key; never return the actual secret.
     return json.loads(json.dumps(result,ensure_ascii=False).replace(key,'[REDACTED]'))
 

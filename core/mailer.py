@@ -46,20 +46,18 @@ def production():
     return _setting("THESIS_ENV").lower() == "production"
 
 
-def send_code(to, code, purpose="登录"):
-    """发一封验证码邮件。失败只抛 MailError（对用户的文案是通用的，细节只进日志）。"""
-    if not configured():
-        if production():
-            raise MailError("邮件服务未配置，暂时无法发送验证码", 503)
-        logger.warning("[DEV MAIL] %s 验证码 → %s : %s", purpose, to, code)
-        return
+def _message(to, subject, body):
     message = EmailMessage()
     sender = _setting("SMTP_FROM") or _setting("SMTP_USER")
     message["From"] = formataddr(("Paper Layout", sender))
     message["To"] = to
-    message["Subject"] = "Paper Layout %s验证码" % purpose
-    message.set_content(
-        "您的%s验证码是：%s\n\n验证码10分钟内有效，请勿告诉任何人。\n如果不是您本人操作，请忽略这封邮件。" % (purpose, code))
+    message["Subject"] = subject
+    message.set_content(body)
+    return message
+
+
+def deliver(message):
+    """用 SMTP 发出一封邮件。失败抛 MailError，底层错误文字放在它的 detail 属性里，供调用方报警。"""
     host = _setting("SMTP_HOST")
     security = _setting("SMTP_SECURITY", "ssl").lower()
     try:
@@ -76,4 +74,31 @@ def send_code(to, code, purpose="登录"):
             client.send_message(message)
     except (OSError, smtplib.SMTPException, ValueError) as exc:
         logger.warning("SMTP send failed: %s", exc)
+        error = MailError("邮件发送失败，请稍后再试")
+        error.detail = "%s: %s" % (type(exc).__name__, exc)
+        raise error from None
+
+
+def send_text(to, subject, body):
+    """发一封纯文本邮件（报警用）。没配 SMTP 时只写日志。"""
+    if not configured():
+        logger.warning("[DEV MAIL] → %s : %s\n%s", to, subject, body)
+        return
+    deliver(_message(to, subject, body))
+
+
+def send_code(to, code, purpose="登录"):
+    """发一封验证码邮件。失败只抛 MailError（对用户的文案是通用的，细节只进日志）。"""
+    if not configured():
+        if production():
+            raise MailError("邮件服务未配置，暂时无法发送验证码", 503)
+        logger.warning("[DEV MAIL] %s 验证码 → %s : %s", purpose, to, code)
+        return
+    message = _message(to, "Paper Layout %s验证码" % purpose,
+                       "您的%s验证码是：%s\n\n验证码10分钟内有效，请勿告诉任何人。\n如果不是您本人操作，请忽略这封邮件。" % (purpose, code))
+    try:
+        deliver(message)
+    except MailError as exc:
+        from core import alerts
+        alerts.alert(("smtp",), "验证码邮件发送失败", "收件人域名：%s\n错误：%s" % (to.rsplit("@", 1)[-1], getattr(exc, "detail", exc)))
         raise MailError("验证码邮件发送失败，请稍后再试") from None

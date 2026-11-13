@@ -15,6 +15,8 @@ accounts._db_path = lambda: Path(_ACCOUNT_DIR) / 'accounts.sqlite3'
 
 # 离线测试不去读官方目录：既不联网，也不依赖服务商当天的模型清单。
 os.environ.setdefault('TABWORD_VALIDATE_PRESETS', 'false')
+# 测试不发报警邮件；报警本身在 tests/test_alerts.py 里单独打开来测。
+os.environ.setdefault('ALERTS_ENABLED', 'false')
 
 TEST_USER = {'id': 1, 'username': 'tester'}
 

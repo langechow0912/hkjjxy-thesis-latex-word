@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -128,6 +129,9 @@ def connect():
     for name in ('result_json', 'result_sse', 'text_key', 'user_id'):
         if name not in columns:
             conn.execute(f'ALTER TABLE service_quotes ADD COLUMN {name} TEXT')
+    conn.execute("""CREATE TABLE IF NOT EXISTS platform_status (
+        platform TEXT PRIMARY KEY, disabled INTEGER NOT NULL, reason TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'manual', until REAL, updated_at REAL NOT NULL)""")
     for name in ('started_at', 'elapsed'):
         if name not in columns:
             conn.execute(f'ALTER TABLE service_quotes ADD COLUMN {name} REAL')
@@ -200,6 +204,8 @@ def official_presets():
         codes = {p.get('code') for p in data.get('presets', []) if isinstance(p, dict) and p.get('code')}
     except Exception as exc:                                    # noqa: BLE001
         logger.warning("preset catalog unavailable, not validating: %s", exc)
+        from core import alerts
+        alerts.alert(('catalog',), '读取服务商改写模型目录失败', '错误：%s\n\n暂时不校验用户选的改写模型。' % exc)
         codes = None
     _PRESETS.update(at=time.time(), codes=codes or None)
     return _PRESETS['codes']
@@ -216,6 +222,97 @@ def check_preset(operation, values):
         value = values.get(key)
         if value and value not in codes:
             raise tabword.TabwordError("所选改写模型已下线或不存在，请刷新页面后重新选择", 422)
+
+
+DETECT_OPERATIONS = frozenset({'detect_text', 'detect_file'})
+# 检测平台是否可用是动态的，以实际报错为准：
+#   · 服务商明确说「预设不存在」→ 马上暂停；其他接口类错误（5xx、超时、连接中断）→ 窗口内连续出错才暂停。
+#   · 暂停是短时间的，到点自动放行去试；一次成功就恢复；用户自己的问题（4xx，例如文件为空）不算平台的错。
+AUTO_PAUSE_SECONDS = _seconds('TABWORD_PAUSE_SECONDS', 180)
+FAIL_WINDOW = 10 * 60
+FAIL_THRESHOLD = 2
+_PLATFORM_FAILS, _PLATFORM_LOCK = {}, threading.Lock()
+
+
+def _platform_label(platform):
+    return re.sub(r'_(zh|en)$', '', str(platform), flags=re.I)
+
+
+def _busy_message(platform):
+    return "「%s」平台接口暂时不可用，请稍候重试，或选择其他检测平台" % _platform_label(platform)
+
+
+def unavailable_platforms():
+    """现在暂时不能用的检测平台 {平台: 原因}。自动暂停的到点自动放行；管理员手动停用的一直生效到手动恢复。"""
+    now = time.time()
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT platform, reason FROM platform_status WHERE disabled=1 AND (until IS NULL OR until>?)",
+                            (now,)).fetchall()
+    return {r['platform']: r['reason'] for r in rows}
+
+
+def set_platform(platform, disabled, reason='', source='manual', seconds=None):
+    platform = str(platform or '').strip()
+    if not platform or len(platform) > 40:
+        raise tabword.TabwordError("请提供检测平台名称", 422)
+    until = time.time() + seconds if disabled and seconds else None
+    with closing(connect()) as conn, conn:
+        conn.execute("INSERT OR REPLACE INTO platform_status VALUES (?,?,?,?,?,?)",
+                     (platform, int(bool(disabled)), reason[:200], source, until, time.time()))
+    if not disabled:
+        with _PLATFORM_LOCK:
+            _PLATFORM_FAILS.pop(platform, None)
+    return unavailable_platforms()
+
+
+def check_platform(operation, values):
+    """报价前拦下暂时不可用的检测平台，提醒用户稍后重试或换平台，不让他付款后才失败。"""
+    if operation not in DETECT_OPERATIONS or not isinstance(values, dict):
+        return
+    platform = str(values.get('task_platform') or '')
+    if platform in unavailable_platforms():
+        raise tabword.TabwordError(_busy_message(platform), 409)
+
+
+def _platform_of(operation, values):
+    if operation not in DETECT_OPERATIONS or not isinstance(values, dict):
+        return ''
+    return str(values.get('task_platform') or '')
+
+
+def note_platform_failure(operation, values, exc):
+    """检测失败后记账。接口类错误会提醒用户稍后重试；连续出错或「预设不存在」会暂停该平台一小会儿。返回给用户的提醒。"""
+    platform = _platform_of(operation, values)
+    message, status = str(exc), getattr(exc, 'status', 502)
+    certain = '预设不存在' in message
+    if not platform or not (certain or status >= 500):
+        return ''                                              # 用户自己的问题（文件为空等）不怪平台
+    now = time.time()
+    with _PLATFORM_LOCK:
+        recent = [t for t in _PLATFORM_FAILS.get(platform, []) if now - t < FAIL_WINDOW] + [now]
+        _PLATFORM_FAILS[platform] = recent
+    if certain or len(recent) >= FAIL_THRESHOLD:
+        set_platform(platform, True, '接口连续报错，暂时不可用', 'auto', AUTO_PAUSE_SECONDS)
+        logger.warning("detection platform %s paused for %d s after %d recent failures: %s",
+                       platform, AUTO_PAUSE_SECONDS, len(recent), message)
+        from core import alerts
+        alerts.alert(('platform', platform), '检测平台「%s」接口不可用，已暂停 %d 分钟' % (_platform_label(platform), AUTO_PAUSE_SECONDS // 60),
+                     '平台：%s\n最近 %d 分钟内出错 %d 次\n最后一次错误：%s\n\n暂停期间用户看到「接口暂时不可用，请稍候重试」；'
+                     '到点会自动放行，再出错会再暂停。服务商修好后无需操作。'
+                     % (platform, FAIL_WINDOW // 60, len(recent), message[:300]))
+        return _busy_message(platform) + "。已暂停该平台，稍后会自动恢复。"
+    return _busy_message(platform) + "。"
+
+
+def note_platform_success(operation, values):
+    """检测成功：清掉连续失败的记录；如果它之前被自动暂停，立刻恢复。"""
+    platform = _platform_of(operation, values)
+    if not platform:
+        return
+    with _PLATFORM_LOCK:
+        _PLATFORM_FAILS.pop(platform, None)
+    with closing(connect()) as conn, conn:
+        conn.execute("UPDATE platform_status SET disabled=0 WHERE platform=? AND source='auto'", (platform,))
 
 
 def text_key(values):
@@ -251,6 +348,7 @@ def quote(operation, values, file=None, user_id=None):
         raise tabword.TabwordError("此服务暂不支持购买", 403)
     tabword.prepare(operation, values, file)
     check_preset(operation, values)
+    check_platform(operation, values)
     p = prices()
     count = 0
     discounted = False
@@ -348,6 +446,11 @@ def fail_stuck(now=None):
             refunded = None
         logger.warning("stuck tabword order %s (%s) failed by sweeper; refunded=%s", row['id'], row['operation'], refunded)
         fixed.append(row['id'])
+    if fixed:
+        from core import alerts
+        alerts.alert(('stuck',), '%d 笔订单处理中断，已标记失败' % len(fixed),
+                     '这些订单长时间停在「处理中」（页面关闭、网络断开或服务重启）：\n%s\n\n用积分支付的已自动退还。'
+                     % '\n'.join(fixed))
     return fixed
 
 
@@ -416,6 +519,11 @@ def record(identity, operation, result=None, error=None, stream=None, reason='')
                 logger.exception("points refund failed for %s", identity)
         note = FAILED_REFUNDED if refunded is not None else FAILED_MANUAL
         reason = '%s（%s）' % (reason, '积分已退' if refunded is not None else '未用积分或已退款，需人工核查')
+        from core import alerts
+        alerts.alert(('provider', operation), '%s失败' % _TITLES.get(operation, operation),
+                     '订单：%s\n原因：%s\n%s' % (identity, reason,
+                                         '已自动退还积分。' if refunded is not None
+                                         else '没有用积分支付（或已退过），如是支付宝付款请人工退款。'))
     with closing(connect()) as conn, conn:
         conn.execute("UPDATE service_quotes SET state=?,task_id=?,task_operation=?,error=?,result_json=?,result_sse=? WHERE id=?",
                      ('failed' if error else 'complete' if stream is not None or (result is not None and operation not in TASKS) else 'submitted', str(task_id) if task_id else None,

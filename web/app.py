@@ -215,8 +215,24 @@ class AffiliateAdminAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class ErrorAlertMiddleware(BaseHTTPMiddleware):
+    """接口里任何没被处理的异常（用户看到 500）都第一时间报警，然后照常抛出。"""
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            from core import alerts
+            # 路径里的任务号、订单号合并成 :id，同一个接口出错只算一类，避免刷屏
+            path = re.sub(r"[0-9A-Za-z-]{16,}", ":id", request.url.path)
+            alerts.alert_exception(("server_error", path, type(exc).__name__),
+                                   "接口异常 %s %s" % (request.method, path), exc,
+                                   "请求：%s %s" % (request.method, path))
+            raise
+
+
 app.add_middleware(BasicAuthMiddleware)
 app.add_middleware(AffiliateAdminAuthMiddleware)
+app.add_middleware(ErrorAlertMiddleware)
 
 
 @app.get("/api/health")
@@ -291,8 +307,10 @@ def _sweep(stop):
     while not stop.wait(SWEEP_INTERVAL):
         try:
             _purge_expired()
-        except Exception:                       # 清理失败不能拖垮服务，下一轮再试
+        except Exception as exc:                # 清理失败不能拖垮服务，下一轮再试
             traceback.print_exc()
+            from core import alerts
+            alerts.alert_exception(("sweeper",), "后台定时清理出错", exc)
 
 
 SWEEP_INTERVAL = 600
@@ -495,6 +513,25 @@ def update_service_prices(body: dict):
     from core import service_billing, tabword
     try:
         return service_billing.save_prices(body)
+    except tabword.TabwordError as exc:
+        raise HTTPException(exc.status, str(exc)) from None
+
+
+@app.get('/api/admin/detection-platforms')
+def detection_platforms():
+    _require_affiliate_admin()
+    from core import service_billing
+    return {'unavailable': service_billing.unavailable_platforms()}
+
+
+@app.put('/api/admin/detection-platforms')
+def update_detection_platform(body: dict):
+    """body: {"platform": "格子达_zh", "disabled": false, "reason": "可选"}；服务商修好后用它恢复平台。"""
+    _require_affiliate_admin()
+    from core import service_billing, tabword
+    try:
+        return {'unavailable': service_billing.set_platform(body.get('platform'), bool(body.get('disabled')),
+                                                           str(body.get('reason') or '管理员手动停用'))}
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
 

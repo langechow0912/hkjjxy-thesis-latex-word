@@ -49,7 +49,7 @@ class PresetCheck(PointsBase):
     def test_detection_has_no_preset_to_check(self):
         with patch.object(tabword, 'read_catalog', return_value=OFFICIAL) as catalog:
             res = self.client.post('/api/tabword/billing/quote', data={
-                'operation': 'detect_text', 'params': json.dumps({'text': '正文' * 40, 'task_platform': '格子达_zh'}, ensure_ascii=False)})
+                'operation': 'detect_text', 'params': json.dumps({'text': '正文' * 40, 'task_platform': '知网_zh'}, ensure_ascii=False)})
         self.assertEqual(res.status_code, 200)
         catalog.assert_not_called()
 

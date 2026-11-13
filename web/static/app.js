@@ -494,6 +494,39 @@ function twRenderModeCards() {
     } else if (!active && check) check.remove();
   }
 }
+// 失效的检测平台：按钮变灰不可选并标注，上方给出提示；当前选的失效了就换到第一个可用的。
+function twApplyPlatformStatus() {
+  const down = twConfig?.unavailable_platforms || {};
+  const buttons = [...document.querySelectorAll('[data-platform]')];
+  for (const button of buttons) {
+    const code = button.dataset.platform, broken = code in down;
+    if (!button.dataset.label) button.dataset.label = button.textContent;
+    button.disabled = broken; button.classList.toggle('unavailable', broken);
+    button.textContent = broken ? `${button.dataset.label}（暂时不可用）` : button.dataset.label;
+    button.title = broken ? `${down[code]}。请稍候重试，或选择其他平台` : '';
+  }
+  if (twPlatform in down) {
+    const next = buttons.find(button => !button.disabled);
+    if (next) {
+      twPlatform = next.dataset.platform; $('twPlatform').value = twPlatform;
+      for (const item of buttons) { const active = item === next; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }
+    }
+  }
+  let notice = $('twPlatformNotice');
+  if (!notice) {
+    notice = document.createElement('p'); notice.id = 'twPlatformNotice'; notice.className = 'msg error'; notice.setAttribute('role', 'status');
+    $('twPlatforms').insertAdjacentElement('afterend', notice);
+  }
+  const names = buttons.filter(button => button.disabled).map(button => button.dataset.label);
+  notice.textContent = names.length ? `${names.join('、')}平台接口暂时不可用，请稍候重试，或选择其他检测平台。恢复后这里会自动更新。` : '';
+  notice.hidden = !names.length;
+}
+async function twReloadConfig() {
+  try { const response = await fetch('/api/tabword'); if (response.ok) { twConfig = await response.json(); twApplyPlatformStatus(); } } catch {}
+}
+const twPlatformDown = error => /暂时不可用|暂时失效|暂停使用/.test(error?.message || '');
+// 平台状态是动态的：有平台暂停时每分钟看一次，恢复了页面自己更新，用户不用刷新。
+setInterval(() => { if (Object.keys(twConfig?.unavailable_platforms || {}).length) twReloadConfig(); }, 60000);
 function twRenderPlatformLanguage() {
   const suffix = twLanguage === 'en' ? '_en' : '_zh';
   const fallback = twLanguage === 'en' ? '知网_en' : '知网_zh';
@@ -508,6 +541,7 @@ function twRenderPlatformLanguage() {
     const active = button.dataset.platform === twPlatform;
     button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
   }
+  twApplyPlatformStatus();
 }
 function twSetMode(mode) {
   twMode = twModeDefaults[mode] ? mode : 'reduce_ai';
@@ -639,6 +673,9 @@ async function twRequest(operation, values, submit, includeFile = true, paidOrde
   try {
     const response = await fetch('/api/tabword/' + operation, {method:'POST', body});
     await twConsume(response);
+  } catch (error) {
+    if (twPlatformDown(error)) twReloadConfig();
+    throw error;
   } finally {
     clearInterval(timer);
     // 异步任务提交后请求虽然结束了，但服务商还在处理：继续显示进度条，直到查询到结果。
@@ -801,7 +838,7 @@ async function twBuy(method = 'alipay') {
     twOrders = [...twOrders.filter(twOpen), order]; twSaveOrders();
     twSendToCheckout(order, win);
     twWatchPayment();
-  } catch (error) { closePayWindow(win); $('twMessage').textContent = error.message; }
+  } catch (error) { closePayWindow(win); $('twMessage').textContent = error.message; if (twPlatformDown(error)) twReloadConfig(); }
   finally {
     twBusy = false; $('twPrepare').disabled = false;
     // Inside finally: the `return` in the points branch above would skip anything placed after it.
@@ -974,6 +1011,7 @@ async function twRefreshPlatforms() {
     for (const item of wrap.querySelectorAll('button')) item.addEventListener('click', () => { twPlatform=item.dataset.platform; $('twPlatform').value=twPlatform; for (const peer of wrap.querySelectorAll('button')) { const active=peer===item; peer.classList.toggle('active',active); peer.setAttribute('aria-pressed',String(active)); } });
     twPlatform = unique[0].code; $('twPlatform').value=twPlatform;
     for (const item of wrap.querySelectorAll('button')) { const active=item.dataset.platform===twPlatform; item.classList.toggle('active',active); item.setAttribute('aria-pressed',String(active)); }
+    twApplyPlatformStatus();
     $('twMessage').textContent = `已同步 ${unique.length} 个官方检测平台。`;
   } catch (error) { $('twMessage').textContent = error.message; }
   finally { button.disabled = false; }
@@ -1052,7 +1090,7 @@ $('twCompare').addEventListener('click', () => {
 });
 $('twMarks').addEventListener('click', () => twShowDiff($('twMarks').getAttribute('aria-pressed') !== 'true'));
 fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); return response.json(); }).then(data => {
-  twConfig = data; twChange();
+  twConfig = data; twChange(); twApplyPlatformStatus();
   for (const mode of ['reduce_ai', 'reduce_duplicate', 'both']) twSyncModels(mode, true);
   const p = data.prices;
   $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。1 元 = 10 积分。文本改写：同一段原文首次改写后，24 小时内再改写 3 次半价。`;

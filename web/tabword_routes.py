@@ -10,7 +10,8 @@ router = APIRouter(prefix='/api/tabword')
 
 @router.get('')
 def status():
-    return {**tabword.catalog(), 'prices': billing.prices(), 'deadlines': billing.deadlines(), 'payment_required': True}
+    return {**tabword.catalog(), 'prices': billing.prices(), 'deadlines': billing.deadlines(),
+            'unavailable_platforms': billing.unavailable_platforms(), 'payment_required': True}
 
 
 @router.post('/billing/quote')
@@ -100,6 +101,19 @@ def read_catalog(operation: str, mode: str | None = None, language: str | None =
         raise HTTPException(status_code=exc.status,detail=str(exc)) from None
 
 
+def _context(values, content):
+    """失败时一起记下选的平台 / 预设和文件大小，事后才能看出是哪一类请求出的问题（不含正文）。"""
+    parts = []
+    if isinstance(values, dict):
+        if values.get('task_platform'):
+            parts.append('平台 %s' % str(values['task_platform'])[:30])
+        if values.get('preset'):
+            parts.append('预设 %s' % str(values['preset'])[:40])
+    if content:
+        parts.append('文件 %d KB' % (len(content[1]) // 1024))
+    return '（%s）' % '，'.join(parts) if parts else ''
+
+
 @router.post('/{operation}')
 def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False),
              file: UploadFile | None = File(None), payment_order: str = Form('')):
@@ -135,14 +149,15 @@ def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False
                 raise
         else:
             identity = None
+        ctx = _context(values, content)
         if tabword.OPERATIONS[operation].stream:
             try:
                 stream = tabword.stream_call(operation,values,content)
             except tabword.TabwordError as exc:
-                note = billing.record(identity, operation, error=True, reason=str(exc)) if identity else None
+                note = billing.record(identity, operation, error=True, reason=str(exc) + ctx) if identity else None
                 raise tabword.TabwordError('%s %s' % (exc, note) if note else str(exc), exc.status) from None
             except Exception as exc:
-                note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc)) if identity else None
+                note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc) + ctx) if identity else None
                 raise tabword.TabwordError(note or '服务商连接失败', 502) from None
             billing.record(identity, operation)
             handed, slot = slot, None      # 流结束（或断开）时由 capture_stream 归还名额
@@ -153,15 +168,17 @@ def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False
         handed, slot = slot, None
         release = (lambda: billing.GATE.release(handed)) if handed else None
         try:
-            result = billing.call_with_deadline(lambda: tabword.call(operation,values,content), release, operation)
+            result = billing.call_with_deadline(lambda: tabword.call(operation,values,content), release, operation + ctx)
         except tabword.TabwordError as exc:
-            note = billing.record(identity, operation, error=True, reason=str(exc)) if identity else None
-            raise tabword.TabwordError('%s %s' % (exc, note) if note else str(exc), exc.status) from None
+            note = billing.record(identity, operation, error=True, reason=str(exc) + ctx) if identity else None
+            advice = billing.note_platform_failure(operation, values, exc)
+            raise tabword.TabwordError(' '.join(x for x in (str(exc), note, advice) if x), exc.status) from None
         except Exception as exc:
-            note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc)) if identity else None
+            note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc) + ctx) if identity else None
             raise tabword.TabwordError(note or '服务商连接失败', 502) from None
         if identity:
             billing.record(identity, operation, result)
+            billing.note_platform_success(operation, values)
         return result
     except tabword.TabwordError as exc:
         raise HTTPException(status_code=exc.status,detail=str(exc)) from None
