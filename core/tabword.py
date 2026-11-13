@@ -213,6 +213,10 @@ def call(name, params=None, file=None, catalog_read=False):
     try: result=json.loads(payload)
     except (ValueError,UnicodeDecodeError): raise TabwordError('服务商未返回有效 JSON') from None
     if isinstance(result,dict) and result.get('success') is False: raise TabwordError('服务商报告处理失败，请检查任务状态')
+    # 检测接口出错时仍返回 HTTP 200，错误只在响应体里：{"code": 500, "message": "..."}；成功是 code == 0。
+    if name in ('detect_text','detect_file') and isinstance(result,dict) and result.get('code') not in (None,0):
+        data=result.get('data') if isinstance(result.get('data'),dict) else {}
+        raise TabwordError('服务商返回错误：%s' % str(result.get('message') or data.get('error') or ('code %s' % result.get('code')))[:200])
     # Balance responses may contain a masked API key; never return the actual secret.
     return json.loads(json.dumps(result,ensure_ascii=False).replace(key,'[REDACTED]'))
 

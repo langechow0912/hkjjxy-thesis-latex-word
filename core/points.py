@@ -621,3 +621,18 @@ def _paid_order(job_id):
         row = conn.execute("""SELECT out_trade_no FROM payment_orders WHERE job_id=? AND status='TRADE_SUCCESS'
                               ORDER BY paid_at DESC LIMIT 1""", (job_id,)).fetchone()
     return alipay.get_order(row["out_trade_no"]) if row else None
+
+
+def refund_spend(job_id, reason="服务处理失败，积分已全额退还"):
+    """把 job_id 的积分支付原额退回。没用积分付、或已经退过的，返回 None；成功返回退回的积分数。"""
+    def run(conn):
+        spent = conn.execute("SELECT user_id, delta FROM points_ledger WHERE kind='spend' AND ref=?",
+                             (job_id,)).fetchone()
+        if not spent:
+            return None
+        try:
+            _apply(conn, spent["user_id"], -spent["delta"], "refund", job_id, reason)
+        except _Duplicate:
+            return None
+        return _show(-spent["delta"])
+    return _transaction(run)

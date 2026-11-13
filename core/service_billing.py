@@ -3,9 +3,12 @@ from contextlib import closing
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import uuid
 import zipfile
 from xml.etree import ElementTree
@@ -16,6 +19,101 @@ DEFAULTS = {"format_export_cents": 2999, "detect_text_cents": 99, "detect_file_c
 SUBMISSIONS = frozenset({"detect_text", "detect_file", "paraphrase", "paraphrase_stream",
                          "paraphrase_async", "document_paraphrase", "document_async"})
 TASKS = {"document_async": "document_task", "paraphrase_async": "paraphrase_task"}
+# 文本改写：同一段原文首次全价，之后再改写享受 REWRITE_DISCOUNTS 次半价（不论首次成败）。
+TEXT_REWRITES = frozenset({"paraphrase", "paraphrase_stream", "paraphrase_async"})
+REWRITE_DISCOUNTS = 3
+REWRITE_DISCOUNT_WINDOW = 24 * 3600
+logger = logging.getLogger(__name__)
+
+
+class Gate:
+    """同时提交给服务商的任务数上限（服务商的并发上限是 10）。
+
+    满了就立刻拒绝，调用方在订单还是 ready 时返回「请稍后重试」，不会消耗付款。
+    每个名额带租期：页面中途关掉、生成器没被正常关闭时，名额会在租期后自动归还。"""
+
+    def __init__(self, limit, lease=20 * 60):
+        self.limit, self.lease = limit, lease
+        self._held, self._lock = {}, threading.Lock()
+
+    def acquire(self):
+        now = time.time()
+        with self._lock:
+            for token in [t for t, at in self._held.items() if now - at > self.lease]:
+                del self._held[token]
+            if len(self._held) >= self.limit:
+                return None
+            token = uuid.uuid4().hex
+            self._held[token] = now
+            return token
+
+    def release(self, token):
+        with self._lock:
+            self._held.pop(token, None)
+
+    def busy(self):
+        with self._lock:
+            return len(self._held)
+
+
+def _gate_limit():
+    value = os.environ.get('TABWORD_MAX_CONCURRENT', '').strip()
+    return int(value) if value.isdigit() and int(value) > 0 else 10
+
+
+GATE = Gate(_gate_limit())
+
+
+def _seconds(name, default):
+    value = os.environ.get(name, '').strip()
+    return int(value) if value.isdigit() and int(value) > 0 else default
+
+
+def deadline():
+    """一次非流式调用（检测等）最多等服务商多久。"""
+    return _seconds('TABWORD_DEADLINE_SECONDS', 180)
+
+
+def stream_deadline():
+    """一次流式改写从开始到结束最多多久。"""
+    return _seconds('TABWORD_STREAM_DEADLINE_SECONDS', 300)
+
+
+def deadlines():
+    """各服务的最长等待秒数，页面据此显示倒计时。"""
+    normal, streaming = deadline(), stream_deadline()
+    return {'detect_text': normal, 'detect_file': normal, 'document_async': normal, 'paraphrase': normal,
+            'paraphrase_async': normal, 'paraphrase_stream': streaming}
+
+
+_WORKERS = ThreadPoolExecutor(max_workers=32, thread_name_prefix='tabword')
+
+
+def call_with_deadline(fn, on_finished=None, label=''):
+    """在工作线程里调用服务商，最多等 deadline() 秒。
+
+    超时就放弃等待并抛 TabwordError(504)；工作线程不能被强杀，会跑到它自己的超时为止。
+    on_finished 在工作线程真正结束时才调用（用来归还并发名额：服务商那边还占着）。
+    迟到的结果不会写进订单（用户已经被告知失败并退了积分），只记一条日志方便排查。"""
+    limit = deadline()
+    started = time.time()
+    future = _WORKERS.submit(fn)
+    if on_finished:
+        future.add_done_callback(lambda _f: on_finished())
+    try:
+        return future.result(timeout=limit)
+    except FutureTimeout:
+        def late(f):
+            try:
+                f.result()
+                logger.warning("tabword %s: result arrived %d s after the %d s deadline (discarded)",
+                               label, time.time() - started, limit)
+            except BaseException as exc:                       # noqa: BLE001
+                logger.warning("tabword %s: failed %d s after the deadline: %s: %s",
+                               label, time.time() - started - limit, type(exc).__name__, exc)
+        future.add_done_callback(late)
+        raise tabword.TabwordError("服务商在 %d 秒内没有返回结果，已放弃等待" % limit, 504) from None
+BUSY_MESSAGE = "当前处理的人数较多，请 30 秒后重试。订单和积分都没有动，不会重复扣费"
 
 
 def connect():
@@ -27,9 +125,15 @@ def connect():
         amount_cents INTEGER NOT NULL, characters INTEGER NOT NULL, created_at INTEGER NOT NULL,
         state TEXT NOT NULL DEFAULT 'ready', task_id TEXT, task_operation TEXT, error TEXT)""")
     columns = {r['name'] for r in conn.execute('PRAGMA table_info(service_quotes)')}
-    for name in ('result_json', 'result_sse'):
+    for name in ('result_json', 'result_sse', 'text_key', 'user_id'):
         if name not in columns:
             conn.execute(f'ALTER TABLE service_quotes ADD COLUMN {name} TEXT')
+    for name in ('started_at', 'elapsed'):
+        if name not in columns:
+            conn.execute(f'ALTER TABLE service_quotes ADD COLUMN {name} REAL')
+    if 'discounted' not in columns:
+        conn.execute('ALTER TABLE service_quotes ADD COLUMN discounted INTEGER NOT NULL DEFAULT 0')
+    conn.execute('CREATE INDEX IF NOT EXISTS service_quotes_by_text ON service_quotes(user_id, text_key)')
     conn.commit()
     return conn
 
@@ -82,25 +186,95 @@ def character_count(values, file):
     return count
 
 
-def quote(operation, values, file=None):
+_PRESETS = {'at': 0, 'codes': None}
+
+
+def official_presets():
+    """官方现有的改写模型代码（缓存 10 分钟）。读不到（服务商故障、未配置）返回 None，调用方就不拦。"""
+    if os.environ.get('TABWORD_VALIDATE_PRESETS', 'true').lower() == 'false':
+        return None
+    if time.time() - _PRESETS['at'] < 600:
+        return _PRESETS['codes']
+    try:
+        data = tabword.read_catalog('presets', {})
+        codes = {p.get('code') for p in data.get('presets', []) if isinstance(p, dict) and p.get('code')}
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning("preset catalog unavailable, not validating: %s", exc)
+        codes = None
+    _PRESETS.update(at=time.time(), codes=codes or None)
+    return _PRESETS['codes']
+
+
+def check_preset(operation, values):
+    """报价前拦下已下线的改写模型：不然用户付了款，服务商才回「预设不存在」。"""
+    if operation not in TEXT_REWRITES | {'document_async', 'document_paraphrase'} or not isinstance(values, dict):
+        return
+    codes = official_presets()
+    if not codes:
+        return
+    for key in ('preset', 'preset_zh', 'preset_en'):
+        value = values.get(key)
+        if value and value not in codes:
+            raise tabword.TabwordError("所选改写模型已下线或不存在，请刷新页面后重新选择", 422)
+
+
+def text_key(values):
+    """文本改写的「同一段原文」：只看文字本身（去掉空白），和预设无关，换个预设重改也算。"""
+    text = ''.join(str(values.get('text', '')).split()) if isinstance(values, dict) else ''
+    return hashlib.sha256(text.encode()).hexdigest() if text else None
+
+
+def _paid_quotes(conn, user_id, key):
+    """该用户这段原文已付款的文本改写报价（最早在前）。"""
+    since = int(time.time()) - REWRITE_DISCOUNT_WINDOW
+    ids = [r['id'] for r in conn.execute("""SELECT id FROM service_quotes WHERE user_id=? AND text_key=?
+                                            AND created_at>=? ORDER BY created_at""", (str(user_id), key, since))]
+    return [i for i in ids if alipay.job_paid(i)]
+
+
+def rewrite_offer(user_id, values):
+    """这段原文再改写还剩几次半价。返回 {"paid": 已付款次数, "discounts_left": 剩余半价次数}。"""
+    key = text_key(values)
+    if not user_id or not key:
+        return {"paid": 0, "discounts_left": 0}
+    with closing(connect()) as conn:
+        paid = _paid_quotes(conn, user_id, key)
+        marks = ','.join('?' * len(paid)) or 'NULL'
+        used = conn.execute(f"SELECT COUNT(*) FROM service_quotes WHERE id IN ({marks}) AND discounted=1",
+                            paid).fetchone()[0]
+    left = REWRITE_DISCOUNTS - used if paid else 0
+    return {"paid": len(paid), "discounts_left": max(0, left)}
+
+
+def quote(operation, values, file=None, user_id=None):
     if operation not in SUBMISSIONS:
         raise tabword.TabwordError("此服务暂不支持购买", 403)
     tabword.prepare(operation, values, file)
+    check_preset(operation, values)
     p = prices()
     count = 0
+    discounted = False
+    key = text_key(values) if operation in TEXT_REWRITES and not file else None
     if operation in ('detect_text', 'detect_file'):
         amount = p[operation + '_cents']
     else:
         count = character_count(values, file)
         amount = max(1, (count * p['rewrite_per_1000_cents'] + 999) // 1000)
+        if key and user_id and rewrite_offer(user_id, values)["discounts_left"] > 0:
+            amount, discounted = max(1, (amount + 1) // 2), True
     if amount > 10000000:
         raise tabword.TabwordError("订单金额超过限额，请拆分文档", 422)
     identity = 'TW-' + uuid.uuid4().hex
     with closing(connect()) as conn, conn:
         conn.execute("""INSERT INTO service_quotes
-            (id,operation,digest,amount_cents,characters,created_at) VALUES (?,?,?,?,?,?)""",
-                     (identity, operation, digest(operation, values, file), amount, count, int(time.time())))
-    return {"quote_id": identity, "amount_cents": amount, "characters": count, "prices": p}
+            (id,operation,digest,amount_cents,characters,created_at,text_key,user_id,discounted) VALUES (?,?,?,?,?,?,?,?,?)""",
+                     (identity, operation, digest(operation, values, file), amount, count, int(time.time()),
+                      key, str(user_id) if user_id else None, int(discounted)))
+    offer = rewrite_offer(user_id, values) if key else {"paid": 0, "discounts_left": 0}
+    return {"quote_id": identity, "amount_cents": amount, "characters": count, "prices": p,
+            "discounted": discounted, "discounts_left": offer["discounts_left"] - (1 if discounted else 0),
+            "paid_before": offer["paid"],
+            "rewrite_discounts": REWRITE_DISCOUNTS if key else 0}
 
 
 EXPIRED = "付款已超过 24 小时，结果已按规定删除"
@@ -136,6 +310,45 @@ def purge_expired():
     for identity in ids:
         if identity in live:
             _expire(identity)
+    fail_stuck()
+
+
+STUCK_AFTER = 10 * 60          # 正常最长约 5 分钟；超过 10 分钟还在「处理中」就是中断了
+LEGACY_STUCK_AFTER = 60 * 60    # 旧订单没有开始时间，用付款时间估算，宽松一些，免得误伤
+STUCK_STREAMS = ('paraphrase_stream', 'paraphrase')
+
+
+def fail_stuck(now=None):
+    """把中断、卡死的订单标记失败并退积分：页面关掉、服务重启、连接断开都会留下这种订单。
+
+    处理中的异步文档任务（submitted）不算卡住，它们本来就要等服务商。返回处理的订单号。"""
+    now = now or time.time()
+    with closing(connect()) as conn:
+        rows = conn.execute("""SELECT id, operation, state, started_at FROM service_quotes
+            WHERE state='processing' OR (state='submitted' AND operation IN (%s))"""
+                            % ','.join('?' * len(STUCK_STREAMS)), STUCK_STREAMS).fetchall()
+    fixed = []
+    for row in rows:
+        began, limit = row['started_at'], STUCK_AFTER
+        if began is None:
+            began, limit = alipay.paid_at(row['id']), LEGACY_STUCK_AFTER
+        if began is None or now - float(began) < limit:
+            continue
+        reason = '处理中超过 %d 分钟没有结果，判定为中断（页面关闭、网络断开或服务重启）' % (limit // 60)
+        with closing(connect()) as conn, conn:
+            claimed = conn.execute("UPDATE service_quotes SET state='failed', error=? WHERE id=? AND state=?",
+                                   (reason, row['id'], row['state'])).rowcount
+        if claimed != 1:
+            continue                                # 刚好在这一刻完成了，别动它
+        from core import points
+        try:
+            refunded = points.refund_spend(row['id'], "%s，积分已全额退还" % _TITLES.get(row['operation'], '服务处理'))
+        except Exception:                           # noqa: BLE001
+            logger.exception("refund failed for stuck order %s", row['id'])
+            refunded = None
+        logger.warning("stuck tabword order %s (%s) failed by sweeper; refunded=%s", row['id'], row['operation'], refunded)
+        fixed.append(row['id'])
+    return fixed
 
 
 def create_payment(identity, referral=None, campaign='', resume_return=False):
@@ -170,32 +383,89 @@ def authorize(operation, values, file, order_id):
     if q['operation'] != operation or q['digest'] != digest(operation, values, file):
         raise tabword.TabwordError("内容、文件或处理选项已变化，请重新计价付款", 403)
     with closing(connect()) as conn, conn:
-        changed = conn.execute("UPDATE service_quotes SET state='processing' WHERE id=? AND state='ready'", (q['id'],)).rowcount
+        changed = conn.execute("UPDATE service_quotes SET state='processing', started_at=? WHERE id=? AND state='ready'",
+                             (time.time(), q['id'])).rowcount
     if changed != 1:
         raise tabword.TabwordError("订单已经提交处理，不能重复调用；如失败请联系管理员核查", 409)
     return q['id']
 
 
-def record(identity, operation, result=None, error=None, stream=None):
-    if operation in ('document_task', 'paraphrase_task'):
-        return
+FAILED_REFUNDED = "处理失败，积分已全额退还，可以重新提交"
+FAILED_MANUAL = "处理失败；如已付款请保留订单号联系客服退款，可以重新提交"
+
+
+def record(identity, operation, result=None, error=None, stream=None, reason=''):
+    """记下处理结果。error 为真时标记失败、写入原因，并把积分原额退回。返回失败提示（成功返回 None）。"""
+    if not identity or operation in ('document_task', 'paraphrase_task'):
+        return None
     payload = result if isinstance(result, dict) else {}
     for key in ('data', 'result'):
         if isinstance(payload.get(key), dict):
             payload = payload[key]
     task_id = payload.get('task_id') or payload.get('jobId')
+    note = None
+    if error:
+        reason = str(reason or (error if isinstance(error, str) else '') or '服务商未返回完整结果')[:300]
+        logger.warning("tabword %s failed for %s: %s", operation, identity, reason)
+        from core import points
+        refunded = None
+        if identity:
+            try:
+                refunded = points.refund_spend(identity, "%s失败，积分已全额退还" % _TITLES.get(operation, '服务处理'))
+            except Exception:                                    # noqa: BLE001  退款失败不能吞掉原错误
+                logger.exception("points refund failed for %s", identity)
+        note = FAILED_REFUNDED if refunded is not None else FAILED_MANUAL
+        reason = '%s（%s）' % (reason, '积分已退' if refunded is not None else '未用积分或已退款，需人工核查')
     with closing(connect()) as conn, conn:
         conn.execute("UPDATE service_quotes SET state=?,task_id=?,task_operation=?,error=?,result_json=?,result_sse=? WHERE id=?",
                      ('failed' if error else 'complete' if stream is not None or (result is not None and operation not in TASKS) else 'submitted', str(task_id) if task_id else None,
                       TASKS.get(operation) if task_id else None,
-                      '提交异常，需人工核查，禁止自动重试' if error else None,
+                      reason[:400] if error else None,
                       json.dumps(result, ensure_ascii=False) if result is not None and not error else None,
                       stream if not error else None, identity))
+        conn.execute("UPDATE service_quotes SET elapsed=? - started_at WHERE id=? AND started_at IS NOT NULL",
+                     (time.time(), identity))
+    return note
 
 
-def capture_stream(identity, operation, source):
+_TITLES = {'paraphrase_stream': '文本改写', 'paraphrase': '文本改写', 'paraphrase_async': '文本改写',
+           'document_async': '文档改写', 'document_paraphrase': '文档改写',
+           'detect_text': '文本检测', 'detect_file': '文件检测'}
+
+
+def _stream_failure(stream):
+    """从 SSE 文本里找失败原因；成功（有 done 且没有 error）返回 None。"""
+    error_message, done, progress = None, False, 0
+    for packet in stream.replace('\r\n', '\n').split('\n\n'):
+        lines = packet.splitlines()
+        event = next((l[6:].strip() for l in lines if l.startswith('event:')), '')
+        data = '\n'.join(l[5:].lstrip() for l in lines if l.startswith('data:'))
+        if event == 'error':
+            try:
+                parsed = json.loads(data)
+                error_message = str(parsed.get('message') or parsed.get('detail') or parsed) if isinstance(parsed, dict) else str(parsed)
+            except ValueError:
+                error_message = data or 'event: error'
+        elif event == 'done':
+            done = True
+        elif event == 'progress':
+            progress += 1
+    if error_message:
+        return '服务商返回错误：%s（已收到 %d 段）' % (error_message[:200], progress)
+    if not done:
+        return '服务商的流在完成前结束（已收到 %d 段，没有 done 事件）' % progress
+    return None
+
+
+def _sse(event, data):
+    return ('event: %s\ndata: %s\n\n' % (event, json.dumps(data, ensure_ascii=False))).encode()
+
+
+def capture_stream(identity, operation, source, release=None):
     chunks = []
     size = 0
+    started = time.time()
+    limit = stream_deadline()
     try:
         for chunk in source:
             size += len(chunk)
@@ -203,20 +473,33 @@ def capture_stream(identity, operation, source):
                 raise tabword.TabwordError('处理结果过大，请联系管理员核查')
             chunks.append(chunk)
             yield chunk
-        stream = b''.join(chunks).decode('utf-8')
+            if time.time() - started > limit:
+                reason = '服务商处理超过 %d 秒仍未完成，已放弃等待（已传 %d 字节）' % (limit, size)
+                note = record(identity, operation, error=True, reason=reason)
+                yield _sse('error', {'message': reason})
+                if note:
+                    yield _sse('refund', {'message': note})
+                return
+        stream = b''.join(chunks).decode('utf-8', 'replace')
         # Provider streams can report failure in an SSE packet with HTTP200.
-        failed = False
-        done = False
-        for packet in stream.replace('\r\n', '\n').split('\n\n'):
-            if any(line.strip() == 'event: error' for line in packet.splitlines()):
-                failed = True
-            if any(line.strip() == 'event: done' for line in packet.splitlines()):
-                done = True
-        record(identity, operation, error=failed or not done, stream=stream)
-    except BaseException:
-        record(identity, operation, error=True)
+        reason = _stream_failure(stream)
+        if reason:
+            reason += '，耗时 %d 秒' % (time.time() - started)
+        note = record(identity, operation, error=bool(reason), stream=stream, reason=reason)
+        if note:
+            yield _sse('refund', {'message': note})
+    except GeneratorExit:
+        # 用户关掉页面或网络断开：服务商那边可能还在处理，照样按失败退款。
+        record(identity, operation, error=True,
+               reason='浏览器连接在完成前断开（已传 %d 字节，耗时 %d 秒）' % (size, time.time() - started))
+        raise
+    except BaseException as exc:
+        record(identity, operation, error=True,
+               reason='%s: %s（已传 %d 字节，耗时 %d 秒）' % (type(exc).__name__, exc, size, time.time() - started))
         raise
     finally:
+        if release:
+            release()
         close = getattr(source, 'close', None)
         if close:
             close()
@@ -227,7 +510,7 @@ def admin_orders():
         pass
     with closing(connect()) as conn:
         rows = conn.execute("""SELECT q.id, q.operation, q.amount_cents, q.characters,
-            q.created_at,q.state,q.error,p.out_trade_no,p.status AS payment_status,p.payment_product,
+            q.created_at,q.state,q.error,q.started_at,q.elapsed,p.out_trade_no,p.status AS payment_status,p.payment_product,
             p.affiliate_id,p.affiliate_code,p.affiliate_campaign,p.affiliate_bps,
             a.name AS affiliate_name,a.email AS affiliate_email,
             m.amount_cents AS commission_cents,m.status AS commission_status

@@ -10,7 +10,7 @@ router = APIRouter(prefix='/api/tabword')
 
 @router.get('')
 def status():
-    return {**tabword.catalog(), 'prices': billing.prices(), 'payment_required': True}
+    return {**tabword.catalog(), 'prices': billing.prices(), 'deadlines': billing.deadlines(), 'payment_required': True}
 
 
 @router.post('/billing/quote')
@@ -22,7 +22,7 @@ def price_quote(operation: str = Form(...), params: str = Form('{}'), file: Uplo
         except ValueError:
             raise tabword.TabwordError('参数不是有效 JSON', 422)
         content = (file.filename or '', file.file.read(20*1024*1024+1)) if file else None
-        quote = billing.quote(operation, values, content)
+        quote = billing.quote(operation, values, content, user_id=user['id'])
     except tabword.TabwordError as exc:
         raise HTTPException(exc.status, str(exc)) from None
     text = values.get('text') if isinstance(values, dict) else ''
@@ -103,6 +103,7 @@ def read_catalog(operation: str, mode: str | None = None, language: str | None =
 @router.post('/{operation}')
 def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False),
              file: UploadFile | None = File(None), payment_order: str = Form('')):
+    slot = None
     try:
         try:
             values = json.loads(params)
@@ -121,26 +122,49 @@ def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False
             tabword.prepare(operation, values, content)
             if not tabword.enabled('TABWORD_ENABLE_CALLS') or not tabword.api_key():
                 raise tabword.TabwordError('处理服务暂未启用', 503)
-            identity = billing.authorize(operation, values, content, payment_order)
+            if operation in billing.SUBMISSIONS:
+                # 先占名额再认领订单：名额满时订单还是 ready，用户稍后可以直接重试。
+                slot = billing.GATE.acquire()
+                if slot is None:
+                    raise tabword.TabwordError(billing.BUSY_MESSAGE, 429)
+            try:
+                identity = billing.authorize(operation, values, content, payment_order)
+            except BaseException:
+                if slot:
+                    billing.GATE.release(slot)
+                raise
         else:
             identity = None
         if tabword.OPERATIONS[operation].stream:
             try:
                 stream = tabword.stream_call(operation,values,content)
-            except Exception:
-                billing.record(identity, operation, error=True)
-                raise
+            except tabword.TabwordError as exc:
+                note = billing.record(identity, operation, error=True, reason=str(exc)) if identity else None
+                raise tabword.TabwordError('%s %s' % (exc, note) if note else str(exc), exc.status) from None
+            except Exception as exc:
+                note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc)) if identity else None
+                raise tabword.TabwordError(note or '服务商连接失败', 502) from None
             billing.record(identity, operation)
-            return StreamingResponse(billing.capture_stream(identity, operation, stream),media_type='text/event-stream',
+            handed, slot = slot, None      # 流结束（或断开）时由 capture_stream 归还名额
+            release = (lambda: billing.GATE.release(handed)) if handed else None
+            return StreamingResponse(billing.capture_stream(identity, operation, stream, release),media_type='text/event-stream',
                                      headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+        # 非流式调用放到工作线程里，最多等 deadline() 秒；名额等工作线程真正结束才归还。
+        handed, slot = slot, None
+        release = (lambda: billing.GATE.release(handed)) if handed else None
         try:
-            result = tabword.call(operation,values,content)
-        except Exception:
-            if identity:
-                billing.record(identity, operation, error=True)
-            raise
+            result = billing.call_with_deadline(lambda: tabword.call(operation,values,content), release, operation)
+        except tabword.TabwordError as exc:
+            note = billing.record(identity, operation, error=True, reason=str(exc)) if identity else None
+            raise tabword.TabwordError('%s %s' % (exc, note) if note else str(exc), exc.status) from None
+        except Exception as exc:
+            note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc)) if identity else None
+            raise tabword.TabwordError(note or '服务商连接失败', 502) from None
         if identity:
             billing.record(identity, operation, result)
         return result
     except tabword.TabwordError as exc:
         raise HTTPException(status_code=exc.status,detail=str(exc)) from None
+    finally:
+        if slot:
+            billing.GATE.release(slot)

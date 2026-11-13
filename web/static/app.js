@@ -438,17 +438,18 @@ if (job) {
 
 // Tabword requests are sent upstream only after an explicit user action.
 let twConfig = null, twBusy = false;
+let twPairs = [], twDiffSource = null;    // 逐段 [原文, 改写]；{original, rewritten} 用来标注改动
 let twMode = 'reduce_ai', twLastRewrite = 'reduce_ai', twInput = 'text', twLanguage = 'zh', twPlatform = '知网_zh';
 const twPresetCache = new Map();
 const twModeDefaults = {
   reduce_duplicate: {
     service: 'paraphrase_stream',
-    zh: [['zh_jc_1_0325','降重测试模式0325-1'],['zh_jc_2_0325','降重测试模式0325-2'],['zh_jc_3_0325','降重测试模式0325-3'],['zh_jc_4_0325','降重测试模式0325-4'],['jc_muti_language_1','超级改写（扩写降重）'],['jc_muti_language_zh','降重模式260206_zh']],
+    zh: [['zh_jc_1_0325','降重测试模式0325-1'],['zh_jc_2_0325','降重测试模式0325-2'],['zh_jc_3_0325','降重测试模式0325-3'],['zh_jc_4_0325','降重测试模式0325-4'],['jc_muti_language_1','超级改写（扩写降重）']],
     en: [['5.09en','文档示例模型 · 5.09en']]
   },
   reduce_ai: {
     service: 'paraphrase_stream',
-    zh: [['aigcmove_tp_s_merge_1','降 AI 混合模式'],['aigcmove_tp_s_micro_1','降 AI 微调模式 1'],['aigcmove_tp_s_micro_2','降 AI 微调模式 2'],['aigcmove_tp_s_micro_3','降 AI 微调模式 3'],['aigcmove_tp_s_micro_4','降 AI 微调模式 4'],['aigcmove_tp_s_micro_5','降 AI 微调模式 5'],['paperpass0618','PaperPass 专用'],['wanfang_0731','万方专用'],['gzd_1020','格子达专用'],['aigcmove_tp_s_1','AI 移除 260112-1 · 小幅改写'],['aigcmove_tp_s_2','AI 移除 260112-2 · 小幅改写'],['aigcmove_tp_s_3','AI 移除 260112-3 · 中幅改写'],['aigcmove_tp_s_4','AI 移除 260112-4 · 中幅改写'],['aigcmove_tp_s_5','AI 移除 260112-5 · 大幅改写'],['turnitin_s_1','Turnitin 260917'],['jc_remove_djgzl_p_8','AI 移除 5.09 · 口语化'],['aimove_matrix_s_1','AI 移除 7.22'],['aimove_weipu_english','维普英文专用'],['aimove_weipu_0513','维普专用 0513'],['aimove_weipu_0520','格子达学校版专用'],['daya','大雅专用']],
+    zh: [['aigcmove_tp_s_merge_1','降 AI 混合模式'],['aigcmove_tp_s_micro_1','降 AI 微调模式 1'],['aigcmove_tp_s_micro_2','降 AI 微调模式 2'],['aigcmove_tp_s_micro_3','降 AI 微调模式 3'],['aigcmove_tp_s_micro_4','降 AI 微调模式 4'],['aigcmove_tp_s_micro_5','降 AI 微调模式 5'],['paperpass0618','PaperPass 专用'],['wanfang_0731','万方专用'],['gzd_1020','格子达专用'],['aigcmove_tp_s_1','AI 移除 260112-1 · 小幅改写'],['aigcmove_tp_s_2','AI 移除 260112-2 · 小幅改写'],['aigcmove_tp_s_3','AI 移除 260112-3 · 中幅改写'],['aigcmove_tp_s_4','AI 移除 260112-4 · 中幅改写'],['aigcmove_tp_s_5','AI 移除 260112-5 · 大幅改写'],['turnitin_s_1','Turnitin 260917'],['aimove_matrix_s_1','AI 移除 7.22'],['aimove_weipu_english','维普英文专用'],['aimove_weipu_0513','维普专用 0513'],['daya','大雅专用']],
     en: [['5.09en','文档默认预设 · 5.09en']]
   },
   both: {
@@ -461,6 +462,8 @@ const twModeDefaults = {
 function twSpec() { return twModeDefaults[twMode] || twModeDefaults.reduce_ai; }
 function twServiceForState() { return twMode === 'detect' ? (twInput === 'file' ? 'detect_file' : 'detect_text') : (twInput === 'file' ? 'document_async' : 'paraphrase_stream'); }
 function twSetOutputEmpty() {
+  twPairs = []; twDiffSource = null;
+  if ($('twMarks')) { $('twMarks').hidden = true; $('twDiffLegend').hidden = true; }
   $('twOutput').innerHTML = '<div class="tw-empty"><span>▤</span><strong>当前暂无处理结果</strong><small>准备内容后，结果会显示在这里</small></div>';
   $('twStats').textContent = '';
   $('twLinks').replaceChildren();
@@ -563,12 +566,19 @@ function twPayload() {
   }
   return {preset:$('twPreset').value.trim(),text:$('twText').value};
 }
+// 服务商返回的「进行中」状态统一显示成中文；没有真实百分比，所以进度条只表示「还在处理」。
+const TW_BUSY = new Set(['processing', 'pending', 'queued', 'running', 'in_progress', 'submitted']);
+let twProcessing = false;
+const twIsBusy = value => typeof value === 'string' && TW_BUSY.has(value.trim().toLowerCase());
+const twStatusLabel = value => twIsBusy(value) ? '处理中，请稍候' : value;
+function twBar(on) { $('twBar').hidden = !on; }
 function twRender(data, eventName = '') {
   if (!data || typeof data !== 'object') { $('twOutput').textContent = String(data ?? ''); return; }
   if (data.submitted === false) { $('twOutput').textContent = `${data.message}\n${data.development ? '服务商标记：开发中。' : '请求参数已准备。'}`; return; }
   if (eventName === 'progress' && data.rewritten) {
     if ($('twOutput').querySelector('.tw-empty')) $('twOutput').textContent = '';
     $('twOutput').textContent += data.rewritten + '\n';
+    twPairs.push([data.original || '', data.rewritten]);
     if (data.original) {
       $('twOriginal').textContent += `${data.original}\n`;
       $('twCompare').disabled = false;
@@ -576,12 +586,19 @@ function twRender(data, eventName = '') {
   }
   const payload = data.data && typeof data.data === 'object' ? data.data : data.result && typeof data.result === 'object' ? data.result : data;
   const detectionSummary = payload.score != null ? `AI 率检测完成：${payload.score}%${payload.level ? `（${payload.level}）` : ''}` : '';
-  const text = payload.paraphrased_text || payload.rewritten || payload.result_text || detectionSummary || payload.stage || payload.status || (!$('twOutput').textContent ? payload.message : null);
-  if (payload.message) $('twMessage').textContent = payload.message;
+  if (payload.status != null) twProcessing = twIsBusy(payload.status);
+  const text = payload.paraphrased_text || payload.rewritten || payload.result_text || detectionSummary || twStatusLabel(payload.stage || payload.status) || (!$('twOutput').textContent ? twStatusLabel(payload.message) : null);
+  if (payload.message) $('twMessage').textContent = twStatusLabel(payload.message);
   if (text && eventName !== 'progress') $('twOutput').textContent = text;
   if (payload.paraphrased_text && twMode !== 'detect') {
     $('twOriginal').textContent = `原文\n${$('twText').value}`;
     $('twCompare').disabled = false;
+    // 有逐段原文就按段对齐；没有（例如打开保存的结果）就整段和输入框里的原文比较。
+    const aligned = twPairs.length && twPairs.every(([before]) => before);
+    twDiffSource = aligned
+      ? {original: twPairs.map(p => p[0]).join('\n'), rewritten: twPairs.map(p => p[1]).join('\n')}
+      : {original: $('twText').value, rewritten: payload.paraphrased_text};
+    twShowDiff(true);
   }
   if (payload.task_id || payload.jobId) { $('twTask').value = payload.task_id || payload.jobId; $('twTaskWrap').hidden = false; }
   const stats = [];
@@ -602,13 +619,36 @@ async function twRequest(operation, values, submit, includeFile = true, paidOrde
   if (paidOrder) body.append('payment_order', paidOrder);
   const file = savedFile === undefined ? (!$('twFileWrap').hidden ? $('twFile').files[0] : null) : savedFile;
   if (includeFile && file) body.append('file', file);
-  const response = await fetch('/api/tabword/' + operation, {method:'POST', body});
-  await twConsume(response);
+  twProcessing = false; twBar(true);
+  const started = Date.now();
+  // 倒计时 = 距离「自动判定失败并退积分」还剩多久（最长等待时间），不是预计完成时间。
+  // 上限来自服务器配置；没有上限的操作（例如查询任务）只显示已用时间。
+  const limit = twConfig?.deadlines?.[operation] || 0;
+  const clock = seconds => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  const tick = () => {
+    const used = Math.round((Date.now() - started) / 1000), left = limit - used;
+    const wait = !limit ? `已用 ${used} 秒`
+      : left > 0 ? `已用 ${used} 秒，最长还需等待 ${clock(left)}` : `已用 ${used} 秒`;
+    $('twMessage').textContent = limit && left <= 0
+      ? `已超过预计等待时间，正在确认结果（${wait}）。如果失败，会自动退还积分，请勿重复提交。`
+      : used < 30 ? `处理中，请稍候…${wait}。超过这个时间仍没有结果，会自动退还积分。`
+      : `服务商响应较慢，仍在处理，请勿关闭页面或重复提交（${wait}）。超时会自动标记失败并退还积分。`;
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+  try {
+    const response = await fetch('/api/tabword/' + operation, {method:'POST', body});
+    await twConsume(response);
+  } finally {
+    clearInterval(timer);
+    // 异步任务提交后请求虽然结束了，但服务商还在处理：继续显示进度条，直到查询到结果。
+    twBar(twProcessing && !!$('twTask').value);
+  }
 }
 async function twConsume(response) {
   if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.detail || '请求失败；请勿重复提交。'); }
   if (!(response.headers.get('content-type') || '').includes('text/event-stream')) { twRender(await response.json()); return; }
-  const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '';
+  const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '', failure = '', refundNote = '';
   try {
     while (true) {
       const {value, done} = await reader.read(); pending += decoder.decode(value || new Uint8Array(), {stream:!done}); pending = pending.replace(/\r\n/g, '\n');
@@ -618,11 +658,16 @@ async function twConsume(response) {
         const event = packet.split('\n').find(line => line.startsWith('event:'))?.slice(6).trim();
         const raw = packet.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
         if (!raw) continue;
-        const data = JSON.parse(raw); if (event === 'error') throw new Error(data.message || '服务商处理失败；请勿自动重试。'); twRender(data, event);
+        const data = JSON.parse(raw);
+        // 先读完整个流：服务商报错后，服务器还会发一条 refund 告诉用户积分已退。
+        if (event === 'error') { failure = data.message || '服务商处理失败'; continue; }
+        if (event === 'refund') { refundNote = data.message || ''; if (currentUser) loadPoints().catch(() => {}); continue; }
+        twRender(data, event);
       }
       if (done) break;
     }
   } finally { await reader.cancel().catch(() => {}); }
+  if (failure || refundNote) throw new Error(refundNote ? `${failure ? failure + '。' : ''}${refundNote}` : failure);
 }
 async function twAction(submit, polling = false) {
   if (submit && !polling) {
@@ -698,9 +743,24 @@ function twSendToCheckout(order, win) {
     ? '浏览器拦截了付款页，请点「打开支付宝付款」。'
     : '已打开支付宝收银台。付款后本页会自动开始处理，请不要关闭本页。';
 }
+// 文本改写同一段原文：首次全价，之后再改写 3 次半价。
+function twOfferText(quote) {
+  if (!quote?.rewrite_discounts) return '';
+  if (quote.discounted) return `本次半价，这段原文还剩 ${quote.discounts_left} 次半价重改。`;
+  if (quote.paid_before) return '这段原文的半价次数已用完。';
+  return `这段原文改写完成后，再改写可享受 ${quote.rewrite_discounts} 次半价。`;
+}
 async function twBuy(method = 'alipay') {
   if (twBusy || !requireLogin(() => twBuy(method))) return;
-  const existing = twCurrentOrder();
+  let existing = twCurrentOrder();
+  if (existing?.paid) {
+    // 已付款但还没开始处理的订单接着用（不重复扣费）；已经提交过的（不论成功、失败、还在处理），
+    // 同一份材料要再来一次就重新计价付款。文本改写同一段原文的后几次享受半价。
+    const state = await request(`/api/tabword/billing/${existing.quote_id}/${existing.order_id}`).catch(() => null);
+    if (state && state.service_state !== 'ready') {
+      existing.done = true; twSaveOrders(); existing = null; twRefresh();
+    }
+  }
   if (existing) {
     if (existing.paid) { twShowOrder(existing); $('twMessage').textContent = '这份内容已付款，正在处理。'; twRunPaid(existing); }
     else if (method === 'points') await twPayWithPoints(existing);
@@ -721,8 +781,12 @@ async function twBuy(method = 'alipay') {
     const body = new FormData(); body.append('operation', operation); body.append('params', JSON.stringify(values));
     if (file) body.append('file', file);
     const quote = await request('/api/tabword/billing/quote', {method:'POST', body});
+    const offer = twOfferText(quote);
+    $('twOffer').textContent = offer;
     if (method === 'points') {
-      if (twPriceCents() == null && !confirm(`文档约 ${quote.characters} 字，需 ${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？`)) {
+      const ask = twPriceCents() == null ? `文档约 ${quote.characters} 字，需 ${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？`
+        : quote.discounted ? `本次享受半价：${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？` : '';
+      if (ask && !confirm(ask)) {
         $('twMessage').textContent = '已取消，未扣积分。'; return;
       }
       // The order only exists once the points are paid; until then nothing is watched.
@@ -810,6 +874,11 @@ async function twRunPaid(order) {
       $('twBilling').hidden = true; $('twMessage').textContent = '已提交处理，点「查询任务结果」查看进度。';
       return;
     }
+    if (state.service_state === 'failed') {
+      // 失败的订单不会再卡在这里：告诉用户原因，让这单结束，同一份材料可以直接重新提交。
+      order.done = true; twSaveOrders(); $('twBilling').hidden = true;
+      throw new Error(`处理失败：${(state.error || '服务商没有返回结果').replace(/（积分已退）$/, '')}。使用积分支付的订单已退还积分，可以直接重新提交。`);
+    }
     if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请保留订单号联系客服。');
     if (!order.values) throw new Error('付款已确认，但这个页面没有保存下单时的内容。请回到下单的页面，或保留订单号联系客服。');
     let file = null;
@@ -871,17 +940,19 @@ for (const button of document.querySelectorAll('[data-platform]')) button.addEve
   twPlatform = button.dataset.platform; $('twPlatform').value = twPlatform;
   for (const item of document.querySelectorAll('[data-platform]')) { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }
 });
-$('twModels').addEventListener('click', async () => {
-  if (!twConfig?.catalog_reads_enabled) { $('twModelInfo').textContent = '尚未配置 Tabword API Key，无法读取官方预设。'; return; }
+// 改写模型以官方目录为准（GET /api/v2/presets）：页面启动时自动同步，也可以手动点「同步官方模型」。
+// 写死的清单只是官方目录读不到时的备用，官方下线的模型会一直留在里面。
+async function twSyncModels(mode, silent = false) {
+  if (!twConfig?.catalog_reads_enabled) { if (!silent) $('twModelInfo').textContent = '尚未配置 Tabword API Key，无法读取官方预设。'; return; }
   try {
-    const mode = twMode === 'both' ? 'both' : twMode === 'reduce_duplicate' ? 'reduce_duplicate' : 'reduce_ai';
     const response = await fetch('/api/tabword/catalog/presets?mode=' + mode); const data = await response.json(); if (!response.ok) throw new Error(data.detail || '模型列表读取失败');
     const list = Array.isArray(data.presets) ? data.presets.filter(p => p && p.code) : [];
     if (!list.length) throw new Error('服务商未返回模型列表。');
-    twPresetCache.set(twMode, {zh:list.map(p => [p.code,p.name || p.code]),en:list.map(p => [p.code,p.name || p.code])});
-    twPopulatePresets(); $('twModelInfo').textContent = `已同步 ${list.length} 个官方模型。`;
-  } catch (error) { $('twModelInfo').textContent = error.message; }
-});
+    twPresetCache.set(mode, {zh:list.map(p => [p.code,p.name || p.code]),en:list.map(p => [p.code,p.name || p.code])});
+    twPopulatePresets(); if (!silent) $('twModelInfo').textContent = `已同步 ${list.length} 个官方模型。`;
+  } catch (error) { if (!silent) $('twModelInfo').textContent = error.message; }
+}
+$('twModels').addEventListener('click', () => twSyncModels(twMode === 'both' ? 'both' : twMode === 'reduce_duplicate' ? 'reduce_duplicate' : 'reduce_ai'));
 async function twRefreshPlatforms() {
   if (!twConfig?.catalog_reads_enabled) {
     $('twMessage').textContent = '尚未配置 Tabword API Key，无法读取官方检测平台。';
@@ -908,6 +979,70 @@ async function twRefreshPlatforms() {
   finally { button.disabled = false; }
 }
 $('twPlatformRefresh').addEventListener('click', twRefreshPlatforms);
+// ---- 改动标注：逐字比较原文和改写稿，改写稿里新增 / 改动的字标色，原文里被删的字划掉 ----
+// 先按段落对齐，再在每段内做逐字 LCS；段落太长时退回按短句比较，避免长文卡顿。
+const TW_DIFF_CELLS = 4e6;
+function twLcsOps(a, b) {
+  const n = a.length, m = b.length;
+  if (!n || !m) return [...a].map(t => ['del', t]).concat([...b].map(t => ['add', t]));
+  if (n * m > TW_DIFF_CELLS) return [['del', a.join('')], ['add', b.join('')]];
+  const dp = Array.from({length: n + 1}, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+    dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const ops = []; let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push(['same', a[i]]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) ops.push(['del', a[i++]]);
+    else ops.push(['add', b[j++]]);
+  }
+  while (i < n) ops.push(['del', a[i++]]);
+  while (j < m) ops.push(['add', b[j++]]);
+  return ops;
+}
+function twTokens(text) {
+  const chars = [...text];
+  return chars.length * chars.length > TW_DIFF_CELLS ? text.split(/(?<=[。！？；!?;\n])/) : chars;
+}
+function twDiffParagraph(before, after) { return twLcsOps(twTokens(before), twTokens(after)); }
+// 把同类操作合并成片段，便于渲染。
+function twMerge(ops) {
+  const out = [];
+  for (const [kind, text] of ops) {
+    const last = out[out.length - 1];
+    if (last && last[0] === kind) last[1] += text; else out.push([kind, text]);
+  }
+  return out;
+}
+function twRenderDiff(container, original, rewritten) {
+  const a = original.split('\n'), b = rewritten.split('\n');
+  const paragraphs = a.length === b.length ? a.map((p, i) => [p, b[i]]) : [[original, rewritten]];
+  const fragment = document.createDocumentFragment();
+  let changed = 0, total = 0;
+  paragraphs.forEach(([before, after], index) => {
+    if (index) fragment.append('\n');
+    for (const [kind, text] of twMerge(twDiffParagraph(before, after))) {
+      if (kind === 'same') { fragment.append(text); total += text.length; continue; }
+      const mark = document.createElement(kind === 'add' ? 'ins' : 'del');
+      mark.className = kind === 'add' ? 'tw-add' : 'tw-del';
+      mark.textContent = text; fragment.append(mark);
+      if (kind === 'add') { changed += text.length; total += text.length; }
+    }
+  });
+  container.replaceChildren(fragment);
+  return total ? Math.round(changed / total * 100) : 0;
+}
+function twShowDiff(on) {
+  const btn = $('twMarks');
+  if (!twDiffSource) { btn.hidden = true; return; }
+  btn.hidden = false; btn.setAttribute('aria-pressed', String(on)); btn.classList.toggle('active', on);
+  if (on) {
+    const ratio = twRenderDiff($('twOutput'), twDiffSource.original, twDiffSource.rewritten);
+    $('twDiffLegend').hidden = false;
+    $('twDiffLegend').querySelector('[data-ratio]').textContent = `改动约 ${ratio}%`;
+  } else {
+    $('twOutput').textContent = twDiffSource.rewritten; $('twDiffLegend').hidden = true;
+  }
+}
 $('twCompare').addEventListener('click', () => {
   const visible = $('twOriginal').hidden;
   $('twOriginal').hidden = !visible;
@@ -915,10 +1050,12 @@ $('twCompare').addEventListener('click', () => {
   $('twCompare').setAttribute('aria-pressed', String(visible));
   document.querySelector('.tw-result-pane').classList.toggle('is-comparing', visible);
 });
+$('twMarks').addEventListener('click', () => twShowDiff($('twMarks').getAttribute('aria-pressed') !== 'true'));
 fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); return response.json(); }).then(data => {
   twConfig = data; twChange();
+  for (const mode of ['reduce_ai', 'reduce_duplicate', 'both']) twSyncModels(mode, true);
   const p = data.prices;
-  $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。1 元 = 10 积分。`;
+  $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。1 元 = 10 积分。文本改写：同一段原文首次改写后，24 小时内再改写 3 次半价。`;
 }).catch(() => { $('twMessage').textContent = '服务配置加载失败。'; });
 // Any change to what will be bought updates the price and which order is shown.
 $('twText').addEventListener('input', twRefresh);

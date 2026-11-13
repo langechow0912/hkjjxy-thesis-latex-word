@@ -202,15 +202,25 @@ def three_line_table(doc, rows, cfg):
             pf.line_spacing = bls
             r = p.add_run(cell_text)
             fmt(r, size=bsize)
-            if ri == 0:  # 栏目线
+            if ri == 0:  # 栏目线；表头行自带顶线，跨页重复出现时第二页最上面也有线
                 tcPr = cell._tc.get_or_add_tcPr()
                 tcb = OxmlElement("w:tcBorders")
+                tp = OxmlElement("w:top")
+                tp.set(qn("w:val"), "single")
+                tp.set(qn("w:sz"), str(top_sz))
+                tp.set(qn("w:color"), "000000")
+                tcb.append(tp)
                 bt = OxmlElement("w:bottom")
                 bt.set(qn("w:val"), "single")
                 bt.set(qn("w:sz"), str(mid_sz))
                 bt.set(qn("w:color"), "000000")
                 tcb.append(bt)
                 tcPr.append(tcb)
+    for ri, row in enumerate(tb.rows):
+        trPr = row._tr.get_or_add_trPr()
+        trPr.append(OxmlElement("w:cantSplit"))        # 一行不被拆到两页
+        if ri == 0 and len(tb.rows) > 1:
+            trPr.append(OxmlElement("w:tblHeader"))    # 表头行跨页时在每页顶部重复
     return tb
 
 
