@@ -35,6 +35,13 @@ RE_ABS_EN = re.compile(r"^Abstract[:：]\s*(.*)$", re.I)
 RE_KEY_EN = re.compile(r"^Key\s*words?[:：]\s*(.*)$", re.I)
 RE_REF_HEAD = re.compile(r"^参考文献\s*$")
 RE_ACK_HEAD = re.compile(r"^致\s*谢\s*$")
+# 原稿自带的目录：Word 自动目录的段落样式叫 TOC 1 / 目录 1 / Table of Figures；
+# 手敲的目录没有样式，就看行尾是不是「点线或制表符 + 页码」。
+RE_TOC_STYLE = re.compile(r"^(?:toc\s*\d*|目录\s*\d*|toc\s*heading|目录标题|table\s+of\s+figures|图表目录)$", re.I)
+RE_TOC_TITLE = re.compile(
+    r"^(?:目\s*录|(?:插图|图表|表格|图|表)\s*目\s*录|contents?|table\s+of\s+contents|list\s+of\s+(?:figures|tables))$", re.I)
+RE_TOC_ENTRY = re.compile(r"(?:\.{2,}|…+|·{2,}|\t)\s*[\dIVXivx]{1,4}\s*$")
+TOC_WINDOW = 12          # 目录必须出现在正文起点之后的前 12 个非空段落内，免得把正文中段的列表误当目录
 # 编号可以是「1-1」两段式，也可以是全文连续的「1」。不做 \d+ 直接吃下去，
 # 是因为按位置配题名/正文判断，不会因为放宽编号而误收正文。
 # 英文稿常见 Table 1 / Figure 2，同样收进来。
@@ -192,6 +199,8 @@ def locate(items):
         if it["kind"] != "p":
             continue
         t = it["text"]
+        if RE_TOC_STYLE.match(it.get("style", "")):
+            continue                                   # 目录里的「参考文献 …… 30」不是真的章节标记
         if m["abs_cn"] is None and RE_ABS_CN.match(t):
             m["abs_cn"] = i
         elif m["key_cn"] is None and RE_KEY_CN.match(t):
@@ -873,7 +882,7 @@ def convert(docx_path, out_dir, cfg=None, log=print, overrides=None):
         "numbering": numbering,
         "title": meta["cn_title"],
         # 识别不出题名/图片的提示，供 web 流程直接展示给用户。
-        "notes": heading_notes + audit(everything),
+        "notes": _toc_note(marks) + heading_notes + audit(everything),
         # 原文条目与正文起点，给 DSH 生成结构清单用（免得再解析一遍 docx）。
         "items": items,
         "body_start": marks["body_start"],
@@ -919,7 +928,7 @@ def analyze_items(docx_path, overrides=None):
             figmap[target.split("/")[-1]] = target.split("/")[-1]
     trace = {}
     blocks, refs, ack, notes, appendix = scan(items, marks, figmap, clean or None, trace)
-    notes = notes + audit(blocks + appendix)
+    notes = _toc_note(marks) + notes + audit(blocks + appendix)
     return analysis_rows(items, marks, trace, clean, notes, rejected), items, marks
 
 
@@ -1055,9 +1064,61 @@ def _resolved_levels(blocks):
 def _body_start(items, marks):
     """正文从哪一段开始：英文关键词之后；没有英文关键词就用中文关键词"""
     idx = marks["key_en"] if marks["key_en"] is not None else marks["key_cn"]
-    if idx is None:
-        return 0
-    return items[idx]["pno"] + 1
+    start = 0 if idx is None else items[idx]["pno"] + 1
+    block = _original_toc(items, start)
+    if block is None:
+        return start
+    first, last = block
+    marks["toc_skipped"] = sum(1 for it in items[first:last + 1] if it["kind"] == "p" and it["text"])
+    return items[last]["pno"] + 1
+
+
+def _is_toc_line(it):
+    if it["kind"] != "p" or not it["text"]:
+        return False
+    if RE_TOC_STYLE.match(it.get("style", "")):
+        return True
+    return len(it["text"]) <= 100 and bool(RE_TOC_ENTRY.search(it["text"]))
+
+
+def _original_toc(items, body_start):
+    """原稿自带的目录页：返回 (首行下标, 末行下标)，没有返回 None。
+
+    目录常排在摘要/关键词之后、正文之前。不跳过的话，目录里每一行（「第一章 绪论 …… 3」）
+    都会被当成正文标题再识别一遍，模板又生成一套目录，成品里就有两个目录。
+    有「目录」标题时至少要有 2 行条目，没有标题时至少要连续 3 行，且必须紧跟在正文起点之后。
+    """
+    seen = 0
+    for s, it in enumerate(items):
+        if it["kind"] != "p" or it["pno"] < body_start or not it["text"]:
+            continue
+        seen += 1
+        if seen > TOC_WINDOW:
+            return None
+        titled = bool(RE_TOC_TITLE.match(it["text"]))
+        if not titled and not _is_toc_line(it):
+            continue
+        last, entries = s, 0 if titled else 1
+        for j in range(s + 1, len(items)):
+            nxt = items[j]
+            if nxt["kind"] != "p" or nxt.get("imgs"):
+                break
+            if not nxt["text"]:
+                continue
+            if _is_toc_line(nxt):
+                last, entries = j, entries + 1
+            elif RE_TOC_TITLE.match(nxt["text"]):      # 「图目录」「表目录」接在目录后面
+                last = j
+            else:
+                break
+        if entries >= (2 if titled else 3):
+            return s, last
+    return None
+
+
+def _toc_note(marks):
+    n = marks.get("toc_skipped")
+    return ["原稿自带的目录（%d 行）已识别并略过，成品里的目录由模板重新生成。" % n] if n else []
 
 
 def _meta(items, marks):
