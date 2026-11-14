@@ -30,6 +30,12 @@ services:
       TABWORD_FORMAT_BASE_URL: ${TABWORD_FORMAT_BASE_URL:-https://apihub.ycjg.top}
       TABWORD_ENABLE_CALLS: ${TABWORD_ENABLE_CALLS:-false}
       TABWORD_ENABLE_DEVELOPMENT: ${TABWORD_ENABLE_DEVELOPMENT:-false}
+      DSH_ENABLED: ${DSH_ENABLED:-}
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_REASONING_EFFORT: ${DEEPSEEK_REASONING_EFFORT:-off}
       ALIPAY_ENABLED: ${ALIPAY_ENABLED:-false}
       ALIPAY_APP_ID: ${ALIPAY_APP_ID:-2021007108658866}
       ALIPAY_NOTIFY_URL: ${ALIPAY_NOTIFY_URL:-}
@@ -47,6 +53,9 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_FROM: ${SMTP_FROM:-}
       SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      # 多发信账号（可选）：文件存在且有可用账号时，优先于上面的单账号配置；
+      # 顺序即优先级，失败自动换下一个，改文件不用重启。格式见 deploy/secrets/README.md。
+      SMTP_ACCOUNTS_FILE: /run/secrets/smtp_accounts.json
       THESIS_EMAIL_DAILY_CAP: ${THESIS_EMAIL_DAILY_CAP:-1000}
     expose:
       - "8000"

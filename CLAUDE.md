@@ -37,7 +37,7 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 
 **付款后结果只保留 24 小时**（`alipay.RESULT_TTL`）：`web/app.py` 的 `_live_job` 每次访问先检查并返回 410，后台线程 `_sweep` 每 10 分钟清理，`service_billing.get_quote` 读取时也会惰性过期。订单和金额记录不删。
 
-**登录**：上传、报价、创建支付订单都要登录（`Depends(current_user)`）。支持邮箱验证码（默认）和老的用户名密码；发信在 `core/mailer.py`（SMTP）。**积分**（1 元 = 10 积分，`core/points.py`）可抵扣所有服务，积分支付落成一笔 `payment_product='points'` 的已付款订单，下游沿用同一套「已付款」判断；详见 `docs/points.md`。管理后台是另一套认证（Basic 或一次性令牌，只显示一次，库里存哈希）。
+**登录**：上传、报价、创建支付订单都要登录（`Depends(current_user)`）。支持邮箱验证码（默认）和老的用户名密码；发信在 `core/mailer.py`（SMTP，支持多账号：`deploy/secrets/smtp_accounts.json` 的顺序即优先级，失败自动换下一个，没有这个文件就用 `SMTP_*` 单账号；报警邮件走同一套）。**积分**（1 元 = 10 积分，`core/points.py`）可抵扣所有服务，积分支付落成一笔 `payment_product='points'` 的已付款订单，下游沿用同一套「已付款」判断；详见 `docs/points.md`。管理后台是另一套认证（Basic 或一次性令牌，只显示一次，库里存哈希）。
 
 **前端**是 `web/static/` 下无构建的 `index.html` + `app.js`，每个静态文件在 `web/app.py` 里有单独的路由，没有整体挂载，新增静态文件要加路由。
 
