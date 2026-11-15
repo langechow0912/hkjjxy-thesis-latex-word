@@ -39,7 +39,9 @@ WORKDIR /app
 
 COPY requirements.txt ./requirements.txt
 COPY requirements-local.txt ./requirements-local.txt
-RUN python -m pip install --no-cache-dir --prefer-binary -r requirements-local.txt
+# 【阿里云版】内地服务器访问 PyPI 官方源慢，构建时可以指定镜像（compose 的 PIP_INDEX_URL 构建参数）。不传就用官方源。
+ARG PIP_INDEX_URL=
+RUN python -m pip install --no-cache-dir --prefer-binary ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} -r requirements-local.txt
 
 COPY --chown=thesis:thesis core/ ./core/
 COPY --chown=thesis:thesis web/ ./web/

@@ -38,6 +38,10 @@ credentials you intend the server to use here:
 
   Optional per entry: `"from"` (default = `user`), `"enabled": false` to switch one off.
   The display name is always `Paper Layout`.
+- `format_worker_token` — optional shared secret between the main site and the overseas
+  formatting server (docs/aliyun-split.md). Put the SAME random string (e.g. `openssl rand -hex 32`)
+  on both machines. On the main site also set `FORMAT_WORKER_URL` in `.env`. Without this file the
+  feature is off (the internal `/internal/format-worker/*` routes answer 404).
 - `alipay_app_private_key.pem` — optional Alipay app private key
 - `alipay_platform_public_key.pem` — optional Alipay platform public key for
   callback signature verification (not the app public key)

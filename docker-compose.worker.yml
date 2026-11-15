@@ -1,0 +1,10 @@
+# 【阿里云版】海外排版服务器：只对主站开放内部接口，其余路径 404。
+#   docker compose -f docker-compose.yml -f docker-compose.worker.yml up -d --build
+# .env 需要：DOMAIN=<排版服务器自己的域名>、MAIN_SITE_IPS=<主站公网 IP，多个用空格隔开>、THESIS_LOCAL_FORMAT=true
+# 另外 deploy/secrets/format_worker_token 要和主站的一致。详见 docs/aliyun-split.md。
+services:
+  caddy:
+    environment:
+      MAIN_SITE_IPS: ${MAIN_SITE_IPS:?Set MAIN_SITE_IPS in .env to the main site's public IP(s)}
+    volumes:
+      - ./Caddyfile.worker:/etc/caddy/Caddyfile:ro

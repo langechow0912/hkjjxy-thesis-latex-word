@@ -1,0 +1,36 @@
+# 【阿里云版】海外排版服务器专用 Caddy 配置（配合 docker-compose.worker.yml）。
+# 主站搬到阿里云之后，这台只给主站当排版服务用：只开放 /internal/format-worker/*，
+# 而且只允许主站的公网 IP 访问；其余任何路径一律 404，不再暴露整个网站。
+# {$DOMAIN} 就是排版服务器自己的域名（例如 format.example.com，A 记录指向这台）。
+# {$MAIN_SITE_IPS} 是主站的公网 IP，多个用空格隔开，也可以写 CIDR。
+{$DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size 25MB
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+		-Server
+	}
+
+	@internal path /internal/format-worker/*
+	handle @internal {
+		@denied not remote_ip {$MAIN_SITE_IPS}
+		respond @denied "Forbidden" 403
+
+		# Keep the container hop on HTTP/1.1; the app's Uvicorn listener is HTTP/1 only.
+		reverse_proxy app:8000 {
+			transport http {
+				versions 1.1
+			}
+		}
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+}

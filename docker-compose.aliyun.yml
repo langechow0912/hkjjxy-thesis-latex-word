@@ -1,0 +1,14 @@
+# 【阿里云版】阿里云广州单机：80/443 已经由宿主机上的 Caddy（systemd）占用，反代到 127.0.0.1:8000，
+# 所以不启动 compose 里的 caddy 容器，只把 app 发布到本机 8000。
+# 内地访问 Docker Hub 不通：基础镜像 python:3.12-slim-bookworm 要事先在本机存在；pip 走阿里云镜像。
+#   docker compose -f docker-compose.yml -f docker-compose.aliyun.yml up -d --build
+# .env 需要：DOMAIN=<站点域名>、THESIS_LOCAL_FORMAT=false（不装 LibreOffice）。
+services:
+  app:
+    build:
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    ports:
+      - "127.0.0.1:8000:8000"
+  caddy:
+    profiles: ["with-caddy"]

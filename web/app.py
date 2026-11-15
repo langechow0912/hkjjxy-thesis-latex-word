@@ -45,7 +45,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import accounts, affiliates, alipay, dayipaper   # noqa: E402
+from core import accounts, affiliates, alipay, dayipaper, format_remote   # noqa: E402
 from core.localconfig import load_pat
 load_pat(ROOT)
 
@@ -85,9 +85,11 @@ from web.tabword_routes import router as tabword_router
 from web import dsh_routes
 from web import points_routes
 from web import format_ai_routes
+from web import format_worker_routes      # 阿里云版：海外排版服务器的内部接口
 from web import account_routes
 from web.account_routes import current_user
 app.include_router(tabword_router)
+app.include_router(format_worker_routes.router)
 app.include_router(dsh_routes.router)
 app.include_router(points_routes.router)
 app.include_router(format_ai_routes.router)
@@ -149,6 +151,11 @@ LOCAL_SCHOOL = {"id": "school:hkjjxy", "name": "海口经济学院", "provider":
 # 轮询间隔对方有硬性下限：低于 1 秒会被风控拦，core/dayipaper.py 里还会再夹一次。
 CLOUD_POLL = float(os.environ.get("THESIS_CLOUD_POLL", "2") or 2)
 CLOUD_TIMEOUT = float(os.environ.get("THESIS_CLOUD_TIMEOUT", "900") or 900)
+# 【阿里云版】海口经济学院的排版交给海外排版服务器（core/format_remote.py）。
+# 这三个只在主站用：轮询间隔、整个任务最长等多久、连续连不上多久就放弃并改走云端 API。
+REMOTE_POLL = float(os.environ.get("THESIS_REMOTE_POLL", "2") or 2)
+REMOTE_TIMEOUT = float(os.environ.get("THESIS_REMOTE_TIMEOUT", "1200") or 1200)
+REMOTE_LOST_AFTER = float(os.environ.get("THESIS_REMOTE_LOST_AFTER", "180") or 180)
 
 
 def _basic_matches(header, user, password):
@@ -170,7 +177,9 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         )
 
     async def dispatch(self, request, call_next):
+        # 阿里云版：/internal/format-worker/* 有自己的密钥认证（主站带 Bearer 密钥来调），不走站点口令
         if (not AUTH_ON or request.url.path in ("/api/health", "/api/alipay/notify")
+                or request.url.path.startswith(format_remote.PREFIX + "/")
                 or AffiliateAdminAuthMiddleware._is_admin_path(request.url.path)):
             return await call_next(request)
         header = request.headers.get("authorization", "")
@@ -926,6 +935,12 @@ def _format_job(job_id):
 
 
 points_routes.bind(_format_job)
+# 阿里云版：海外排版服务器的内部接口。lambda 延迟取值，测试里替换 _run_school 仍然有效。
+format_worker_routes.bind(
+    jobs=JOBS, new_job=lambda **kw: _new_job(**kw), run=lambda *a: _run_school(*a),
+    running=lambda: _running_count(), limit=lambda: MAX_RUNNING,
+    drop=lambda job: _drop_job(job), max_bytes=lambda: MAX_UPLOAD_MB * 1024 * 1024,
+    engine=lambda: LOCAL_FORMAT)
 
 
 def _cloud_job(job_id):
@@ -1044,12 +1059,13 @@ def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=
     query = re.sub(r'\s+', '', q).lower()
     # 海口经济学院走本地学校模板（封面、声明、字体按学校规范）；"海口经济""海经"等
     # 简称也必须命中，否则会落到云端通用规范，排出来没有学校封面。
-    if LOCAL_FORMAT and ('hkjjxy' in query or query.startswith('海口经济') or query in ('海口', '海经', '海经院')):
+    # 阿里云版：本机没有 LibreOffice 但配了海外排版服务器时，同样显示本地学校模板。
+    if _school_available() and ('hkjjxy' in query or query.startswith('海口经济') or query in ('海口', '海经', '海经院')):
         return {'total': 1, 'items': [dict(LOCAL_SCHOOL)]}
     result = api_dp_rules(q, size)
     items = [{**r, 'id': 'dayipaper:' + str(r['id']), 'provider': 'dayipaper'}
              for r in result.get('items', [])]
-    if LOCAL_FORMAT:
+    if _school_available():
         # 云端结果里出现的海口经济学院也换成本地模板：用户点的是"海口经济学院"就走本地。
         haikou = [r for r in items if _is_haikou_rule(r)]
         if haikou:
@@ -1061,6 +1077,41 @@ def api_format_rules(q: str = Query(..., min_length=1), size: int = Query(5, ge=
 def _is_haikou_rule(rule):
     names = " ".join(str(rule.get(k) or "") for k in ("name", "targetSchoolName", "label"))
     return "海口经济学院" in names
+
+
+# ---- 【阿里云版】海口经济学院这次走哪条路 ----
+# 优先级：海外排版服务器（worker）→ 本机 LibreOffice（local）→ 云端 API（cloud，回退）。
+# 排版免费、付款在导出时，所以在这几条路之间切换不会多收钱。
+def _school_available():
+    """本地学校模板有没有可能排：本机有 LibreOffice，或者配了海外排版服务器。"""
+    return LOCAL_FORMAT or format_remote.configured()
+
+
+def _school_route():
+    if format_remote.configured() and format_remote.healthy():
+        return "worker"
+    if LOCAL_FORMAT:
+        return "local"
+    return "cloud"
+
+
+_HAIKOU_CLOUD = {"at": 0.0, "id": None}
+
+
+def _cloud_haikou_rule():
+    """海口经济学院在云端排版里的规范 id（回退用）；缓存 10 分钟，查不到时沿用上一次的。"""
+    now = time.time()
+    if _HAIKOU_CLOUD["id"] and now - _HAIKOU_CLOUD["at"] < 600:
+        return _HAIKOU_CLOUD["id"]
+    try:
+        result = dayipaper.search_rules("海口经济学院", page_size=10)
+    except (dayipaper.ApiError, OSError):
+        return _HAIKOU_CLOUD["id"]
+    for rule in result.get("items", []):
+        if _is_haikou_rule(rule):
+            _HAIKOU_CLOUD.update(at=now, id=str(rule["id"]))
+            break
+    return _HAIKOU_CLOUD["id"]
 
 
 @app.post("/api/format")
@@ -1082,11 +1133,22 @@ async def api_dp_format(file: UploadFile | None = File(None),
                         overrides: str = Form(""),
                         user=Depends(current_user)):
     local_rule = ruleId.strip() in ('hkjjxy', 'school:hkjjxy')
-    if local_rule and not LOCAL_FORMAT:
-        raise HTTPException(400, "本服务器未开启海口经济学院本地排版，请重新搜索院校并选择云端规范")
+    school_route, fallback_cloud = None, False
+    if local_rule:
+        if not _school_available():
+            raise HTTPException(400, "本服务器未开启海口经济学院本地排版，请重新搜索院校并选择云端规范")
+        # 阿里云版：海外排版服务器 → 本机 LibreOffice → 云端 API（回退）
+        school_route = _school_route()
+        if school_route == 'cloud':
+            cloud_rule = _cloud_haikou_rule() if dayipaper.has_token() else None
+            if not cloud_rule:
+                raise HTTPException(503, "海口经济学院排版服务暂时不可用，请稍后再试")
+            ruleId, local_rule, fallback_cloud = 'dayipaper:' + cloud_rule, False, True
+        elif school_route == 'worker' and format_remote.busy():
+            raise HTTPException(503, "当前排版任务较多，请稍后再提交")
     if not local_rule and not dayipaper.has_token():
         raise HTTPException(503, "云端排版未启用：请设置环境变量 DAYIPAPER_PAT 后重启服务")
-    if local_rule and _running_count() >= MAX_RUNNING:
+    if school_route == 'local' and _running_count() >= MAX_RUNNING:
         raise HTTPException(503, "当前排版任务较多，请稍后再提交")
     if not local_rule and _cloud_running_count() >= MAX_CLOUD:
         raise HTTPException(503, "已有 %d 个云端任务在跑，请稍后再提交（上限 %d）"
@@ -1138,7 +1200,9 @@ async def api_dp_format(file: UploadFile | None = File(None),
                     'stage': '准备本地排版', 'status': None, 'statusLabel': '',
                     'taskId': None, 'suggestions': [], 'preview': None, 'exported': False})
         accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip() or LOCAL_SCHOOL['name'])
-        threading.Thread(target=_run_school, args=(job, data, meta), daemon=True).start()
+        # 阿里云版：worker 路线把原稿交给海外排版服务器；其余照旧在本机排（先取再用，测试可替换 _run_school）
+        runner = _run_remote_school if school_route == 'worker' else _run_school
+        threading.Thread(target=runner, args=(job, data, meta), daemon=True).start()
         if analysis is not None:
             format_ai_routes.discard(analysis["id"])
         return {'job': job['id'], 'title': meta['title']}
@@ -1152,11 +1216,17 @@ async def api_dp_format(file: UploadFile | None = File(None),
     else:
         school_key = 'dayipaper:' + meta['ruleId']
 
+    if fallback_cloud:
+        # 阿里云版：用户选的是海口经济学院，只是排版服务器连不上才改走云端。school_key 仍记
+        # school:hkjjxy，限定这所学校的优惠券才照常能用；规范 id 是云端的海口规则。
+        school_key = LOCAL_SCHOOL["id"]
     job = _new_job(kind="cloud")
     job.update({"name": meta["title"], "school_key": school_key,
                 "stage": "上传源文档", "status": None,
                 "statusLabel": "", "taskId": None, "suggestions": [],
                 "preview": None, "exported": False})
+    if fallback_cloud:
+        job["log"].append("海口经济学院排版服务器暂不可用，已改用云端规范排版")
     accounts.record_upload(user['id'], 'format', job['id'], meta['title'], ruleLabel.strip())
     retag = None
     if analysis is not None:
@@ -1187,6 +1257,102 @@ def _run_school(job, payload, meta):
         job['state'] = 'error'
         job['stage'] = '本地排版失败'
         job['log'].append(traceback.format_exc())
+
+
+# ---- 【阿里云版】把海口经济学院的排版交给海外排版服务器 ----
+def _wait_remote(job, remote):
+    """轮询到完成：把对面的阶段、日志、建议同步到本地任务。返回对面的最终状态；
+    对面报告排版本身出错（原稿的问题，不是线路的问题）返回 None，任务已标成 error，不改走云端。"""
+    started, lost_since, seen = time.time(), None, 0
+    while True:
+        if time.time() - started > REMOTE_TIMEOUT:
+            raise format_remote.Unreachable("排版服务器超过 %d 秒没有完成" % REMOTE_TIMEOUT)
+        try:
+            info = format_remote.status(remote)
+            lost_since = None
+        except format_remote.Unreachable:
+            lost_since = lost_since or time.time()
+            if time.time() - lost_since > REMOTE_LOST_AFTER:      # 连续连不上这么久才放弃，短暂抖动不算
+                raise
+            time.sleep(REMOTE_POLL * 2)
+            continue
+        new = int(info.get("logCount") or 0) - seen
+        if new > 0:
+            job["log"].extend(info.get("log", [])[-new:])
+            seen += new
+        job["stage"] = info.get("stage") or job.get("stage")
+        job["suggestions"] = info.get("suggestions") or []
+        if info.get("state") == "done":
+            return info
+        if info.get("state") == "error":
+            job["state"] = "error"
+            job["stage"] = info.get("stage") or "排版失败"
+            format_remote.discard(remote)
+            return None
+        time.sleep(REMOTE_POLL)
+
+
+def _run_remote_school(job, payload, meta):
+    """把原稿交给海外排版服务器，轮询到完成，再把 docx / pdf 拷回主站任务目录。
+
+    拷回之后和本机排版完全一样（预览、付费下载、24 小时清理都不用改）。
+    线路不通（连不上、对面重启丢了任务、超时）就改走云端 API；排版本身报错则如实报错。"""
+    filename = "source" + meta.get("sourceSuffix", ".docx")
+    try:
+        job["stage"] = "提交到排版服务器"
+        remote = format_remote.submit(payload, filename, meta, key=job["id"])
+        job["log"].append("已提交到排版服务器：%s" % remote)
+        info = _wait_remote(job, remote)
+        if info is None:
+            return
+        job["stage"] = "取回排版成品"
+        files = {}
+        for kind in ("docx", "pdf"):
+            if kind in (info.get("files") or {}):
+                files[kind] = str(format_remote.fetch(remote, kind, Path(job["tmp"]) / ("result." + kind)))
+        if "docx" not in files:
+            raise format_remote.Gone("排版服务器没有给出 Word 成品")
+        job["files"] = files
+        job["suggestions"] = info.get("suggestions") or []
+        job["stage"] = info.get("stage") or "排版完成"
+        job["state"] = "done"
+        _save_job(job)
+        format_remote.discard(remote)
+    except (format_remote.Unreachable, format_remote.Gone) as exc:
+        format_remote.mark_down(str(exc))
+        _remote_fallback(job, payload, meta, filename, str(exc))
+    except format_remote.Rejected as exc:
+        if exc.status in (401, 403):                             # 密钥配错：当作排版服务器不可用，并报警
+            format_remote.mark_down(str(exc))
+            _remote_fallback(job, payload, meta, filename, str(exc))
+        else:
+            job["state"] = "error"
+            job["stage"] = str(exc)
+            job["log"].append("排版服务器拒绝了请求：%s" % exc)
+    except format_remote.RemoteError as exc:                     # Busy：只是忙，让用户稍后再提交
+        job["state"] = "error"
+        job["stage"] = str(exc) or "当前排版任务较多，请稍后再提交"
+    except BaseException:
+        job["state"] = "error"
+        job["stage"] = "排版失败"
+        job["log"].append(traceback.format_exc())
+
+
+def _remote_fallback(job, payload, meta, filename, reason):
+    """排版服务器用不了：同一个任务改走云端 API（排版免费，导出才计费，所以随时可以切）。"""
+    rule = _cloud_haikou_rule() if dayipaper.has_token() else None
+    if not rule:
+        job["state"] = "error"
+        job["stage"] = "海口经济学院排版服务暂时不可用，请稍后重试"
+        job["log"].append("排版服务器不可用（%s），且云端排版也不可用" % reason)
+        return
+    job["log"].append("排版服务器不可用（%s），改用云端规范排版" % reason)
+    cloud_meta = {k: v for k, v in meta.items() if k not in ("sourceSuffix", "overrides")}
+    cloud_meta["ruleId"] = rule
+    # school_key 保持 school:hkjjxy：限定这所学校的优惠券照常能用
+    job.update(kind="cloud", state="running", files={}, stage="上传源文档", status=None,
+               statusLabel="", taskId=None, preview=None)
+    _run_cloud(job, payload, filename, cloud_meta, meta.get("overrides"))
 
 
 def _run_cloud(job, payload, filename, meta, retag=None):
