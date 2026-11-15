@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import logging
+import tempfile
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import hashlib
@@ -49,8 +50,16 @@ class DeepSeekClient:
         # 缓存配置
         cache_config = config.get('cost_control', {})
         self.cache_ttl = cache_config.get('cache_ttl', 3600)
-        self.cache_dir = Path('.dsh_cache')
-        self.cache_dir.mkdir(exist_ok=True)
+        # 生产容器的根文件系统是只读的，不能写相对路径（当前目录是 /app）；
+        # 默认放系统临时目录（容器里 TMPDIR=/data/tmp 可写）。缓存只是加速，建不出来就关掉，不能让请求失败。
+        self.cache_dir = Path(os.getenv('DSH_CACHE_DIR', '').strip()
+                              or Path(tempfile.gettempdir()) / 'dsh_cache')
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("DSH cache disabled, cannot create %s: %s", self.cache_dir, e)
+            self.cache_ttl = 0
+            self.cache_dir = None
 
         if not self.api_key:
             logger.warning("DEEPSEEK_API_KEY not set, DSH will be disabled")
@@ -109,6 +118,8 @@ class DeepSeekClient:
 
     def _get_cache(self, key: str) -> Optional[Dict[str, Any]]:
         """读取缓存"""
+        if self.cache_dir is None:
+            return None
         cache_file = self.cache_dir / f"{key}.json"
         if not cache_file.exists():
             return None
@@ -127,6 +138,8 @@ class DeepSeekClient:
     def _set_cache(self, key: str, result: Dict[str, Any]):
         """写入缓存"""
         import time
+        if self.cache_dir is None:
+            return
         cache_file = self.cache_dir / f"{key}.json"
         try:
             cache_file.write_text(json.dumps({

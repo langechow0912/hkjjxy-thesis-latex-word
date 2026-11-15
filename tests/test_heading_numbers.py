@@ -38,6 +38,7 @@ class HeadingNumbers(unittest.TestCase):
             doc.save(source)
             tex, _ = docx2tex.convert(str(source), tmp, P.load('hkjjxy'), log=lambda *a: None)
             headings = [b['text'] for b in texparse.parse(tex)['blocks'] if b['kind'] == 'heading']
+            # 绪论当第 1 章编号，下面的小节从 1.1 起（不再出现 0.1）
             self.assertEqual(headings, ['1　绪论', '1.1　背景'])
 
     def test_latex_fourth_level_keeps_numbering_and_references_do_not_force_page(self):
@@ -60,8 +61,30 @@ class HeadingNumbers(unittest.TestCase):
         stat, headings, _ = convert(['引言', '这里是正文。', '企业筹资风险相关理论基础',
                                     '0.1 企业筹资风险的内涵与分类', '0.1.1 企业筹资风险',
                                     '1 比亚迪风险识别', '1.1 概况'])
-        self.assertEqual(stat['numbering'], 'auto')
+        # 旧稿零开头的小节随第 1 章重新编号。
         self.assertEqual(headings, ['1', '1.1', '1.1.1', '2', '2.1'])
+
+    def test_unnumbered_chapter_titles_after_intro_and_mid_document_are_recovered(self):
+        # 引言为第 1 章，后续缺编号的第 2、3 章根据小节恢复。
+        long = '这是一段足够长的正文，用来说明本章要讨论的问题和研究的背景以及后续的安排。' * 2
+        stat, headings, _ = convert(['引言', long, '企业筹资风险相关理论基础', '2.1 内涵', long,
+                                     '控制策略建议', long, '3.1 偿债风险', long])
+        self.assertEqual(headings, ['1', '2', '2.1', '3', '3.1'])
+
+    def test_all_intro_names_take_chapter_one(self):
+        for intro in ('引言', '绪论', '前言', '1 引言', '1 绪论', '一、前言'):
+            stat, headings, _ = convert([intro, '这里是正文。', '1.1 背景', '2 理论', '2.1 概念'])
+            self.assertEqual(headings, ['1', '1.1', '2', '2.1'], intro)
+            self.assertEqual(stat['sec1'], 2, intro)
+
+    def test_intro_chapter_named_xulun_takes_chapter_one(self):
+        # 绪论无论有没有编号都是第 1 章；原稿写成 0.1 / 1 的后续章节都顺延重排
+        for src in (['绪论', '0.1 研究背景', '0.1.1 政策', '1 现状', '1.1 设计'],
+                    ['绪论', '1.1 研究背景', '1.1.1 政策', '2 现状', '2.1 设计'],
+                    ['1 绪论', '1.1 研究背景', '1.1.1 政策', '2 现状', '2.1 设计']):
+            stat, headings, _ = convert(src)
+            self.assertEqual(headings, ['1', '1.1', '1.1.1', '2', '2.1'], src)
+            self.assertEqual(stat['sec1'], 2, src)
 
     def test_bracket_titles_follow_parent_level_and_keep_fourth_numbers(self):
         with tempfile.TemporaryDirectory() as tmp:

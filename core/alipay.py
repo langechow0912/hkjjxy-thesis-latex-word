@@ -7,6 +7,7 @@ path and is never returned by this module.
 import base64
 from contextlib import closing
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -336,6 +337,13 @@ def _mark_paid(order_no, trade_no):
                                   (order_no,)).fetchone()
         affiliates.redeem_coupon(conn, order_no)
         affiliates.settle_paid_order(conn, paid_order)
+    # 积分充值单：付款确认后入账（幂等；漏了也会在读余额时补记）
+    if paid_order and str(paid_order["job_id"]).startswith("PT-"):
+        try:
+            from core import points
+            points.credit_topup(order_no)
+        except Exception:
+            logging.getLogger(__name__).exception("points top-up credit failed: %s", order_no)
 
 
 # The asynchronous notification can be lost (unreachable notify URL, proxy or

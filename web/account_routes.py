@@ -36,15 +36,6 @@ def _signed_in(request, response, token, user):
     return {'user': user}
 
 
-@router.post('/register')
-def register(body: Credentials, request: Request, response: Response):
-    try:
-        token, user = accounts.register(body.username, body.password)
-    except accounts.AccountError as exc:
-        raise HTTPException(exc.status, str(exc)) from None
-    return _signed_in(request, response, token, user)
-
-
 @router.post('/login')
 def login(body: Credentials, request: Request, response: Response):
     try:
@@ -52,6 +43,82 @@ def login(body: Credentials, request: Request, response: Response):
     except accounts.AccountError as exc:
         raise HTTPException(exc.status, str(exc)) from None
     return _signed_in(request, response, token, user)
+
+
+class EmailReq(BaseModel):
+    email: str
+
+
+class EmailCodeReq(BaseModel):
+    email: str
+    code: str
+
+
+class EmailRegisterReq(EmailCodeReq):
+    password: str
+
+
+def _fail(exc):
+    raise HTTPException(exc.status, str(exc)) from None
+
+
+@router.post('/email/send')
+def email_send(body: EmailReq):
+    try:
+        return accounts.send_email_code(body.email, 'login')
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
+@router.post('/email/login')
+def email_login(body: EmailCodeReq, request: Request, response: Response):
+    try:
+        token, user, created = accounts.login_with_email(body.email, body.code)
+    except accounts.AccountError as exc:
+        _fail(exc)
+    return {**_signed_in(request, response, token, user), 'created': created}
+
+
+@router.post('/email/register')
+def email_register(body: EmailRegisterReq, request: Request, response: Response):
+    try:
+        token, user, created = accounts.login_with_email(body.email, body.code, body.password)
+    except accounts.AccountError as exc:
+        _fail(exc)
+    return {**_signed_in(request, response, token, user), 'created': created}
+
+
+@router.post('/email/reset/send')
+def email_reset_send(body: EmailReq):
+    try:
+        return accounts.send_email_code(body.email, 'reset')
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
+@router.post('/email/reset')
+def email_reset(body: EmailRegisterReq, request: Request, response: Response):
+    try:
+        token, user = accounts.reset_password(body.email, body.code, body.password)
+    except accounts.AccountError as exc:
+        _fail(exc)
+    return _signed_in(request, response, token, user)
+
+
+@router.post('/email/bind/send')
+def email_bind_send(body: EmailReq, user=Depends(current_user)):
+    try:
+        return accounts.send_email_code(body.email, 'bind', user['id'])
+    except accounts.AccountError as exc:
+        _fail(exc)
+
+
+@router.post('/email/bind/verify')
+def email_bind_verify(body: EmailCodeReq, user=Depends(current_user)):
+    try:
+        return accounts.bind_email(user['id'], body.email, body.code)
+    except accounts.AccountError as exc:
+        _fail(exc)
 
 
 @router.post('/logout')

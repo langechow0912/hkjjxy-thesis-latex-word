@@ -31,10 +31,20 @@ class AccountTests(unittest.TestCase):
         accounts._FAILS.clear()
         self.client = TestClient(web.app)
 
-    def register(self, username=None, password='correct-horse'):
-        return self.client.post('/api/account/register', json={'username': username or name(), 'password': password})
+    def register(self, username=None, password='correct-horse', client=None):
+        """造一个老式用户名账号（HTTP 已不再开放用户名注册），再用密码登录。"""
+        username = username or name()
+        try:
+            accounts.register(username, password)
+        except accounts.AccountError as exc:
+            return type('Rejected', (), {'status_code': exc.status})()
+        return (client or self.client).post('/api/account/login', json={'username': username, 'password': password})
 
-    def test_register_signs_in_with_httponly_cookie(self):
+    def test_username_register_route_is_gone(self):
+        response = self.client.post('/api/account/register', json={'username': name(), 'password': 'correct-horse'})
+        self.assertIn(response.status_code, (404, 405))
+
+    def test_login_signs_in_with_httponly_cookie(self):
         response = self.register('学生_01')
         self.assertEqual(response.status_code, 200)
         self.assertIn('httponly', response.headers['set-cookie'].lower())
@@ -107,7 +117,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(items[0]['expires_at'] - items[0]['paid_at'], alipay.RESULT_TTL)
 
         other = TestClient(web.app)
-        other.post('/api/account/register', json={'username': name(), 'password': 'correct-horse'})
+        self.register(client=other)
         self.assertEqual(other.get('/api/account/history').json()['items'], [])
 
     def test_paid_text_service_is_listed(self):

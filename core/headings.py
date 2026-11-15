@@ -39,8 +39,10 @@ _CN_DIGITS = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
 FIXED_LEVEL = {"cn_chapter": 1, "cn_dun": 1, "arabic1": 1, "arabic2": 2, "arabic3": 3}
 # 容易和正文里的列表项混淆的种类，没有标题样式时要额外验证
 LIST_LIKE = ("cn_paren", "circled", "arabic_dot")
-# 模板里没有编号、但本来就是一级的固定标题，不参与重新编号
+# 引言、绪论、前言均按正常章节编号。
 _NO_PROMOTE = ("引言", "前言", "绪论")
+UNNUM_KIND = "unnum_h1"
+_CHAPTER_TITLES = _NO_PROMOTE
 _PUNCT = re.compile(r"[，。；：！？,.;:!?、]")
 _KIND_LABEL = {"cn_chapter": "第X章", "cn_dun": "一、", "cn_paren": "（一）",
                "circled": "①", "arabic_dot": "1."}
@@ -149,12 +151,14 @@ def _is_metric_label(items, i, text):
             in nxt[:40].replace("营业收入", "营收"))
 
 
-def plan(items, body_start, skip):
+def plan(items, body_start, skip, force=None):
     """通读正文，给每个标题段定级。
 
     items      docx2tex.read_items() 的结果
     body_start 正文起点（段落号）
     skip(it)   返回 True 的段落不参与判断（题注、表注、参考文献区等）
+    force      用户的手动设置 {条目下标: 1-4 或 0}。1-4 = 强制当成这一级标题（无视 skip，
+               仍走同一套「缺上级就压缩层级」的处理，编号由后面统一重排）；0 = 强制不是标题。
 
     返回 (decisions, notes)：
       decisions  {段落号: {level, text, src, orig, kind}}。level 1-3 是 sec1-3，
@@ -166,7 +170,7 @@ def plan(items, body_start, skip):
     stack = []                  # 当前标题路径 [(level, kind)]
     counts = [0, 0, 0]
     pending = []                # 自上一个标题以来、没被判成标题的正文段下标
-    state = {"level1": False, "chapter": None}
+    state = {"level1": False, "chapter": None, "unnum": False}
     rejected = {}               # kind → 刚被当成列表项拒掉的编号
     clamped, weak, demoted = [], [], []
     stripped = {}               # kind → 剥掉原编号的个数
@@ -177,7 +181,10 @@ def plan(items, body_start, skip):
     def commit(it, level, kind, text, src, orig):
         stack[:] = [e for e in stack if e[0] < level]
         stack.append((level, kind))
-        if level <= 3:
+        if kind == UNNUM_KIND:
+            counts[:] = [0, 0, 0]      # 不占章序号；它下面的小节按 0.1 起算
+            src = None
+        elif level <= 3:
             counts[level - 1] += 1
             counts[level:] = [0] * (3 - level)
             if src is None or len(src) != level:
@@ -187,6 +194,7 @@ def plan(items, body_start, skip):
         if level == 1:
             state["level1"] = True
             state["chapter"] = src[0] if src else None
+            state["unnum"] = kind == UNNUM_KIND
         decisions[it["pno"]] = {"level": level, "text": text, "src": src,
                                 "orig": orig, "kind": kind}
         pending[:] = []
@@ -211,14 +219,22 @@ def plan(items, body_start, skip):
         """遇到 X.Y 却没见过第 X 章：把前面被当成正文的章题找回来。"""
         if state["chapter"] == chapter and state["level1"]:
             return
-        prev = _prev_index(items, idx)
-        if not state["level1"] and prev is not None and prev in pending:
-            cand = items[prev]
-            text = cand["text"]
-            if (is_heading_line(text) and not re.search(r"[，,：:！？!?]", text)
-                    and text not in _NO_PROMOTE and parse_numbering(text) is None):
-                commit(cand, 1, "arabic1", text, (chapter,), text)
-                return
+        # X.Y 前面（上一个标题之后）没写编号的短行就是第 X 章的章题；章题和 X.1 之间可以隔着引导段。
+        # 以前只在还没出现过一级标题、且章题紧挨着 X.1 时才这么认，
+        # 结果「引言」之后的第 1 章、第 3 章之后没写编号的第 4 章都被吞成了正文。
+        # 原稿写 0.1 的，是明确挂在引言下面的小节，不去找第 0 章
+        expected = chapter >= 1 and (not state["level1"] or state["unnum"]
+                    or (state["chapter"] is not None and chapter == state["chapter"] + 1))
+        if expected:
+            for j in reversed(pending):
+                if state["level1"] and j == pending[0]:
+                    # 上一个标题后面的第一行不当章题：那样上一节就是空的，更像是上一节里的短句
+                    break
+                text = items[j]["text"]
+                if (is_heading_line(text) and not re.search(r"[，,：:！？!?。；;]", text)
+                        and text not in _NO_PROMOTE and parse_numbering(text) is None):
+                    commit(items[j], 1, "arabic1", text, (chapter,), text)
+                    return
         for j in reversed(pending):
             m = RE_H1.match(items[j]["text"])
             if m and int(m.group(1)) == chapter and len(items[j]["text"]) <= 2 * MAX_HEADING_LEN:
@@ -229,7 +245,13 @@ def plan(items, body_start, skip):
         if it["kind"] != "p" or it["pno"] < body_start:
             continue
         t = it["text"]
-        if not t or it.get("imgs") or skip(it):
+        if not t or it.get("imgs"):
+            continue
+        forced = force.get(idx) if force else None
+        if forced == 0:                      # 用户说这不是标题
+            pending.append(idx)
+            continue
+        if not forced and skip(it):
             continue
         num = parse_numbering(t)
         styled = it.get("heading_level")
@@ -237,7 +259,11 @@ def plan(items, body_start, skip):
         level = None
         text, src = t, None
 
-        if num:
+        if forced:
+            # 用户指定的标题：原编号照旧剥掉，层级交给下面统一的压缩逻辑
+            kind, level = "manual", forced
+            text = num["rest"] if num and num["rest"].strip() else t
+        elif num:
             k = num["kind"]
             rest = num["rest"]
             if k in ("arabic2", "arabic3"):
@@ -267,6 +293,9 @@ def plan(items, body_start, skip):
                     level = flex_level(k, styled, num["num"][0])
         elif styled:
             kind, text, level = "style", t, styled
+        elif t in _CHAPTER_TITLES and not state["level1"]:
+            # 没样式也没编号的「引言」「绪论」单独占一行：按名字认并编号
+            kind, level = "named_h1", 1
         elif it.get("bold") and 2 <= len(t) <= MAX_BOLD_LEN and not _PUNCT.search(t):
             _, nxt = _next_item(items, idx)
             if nxt is not None and ((nxt["kind"] == "p" and len(nxt["text"]) >= 40
@@ -285,10 +314,12 @@ def plan(items, body_start, skip):
         rejected.pop(kind, None)
 
         # 缺上级：压缩层级，不编造标题
+        clamp_from = None
         if level > top() + 1:
             fixed_level = level
             level = top() + 1
-            if kind in FIXED_LEVEL or kind == "style":
+            clamp_from = fixed_level
+            if kind in FIXED_LEVEL or kind in ("style", "manual"):
                 clamped.append((t, fixed_level, level))
             src = None
         elif styled and kind not in FIXED_LEVEL and kind != "style" and styled > level:
@@ -300,6 +331,8 @@ def plan(items, body_start, skip):
                                     "orig": t, "kind": kind}
             continue
         commit(it, level, kind, text, src, t)
+        if clamp_from:
+            decisions[it["pno"]]["clamped"] = clamp_from
         if kind in _KIND_LABEL:
             stripped[kind] = stripped.get(kind, 0) + 1
 

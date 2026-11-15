@@ -31,7 +31,52 @@
         <button class="btn primary" type="submit">保存价格</button>
       </form>
       <p>按非空白字符计数，改写按实际字符数比例计费、向上取整到分。改价只影响新报价，已有订单保留原金额。</p>
+      <p id="servicePointsHint" class="hint"></p>
       <p class="message" id="servicePriceMessage" role="status"></p>
+    </section>
+    <section class="section">
+      <div class="head"><h2>积分设置</h2></div>
+      <form class="form" id="pointsSettingsForm">
+        <div class="field"><label><input id="pointsEnabled" type="checkbox"> 开启积分功能（充值与积分支付）</label></div>
+        <div class="field"><label for="signupBonus">注册赠送积分（0 表示不赠送）</label><input id="signupBonus" type="number" min="0" max="10000" step="0.1" required></div>
+        <div class="field"><label for="signupBonusCap">每日最多赠送人数</label><input id="signupBonusCap" type="number" min="0" max="100000" step="1" required></div>
+        <div class="field"><label for="topupPackages">充值档位（元，英文逗号分隔，最多 8 个）</label><input id="topupPackages" required placeholder="5,10,20,50,100"></div>
+        <div class="field"><label for="aiRate">AI 助手：每 1000 token 扣多少积分</label><input id="aiRate" type="number" min="0.1" max="100" step="0.1" required></div>
+        <div class="field"><label for="aiMin">AI 助手：每次最低扣多少积分</label><input id="aiMin" type="number" min="0" max="100" step="0.1" required></div>
+        <div class="field"><label for="aiMaxOut">AI 助手：单次输出 token 上限</label><input id="aiMaxOut" type="number" min="200" max="8000" step="100" required></div>
+        <button class="btn primary" type="submit">保存积分设置</button>
+      </form>
+      <p>1 元 = 10 积分；服务的积分价与人民币价一致、不取整（例如 0.99 元 = 9.9 积分），积分最多一位小数。注册赠送只给邮箱验证通过的新用户。</p>
+      <p>AI 助手按 DeepSeek 返回的实际 token 用量扣积分：每次先按上限预留，用多少扣多少，多退少补，出错全额退还。<b>这三项默认值只是占位，请按 DeepSeek 真实账单校准</b>（例如一次扫描约 4000–6000 token）。</p>
+      <p class="message" id="pointsSettingsMessage" role="status"></p>
+    </section>
+    <section class="section">
+      <div class="head"><h2>积分调整与流水</h2></div>
+      <form class="form" id="pointsAdjustForm">
+        <div class="field"><label for="adjustEmail">用户邮箱</label><input id="adjustEmail" type="email" required></div>
+        <div class="field"><label for="adjustDelta">增减积分（负数为扣除，最多一位小数）</label><input id="adjustDelta" type="number" step="0.1" required></div>
+        <div class="field"><label for="adjustNote">备注（例如：订单失败退还）</label><input id="adjustNote" maxlength="100"></div>
+        <button class="btn primary" type="submit">提交调整</button>
+      </form>
+      <p>活动发放、失败订单退还积分都在这里操作，每次都会留下流水。</p>
+      <p class="message" id="pointsAdjustMessage" role="status"></p>
+      <div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>类型</th><th>变动</th><th>余额</th><th>备注</th></tr></thead><tbody id="pointsLedgerRows"></tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="head"><h2>积分兑换码</h2></div>
+      <form class="form" id="redeemForm">
+        <div class="field"><label for="redeemPoints">每个码兑换多少积分（最多一位小数）</label><input id="redeemPoints" type="number" min="0.1" max="10000" step="0.1" required></div>
+        <div class="field"><label for="redeemCount">生成几个码（1–500）</label><input id="redeemCount" type="number" min="1" max="500" step="1" value="1" required></div>
+        <div class="field"><label for="redeemUses">每个码最多可被几个用户兑换（每人限兑一次）</label><input id="redeemUses" type="number" min="1" max="1000000" step="1" value="1" required></div>
+        <div class="field"><label for="redeemExpires">有效期至（留空为长期有效）</label><input id="redeemExpires" type="date"></div>
+        <div class="field"><label for="redeemCustom">自定义码（可选，4–32 位字母数字；填了就只能生成 1 个）</label><input id="redeemCustom" maxlength="32" autocomplete="off"></div>
+        <div class="field"><label for="redeemNote">备注（例如：双十一活动）</label><input id="redeemNote" maxlength="100"></div>
+        <button class="btn primary" type="submit">生成兑换码</button>
+      </form>
+      <p class="message" id="redeemMessage" role="status"></p>
+      <div id="redeemOutputBox" hidden><textarea id="redeemOutput" rows="6" readonly style="width:100%"></textarea></div>
+      <p>码不区分大小写，用户输入时带不带连字符都行。已兑换的积分不会因停用而收回；兑换记录在上面的积分流水里（类型「兑换码」）。</p>
+      <div class="table-wrap"><table><thead><tr><th>兑换码</th><th>积分</th><th>已用 / 总数</th><th>有效期</th><th>状态</th><th>备注</th><th>操作</th></tr></thead><tbody id="redeemRows"></tbody></table></div>
     </section>
     <section class="section">
       <div class="head"><h2>最近服务订单</h2><button class="btn" id="downloadServiceOrders" type="button">下载订单 CSV</button></div>

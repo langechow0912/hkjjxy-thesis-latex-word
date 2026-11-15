@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DSH 结构助手 · Paper Layout</title><link rel="icon" type="image/png" href="/favicon.png"><link rel="shortcut icon" href="/favicon.ico">
+  <title>DSH 结构助手</title><link rel="icon" type="image/png" href="/favicon.png"><link rel="shortcut icon" href="/favicon.ico">
   <style>
-    :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#24212a;background:#f7f6f8;--line:#e6e2e9;--muted:#776f7e;--accent:#7656a4;--soft:#f0ebf7;--warn:#a5651b;--bad:#b3392e}
+    :root{--line:#e5e5e5;--muted:#767676;--accent:#1a1a1a;--soft:#f1f1f1;--warn:#a5651b;--bad:#b3392e}
     *{box-sizing:border-box}body{margin:0}
     header{background:#fff;border-bottom:1px solid var(--line)}
     .bar,main{width:min(1180px,calc(100% - 32px));margin:auto}
@@ -24,27 +24,28 @@
     .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
     .btn:disabled{opacity:.5;cursor:not-allowed}
     #tree{max-height:560px;overflow:auto;font-size:14px}
-    .row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px dashed #f0edf2}
+    .row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px dashed #f0f0f0}
     .row .lv{flex:none;min-width:30px;text-align:center;font-size:11px;border-radius:6px;background:var(--soft);color:var(--accent);padding:1px 4px}
     .row .num{color:var(--muted);flex:none}
     .row.body,.row.table{color:var(--muted);font-size:12px}
     .row .diff{font-size:11px;color:var(--warn);margin-left:auto;flex:none}
-    pre{margin:8px 0 0;padding:10px;background:#faf9fb;border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:260px;overflow:auto}
+    pre{margin:8px 0 0;padding:10px;background:#fafafa;border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:260px;overflow:auto}
     table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:6px 4px;border-bottom:1px solid var(--line);vertical-align:top}
     td:nth-child(n+2){white-space:nowrap;width:1%}
     .tag{white-space:nowrap;font-size:11px;border-radius:6px;padding:1px 6px;background:#e7f3ee;color:#28745a}.tag.off{background:#eee;color:var(--muted)}
-    #log{height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;background:#faf9fb;display:flex;flex-direction:column;gap:8px}
+    #log{height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;background:#fafafa;display:flex;flex-direction:column;gap:8px}
     .msg{max-width:88%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;font-size:14px}
     .msg.user{align-self:flex-end;background:var(--accent);color:#fff}.msg.bot{align-self:flex-start;background:#fff;border:1px solid var(--line)}
     .msg.err{align-self:center;color:var(--bad);background:none;font-size:13px}
     textarea{width:100%;min-height:64px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;resize:vertical;margin-top:10px}
     .tools{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
-    .sug{margin:8px 0 0;padding:8px 10px;border-left:3px solid var(--accent);background:#faf9fb;font-size:13px}.sug.high{border-color:var(--bad)}
+    .sug{margin:8px 0 0;padding:8px 10px;border-left:3px solid var(--accent);background:#fafafa;font-size:13px}.sug.high{border-color:var(--bad)}
     details{margin-top:16px}summary{cursor:pointer;color:var(--muted);font-size:13px}
   </style>
+  <link rel="stylesheet" href="/ui.css">
 </head>
 <body>
-  <header><div class="bar"><span class="brand">Paper Layout · DSH 结构助手</span><a href="/">返回网站</a></div></header>
+  <header><div class="bar dsh-bar"><a class="brand" href="/" style="text-decoration:none;color:inherit">论文排版 · DSH 结构助手</a><a class="btn" href="/">返回网站</a></div></header>
   <main>
     <h1>DSH 识别的目录</h1>
     <p class="muted">这里显示 DSH 对你这篇论文章节结构的识别结果，并可以直接和它对话、手动运行检查。DSH 只看到标题和各段正文的字数，看不到正文内容。</p>

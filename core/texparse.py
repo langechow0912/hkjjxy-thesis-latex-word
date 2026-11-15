@@ -202,7 +202,7 @@ def scan_body(lines, tables, figures, tab_labels, fig_labels):
             fourth = 0
             title = resolve(unesc(m.group(2)))
             if m.group(1):
-                blocks.append({"kind": "heading", "level": 1, "text": title})
+                blocks.append({"kind": "heading", "level": 1, "text": title, "unnum": True})
                 toc_entries.append((1, title))
             else:
                 cnt[0] += 1
