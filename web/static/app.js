@@ -567,7 +567,7 @@ function twChange() {
   $('twDetectionWrap').hidden = !detect;
   $('twDetectionMeta').hidden = !detect || !file;
   $('twFormatWrap').hidden = true;
-  $('twFile').accept = detect ? '.doc,.docx,.txt' : '.docx';
+  $('twFile').accept = detect ? '.doc,.docx,.txt' : '.doc,.docx';
   $('twPlatform').value = twPlatform;
   document.querySelector('.tw-platform-group .tw-option-label').textContent = '检测平台';
   document.querySelector('.tw-platform-group').hidden = !detect;
@@ -797,9 +797,16 @@ function twSendToCheckout(order, win) {
     ? '浏览器拦截了付款页，请点「打开支付宝付款」。'
     : '已打开支付宝收银台。付款后本页会自动开始处理，请不要关闭本页。';
 }
+// .doc 的字数是直接读文件二进制得出的，和 .docx 的数法不完全一样：报价时说明，并保证不会因此失败。
+function twApproxNote(quote) {
+  if (!quote?.approximate) return '';
+  return quote.basis === 'estimate'
+    ? '这份 .doc 无法精确读取字数，已按文件大小粗略估算（估算偏低，不会多收）。'
+    : '这份 .doc 的字数由文件内容直接解析得出，可能与 Word 里显示的略有出入（一般相差很小）；按此计费，不会因此影响处理。';
+}
 // 文本改写同一段原文：首次全价，之后再改写 3 次半价。
 function twOfferText(quote) {
-  if (!quote?.rewrite_discounts) return '';
+  if (!quote?.rewrite_discounts) return twApproxNote(quote);
   if (quote.discounted) return `本次半价，这段原文还剩 ${quote.discounts_left} 次半价重改。`;
   if (quote.paid_before) return '这段原文的半价次数已用完。';
   return `这段原文改写完成后，再改写可享受 ${quote.rewrite_discounts} 次半价。`;
@@ -838,7 +845,7 @@ async function twBuy(method = 'alipay') {
     const offer = twOfferText(quote);
     $('twOffer').textContent = offer;
     if (method === 'points') {
-      const ask = twPriceCents() == null ? `文档约 ${quote.characters} 字，需 ${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？`
+      const ask = twPriceCents() == null ? `文档约 ${quote.characters} 字，需 ${fmtPoints(pointsFor(quote.amount_cents))} 积分。${twApproxNote(quote)}确认支付？`
         : quote.discounted ? `本次享受半价：${fmtPoints(pointsFor(quote.amount_cents))} 积分，确认支付？` : '';
       if (ask && !confirm(ask)) {
         $('twMessage').textContent = '已取消，未扣积分。'; return;
@@ -1112,7 +1119,7 @@ fetch('/api/tabword').then(response => { if (!response.ok) throw new Error(); re
   twConfig = data; twChange(); twApplyPlatformStatus();
   for (const mode of ['reduce_ai', 'reduce_duplicate', 'both']) twSyncModels(mode, true);
   const p = data.prices;
-  $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写请用 .docx。1 元 = 10 积分。文本改写：同一段原文首次改写后，24 小时内再改写 3 次半价。`;
+  $('twPriceInfo').textContent = `文本检测 ${dualPrice(p.detect_text_cents)}/次 · 文件检测 ${dualPrice(p.detect_file_cents)}/次 · 改写 ${dualPrice(p.rewrite_per_1000_cents)}/千字（非空白字符按比例计费，向上取整到分）。文档改写支持 .docx / .doc（.doc 的字数由文件内容快速解析，可能有小误差，不会因此失败）。1 元 = 10 积分。文本改写：同一段原文首次改写后，24 小时内再改写 3 次半价。`;
 }).catch(() => { $('twMessage').textContent = '服务配置加载失败。'; });
 // Any change to what will be bought updates the price and which order is shown.
 $('twText').addEventListener('input', twRefresh);

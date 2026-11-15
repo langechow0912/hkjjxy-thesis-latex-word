@@ -79,9 +79,11 @@ class ServiceBillingTests(unittest.TestCase):
             doc.writestr('word/document.xml', '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>' + '字' * 1001 + '</w:t></w:r></w:p></w:body></w:document>')
         q = billing.quote('document_async', {'preset_zh': 'a'}, ('x.docx', buffer.getvalue()))
         self.assertEqual((q['characters'], q['amount_cents']), (1001, 101))
-        for name, content in (('x.doc', b'fake'), ('x.docx', b'fake')):
-            with self.assertRaises(tabword.TabwordError):
-                billing.quote('document_async', {}, (name, content))
+        with self.assertRaises(tabword.TabwordError):                  # 坏的 .docx 读不出正文：仍然报错
+            billing.quote('document_async', {}, ('x.docx', b'fake'))
+        # .doc 读不懂不再报错：按大小估算（偏低）并标记为估算，详见 tests/test_doc_quote.py
+        q = billing.quote('document_async', {}, ('x.doc', b'fake'))
+        self.assertEqual((q['basis'], q['approximate']), ('estimate', True))
 
     def test_quote_snapshot_survives_price_change(self):
         quote, order, _ = self.purchase()

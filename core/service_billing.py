@@ -14,7 +14,7 @@ import uuid
 import zipfile
 from xml.etree import ElementTree
 
-from core import alipay, tabword
+from core import alipay, doc_binary, tabword
 
 DEFAULTS = {"format_export_cents": 2999, "detect_text_cents": 99, "detect_file_cents": 399, "rewrite_per_1000_cents": 100}
 SUBMISSIONS = frozenset({"detect_text", "detect_file", "paraphrase", "paraphrase_stream",
@@ -208,11 +208,33 @@ def digest(operation, values, file):
     return hashlib.sha256(payload + b'\0' + (file[1] if file else b'')).hexdigest()
 
 
-def character_count(values, file):
+def doc_price_percent():
+    """.doc 报价的调整比例（%）：正数加价、负数让利，默认 0。
+
+    .doc 的字数是直接读二进制得出的，和 .docx 的数法实测相差 0%～0.3%。用户体验优先、宁可少收：
+    觉得要再让利就设成负数（环境变量 THESIS_DOC_PRICE_PERCENT，例如 -5 就是打 95 折）。"""
+    try:
+        value = int(round(float(os.environ.get('THESIS_DOC_PRICE_PERCENT', '0') or 0)))
+    except ValueError:
+        return 0
+    return max(-90, min(200, value))
+
+
+def count_with_basis(values, file):
+    """返回 (字数, basis)。basis：None = 精确（文本或 .docx）；"doc" = .doc 二进制快速解析；
+    "estimate" = .doc 读不出正文，按大小估算（偏低）。.doc 无论如何都不会让报价失败。"""
     text = values.get('text', '')
     if file:
-        if not file[0].lower().endswith('.docx'):
-            raise tabword.TabwordError("按字数计费的文档改写请上传 .docx 文件", 422)
+        name, data = file[0].lower(), file[1]
+        if name.endswith('.doc') and not data:
+            raise tabword.TabwordError("上传的文件是空的", 422)
+        if name.endswith('.doc') and data[:2] != b'PK':      # 真的 .doc；扩展名写成 .doc 的 .docx 走下面
+            count, basis = doc_binary.count(data)
+            if not count:
+                raise tabword.TabwordError("正文不能为空", 422)
+            return count, basis
+        if not (name.endswith('.docx') or name.endswith('.doc')):
+            raise tabword.TabwordError("按字数计费的文档改写请上传 .docx 或 .doc 文件", 422)
         try:
             with zipfile.ZipFile(io.BytesIO(file[1])) as archive:
                 info = archive.getinfo('word/document.xml')
@@ -228,7 +250,11 @@ def character_count(values, file):
     count = sum(not char.isspace() for char in text)
     if not count:
         raise tabword.TabwordError("正文不能为空", 422)
-    return count
+    return count, None
+
+
+def character_count(values, file):
+    return count_with_basis(values, file)[0]
 
 
 _PRESETS = {'at': 0, 'codes': None}
@@ -393,12 +419,17 @@ def quote(operation, values, file=None, user_id=None):
     p = prices()
     count = 0
     discounted = False
+    basis, percent = None, 0
     key = text_key(values) if operation in TEXT_REWRITES and not file else None
     if operation in ('detect_text', 'detect_file'):
         amount = p[operation + '_cents']
     else:
-        count = character_count(values, file)
-        amount = max(1, (count * p['rewrite_per_1000_cents'] + 999) // 1000)
+        count, basis = count_with_basis(values, file)
+        if basis:                                      # .doc：字数是快速解析/估算的，按调整比例计价
+            percent = doc_price_percent()
+            amount = max(1, (count * p['rewrite_per_1000_cents'] * (100 + percent) + 99999) // 100000)
+        else:
+            amount = max(1, (count * p['rewrite_per_1000_cents'] + 999) // 1000)
         if key and user_id and rewrite_offer(user_id, values)["discounts_left"] > 0:
             amount, discounted = max(1, (amount + 1) // 2), True
     if amount > 10000000:
@@ -411,6 +442,8 @@ def quote(operation, values, file=None, user_id=None):
                       key, str(user_id) if user_id else None, int(discounted)))
     offer = rewrite_offer(user_id, values) if key else {"paid": 0, "discounts_left": 0}
     return {"quote_id": identity, "amount_cents": amount, "characters": count, "prices": p,
+            # 字数是否为估算：basis = "doc"（.doc 二进制解析，可能有小误差）或 "estimate"（读不出，按大小估算且偏低）
+            "approximate": bool(basis), "basis": basis, "adjust_percent": percent,
             "discounted": discounted, "discounts_left": offer["discounts_left"] - (1 if discounted else 0),
             "paid_before": offer["paid"],
             "rewrite_discounts": REWRITE_DISCOUNTS if key else 0}

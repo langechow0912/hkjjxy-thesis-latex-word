@@ -25,13 +25,14 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 - `school:hkjjxy` → 本地链路 `core/schoolformat.run`：`docx2tex`（Word→tex 字符串，只当中间表示）→ `texparse` → `toc.probe` → `docxbuild`（生成 Word）→ LibreOffice 转 PDF → `preview_watermark`。需要 `soffice`，站点不编译 LaTeX。
 - `dayipaper:<id>` → 云端链路 `core/dayipaper.py`，后台线程轮询服务方。
 - `THESIS_LOCAL_FORMAT=false` 时海口经济学院也走云端，镜像不装 LibreOffice（构建参数和运行时变量要一起设）。
+- **【阿里云版，`aliyun-split` 分支，未上线】** 主站可以不装 LibreOffice，把海口经济学院的排版交给海外排版服务器（`core/format_remote.py` 客户端 + `web/format_worker_routes.py` 内部接口，`web/app.py` 的 `_school_route` 选路：海外排版服务器 → 本机 → 云端 API）；连不上自动改走云端。成品拷回主站后和本机排版一样，付款逻辑不变。部署和故障行为见 `docs/aliyun-split.md`。
 - 本地链路目前写死 `hkjjxy`（`web/app.py` 的 `LOCAL_SCHOOL`、`_run_school`），新增学校不只是加 `schools/<id>/`，见 `docs/new-school-guide.md`。
 
 **任务在内存里**（`web/app.py` 的 `JOBS`）。完成的任务把 `job.json` 写进自己的临时目录，启动时 `_restore_jobs` 扫描恢复；运行中的任务重启就丢。
 
 **两种付费商品共用一个 SQLite**（`ALIPAY_ORDER_DB`，默认 `.secrets/alipay-orders.sqlite3`）：
 - `payment_orders`（`core/alipay.py`）的 `job_id` 列有两种值：排版任务 `j<32 位 hex>`，降重/检测报价 `TW-<32 位 hex>`。
-- 降重/检测流程（`core/service_billing.py` + `web/tabword_routes.py`）：`quote` → `create_payment` → 支付 → `authorize` → `record`。付款绑定操作、参数、文件摘要，`authorize` 用一次原子更新把 `ready` 改成 `processing`，保证一笔付款只提交一次。**提交过的订单任何情况下不自动重试**；唯一的例外是连接阶段（TCP/TLS 握手）失败——请求一个字节都没发出去，`tabword.open_call` 会重试一次，仍失败就把订单恢复成 `ready` 让用户重新提交（见 `docs/service-billing.md`）。失败的订单一律退成积分（积分付的退原积分，支付宝付的退成同额积分，`points.refund_failed`），匿名订单留给人工核查。
+- 降重/检测流程（`core/service_billing.py` + `web/tabword_routes.py`）：`quote` → `create_payment` → 支付 → `authorize` → `record`。付款绑定操作、参数、文件摘要，`authorize` 用一次原子更新把 `ready` 改成 `processing`，保证一笔付款只提交一次。**提交过的订单任何情况下不自动重试**；唯一的例外是连接阶段（TCP/TLS 握手）失败——请求一个字节都没发出去，`tabword.open_call` 会重试一次，仍失败就把订单恢复成 `ready` 让用户重新提交（见 `docs/service-billing.md`）。失败的订单一律退成积分（积分付的退原积分，支付宝付的退成同额积分，`points.refund_failed`），匿名订单留给人工核查。降 AI 上传 `.doc` 时字数由 `core/doc_binary.py` 直接读二进制，读不懂也不报错、按偏低估算（`THESIS_DOC_PRICE_PERCENT` 可调价），见 `docs/service-billing.md`。
 - 付款确认有两条路：支付宝异步通知，和 `alipay.sync_order` 主动 `trade.query`（有频率限制）。本地没有公网通知地址，只靠后者。
 - 账号、会话、上传记录（`core/accounts.py`）和推广员/优惠券（`core/affiliates.py`）也在这个库里。
 
