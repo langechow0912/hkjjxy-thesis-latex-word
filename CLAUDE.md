@@ -31,7 +31,7 @@ docker compose up -d --build                        # 部署/更新；改了 THE
 
 **两种付费商品共用一个 SQLite**（`ALIPAY_ORDER_DB`，默认 `.secrets/alipay-orders.sqlite3`）：
 - `payment_orders`（`core/alipay.py`）的 `job_id` 列有两种值：排版任务 `j<32 位 hex>`，降重/检测报价 `TW-<32 位 hex>`。
-- 降重/检测流程（`core/service_billing.py` + `web/tabword_routes.py`）：`quote` → `create_payment` → 支付 → `authorize` → `record`。付款绑定操作、参数、文件摘要，`authorize` 用一次原子更新把 `ready` 改成 `processing`，保证一笔付款只提交一次。**提交过的订单任何情况下不自动重试**，失败的留给人工核查。
+- 降重/检测流程（`core/service_billing.py` + `web/tabword_routes.py`）：`quote` → `create_payment` → 支付 → `authorize` → `record`。付款绑定操作、参数、文件摘要，`authorize` 用一次原子更新把 `ready` 改成 `processing`，保证一笔付款只提交一次。**提交过的订单任何情况下不自动重试**；唯一的例外是连接阶段（TCP/TLS 握手）失败——请求一个字节都没发出去，`tabword.open_call` 会重试一次，仍失败就把订单恢复成 `ready` 让用户重新提交（见 `docs/service-billing.md`）。失败的订单一律退成积分（积分付的退原积分，支付宝付的退成同额积分，`points.refund_failed`），匿名订单留给人工核查。
 - 付款确认有两条路：支付宝异步通知，和 `alipay.sync_order` 主动 `trade.query`（有频率限制）。本地没有公网通知地址，只靠后者。
 - 账号、会话、上传记录（`core/accounts.py`）和推广员/优惠券（`core/affiliates.py`）也在这个库里。
 

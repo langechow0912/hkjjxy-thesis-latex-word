@@ -648,7 +648,7 @@ function twRender(data, eventName = '') {
   }
   if (!payload.paraphrased_text && !(eventName === 'progress' && payload.original)) $('twCompare').disabled = true;
 }
-async function twRequest(operation, values, submit, includeFile = true, paidOrder = '', savedFile = undefined) {
+async function twRequest(operation, values, submit, includeFile = true, paidOrder = '', savedFile = undefined, quoteId = '') {
   const body = new FormData(); body.append('params', JSON.stringify(values)); body.append('submit', String(submit));
   if (paidOrder) body.append('payment_order', paidOrder);
   const file = savedFile === undefined ? (!$('twFileWrap').hidden ? $('twFile').files[0] : null) : savedFile;
@@ -659,10 +659,27 @@ async function twRequest(operation, values, submit, includeFile = true, paidOrde
   // 上限来自服务器配置；没有上限的操作（例如查询任务）只显示已用时间。
   const limit = twConfig?.deadlines?.[operation] || 0;
   const clock = seconds => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  // 检测：服务器记着请求走到了哪一步（连接 / 送文件 / 文件已送达在检测），每 2.5 秒问一次，
+  // 让用户几秒内就知道文件有没有真的送到，不用干等到超时。
+  let phase = null;
+  const phaseText = {
+    connecting: '正在连接检测服务…',
+    retrying: '连接不稳定，正在重新连接…',
+    sending: '正在把文件送到检测服务…',
+    waiting: '文件已送达，正在检测，通常 10–60 秒，请勿关闭页面或重复提交。'};
+  const watcher = quoteId && paidOrder && operation.startsWith('detect') ? setInterval(async () => {
+    try { phase = (await request(`/api/tabword/billing/${quoteId}/${paidOrder}`)).progress || null; } catch (_) { /* 进度只是提示 */ }
+  }, 2500) : null;
   const tick = () => {
     const used = Math.round((Date.now() - started) / 1000), left = limit - used;
     const wait = !limit ? `已用 ${used} 秒`
       : left > 0 ? `已用 ${used} 秒，最长还需等待 ${clock(left)}` : `已用 ${used} 秒`;
+    if (phase && phaseText[phase.phase]) {
+      $('twMessage').textContent = limit && left <= 0
+        ? `已超过预计等待时间，正在确认结果（${wait}）。如果失败，会自动退款为积分，请勿重复提交。`
+        : `${phaseText[phase.phase]}（${wait}）`;
+      return;
+    }
     $('twMessage').textContent = limit && left <= 0
       ? `已超过预计等待时间，正在确认结果（${wait}）。如果失败，会自动退还积分，请勿重复提交。`
       : used < 30 ? `处理中，请稍候…${wait}。超过这个时间仍没有结果，会自动退还积分。`
@@ -677,7 +694,7 @@ async function twRequest(operation, values, submit, includeFile = true, paidOrde
     if (twPlatformDown(error)) twReloadConfig();
     throw error;
   } finally {
-    clearInterval(timer);
+    clearInterval(timer); if (watcher) clearInterval(watcher);
     // 异步任务提交后请求虽然结束了，但服务商还在处理：继续显示进度条，直到查询到结果。
     twBar(twProcessing && !!$('twTask').value);
   }
@@ -914,7 +931,9 @@ async function twRunPaid(order) {
     if (state.service_state === 'failed') {
       // 失败的订单不会再卡在这里：告诉用户原因，让这单结束，同一份材料可以直接重新提交。
       order.done = true; twSaveOrders(); $('twBilling').hidden = true;
-      throw new Error(`处理失败：${(state.error || '服务商没有返回结果').replace(/（积分已退）$/, '')}。使用积分支付的订单已退还积分，可以直接重新提交。`);
+      const alipayRefund = /（支付宝付款已退成积分）$/.test(state.error || '');
+      throw new Error(`处理失败：${(state.error || '服务商没有返回结果').replace(/（(积分已退|支付宝付款已退成积分)）$/, '')}。${alipayRefund
+        ? '支付宝付款已按原额退还为积分，可以用积分重新提交。' : '使用积分支付的订单已退还积分，可以直接重新提交。'}`);
     }
     if (state.service_state !== 'ready') throw new Error('该订单已经提交处理，不能重复调用。如未收到结果，请保留订单号联系客服。');
     if (!order.values) throw new Error('付款已确认，但这个页面没有保存下单时的内容。请回到下单的页面，或保留订单号联系客服。');
@@ -928,7 +947,7 @@ async function twRunPaid(order) {
     $('twMessage').textContent = '付款已确认，正在处理，请勿关闭页面…';
     twSetOutputEmpty(); $('twTask').value = ''; $('twTaskWrap').hidden = true;
     order.waiting = true; twSaveOrders();     // the server marks it as processing now: never auto-retry
-    await twRequest(order.operation, order.values, true, true, order.order_id, file);
+    await twRequest(order.operation, order.values, true, true, order.order_id, file, order.quote_id);
     if (twTaskFrom(order)) return;
     order.done = true; twSaveOrders();
     $('twBilling').hidden = true;

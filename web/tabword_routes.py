@@ -56,7 +56,8 @@ def payment_status(quote_id: str, order_id: str):
         raise HTTPException(404, '订单不存在')
     q = billing.get_quote(quote_id)
     return {'status': order['status'], 'service_state': q['state'], 'task_id': q['task_id'],
-            'task_operation': q['task_operation'], 'error': q['error']}
+            'task_operation': q['task_operation'], 'error': q['error'],
+            'progress': billing.get_progress(quote_id) if q['state'] == 'processing' else None}
 
 
 @router.get('/billing/{quote_id}/{order_id}/result')
@@ -167,8 +168,13 @@ def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False
         # 非流式调用放到工作线程里，最多等 deadline() 秒；名额等工作线程真正结束才归还。
         handed, slot = slot, None
         release = (lambda: billing.GATE.release(handed)) if handed else None
+        options = billing.call_options(identity)
         try:
-            result = billing.call_with_deadline(lambda: tabword.call(operation,values,content), release, operation + ctx)
+            result = billing.call_with_deadline(lambda: tabword.call(operation,values,content,**options), release, operation + ctx)
+        except tabword.NotDelivered as exc:
+            # 连接阶段就失败：文件没送到服务商，不可能被处理或计费。订单恢复成可重新提交，付款继续有效。
+            note = billing.release_unsubmitted(identity, operation, str(exc) + ctx) if identity else None
+            raise tabword.TabwordError(note or str(exc), 503) from None
         except tabword.TabwordError as exc:
             note = billing.record(identity, operation, error=True, reason=str(exc) + ctx) if identity else None
             advice = billing.note_platform_failure(operation, values, exc)
@@ -176,6 +182,8 @@ def dispatch(operation: str, params: str = Form('{}'), submit: bool = Form(False
         except Exception as exc:
             note = billing.record(identity, operation, error=True, reason='%s: %s' % (type(exc).__name__, exc) + ctx) if identity else None
             raise tabword.TabwordError(note or '服务商连接失败', 502) from None
+        finally:
+            billing.clear_progress(identity)
         if identity:
             billing.record(identity, operation, result)
             billing.note_platform_success(operation, values)

@@ -1,20 +1,138 @@
 """Tabword documented API contracts. No upstream traffic unless explicitly enabled."""
+import http.client
 import json
+import logging
 import mimetypes
 import os
 import re
+import socket
+import threading
+import time
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.request import Request, build_opener, HTTPRedirectHandler, HTTPHandler, HTTPSHandler
 from urllib.error import HTTPError, URLError
+
+logger = logging.getLogger(__name__)
 
 
 class TabwordError(Exception):
     def __init__(self, message, status=502):
         super().__init__(message)
         self.status = status
+
+
+class NotDelivered(TabwordError):
+    """请求一个字节都没发给服务商（连接阶段就失败了）：服务商不可能处理、也不可能计费，
+    所以同一笔付款可以安全地重新提交。这是唯一允许重试的失败。"""
+
+
+class ConnectFailed(OSError):
+    """TCP 连接或 TLS 握手失败（请求还没开始发送）。"""
+
+
+CONNECT_TIMEOUT = 30       # 连上服务商（TCP + TLS 握手）最多等多久；正常 0.5 秒内完成
+READ_TIMEOUT = 150         # 连上之后单次读写最多等多久（流式改写仍靠它）
+CONNECT_ATTEMPTS = 2       # 连接阶段失败最多试几次：这时请求还没发出去，重试不会重复提交
+RETRY_PAUSE = 1
+
+
+def _pause(seconds):
+    time.sleep(seconds)
+
+
+class _Call:
+    """一次对服务商的请求：当前阶段 + 硬截止时间。
+
+    阶段：connecting（连接中）→ sending（送文件）→ waiting（文件已送达，等结果）；
+    连接失败重试时是 retrying。截止时间到了由看门狗直接掐断连接，
+    服务商哪怕一直一点一点地回数据（每次读都不超时）也拖不过截止时间。"""
+
+    def __init__(self, deadline=None, on_phase=None):
+        self.until = time.monotonic() + deadline if deadline else None
+        self.on_phase = on_phase
+        self.phase = 'connecting'
+        self.sock = None
+        self.timer = None
+        self.fired = False
+
+    def set(self, phase, **info):
+        self.phase = phase
+        if self.on_phase:
+            try:
+                self.on_phase(phase, **info)
+            except Exception:                                  # noqa: BLE001  进度只是提示，不能影响请求
+                logger.exception("tabword phase callback failed")
+
+    def time_left(self):
+        return float('inf') if self.until is None else self.until - time.monotonic()
+
+    def read_timeout(self):
+        return max(1.0, min(READ_TIMEOUT, self.time_left()))
+
+    def arm(self):
+        if self.until is None or self.timer is not None:
+            return
+        self.timer = threading.Timer(max(0.5, self.time_left()), self._abort)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _abort(self):
+        self.fired = True
+        sock = self.sock
+        if sock is None:
+            return
+        for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+            try:
+                action()
+            except OSError:
+                pass
+
+    def done(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+
+def _connection(base, call):
+    class Connection(base):
+        def connect(self):
+            self.timeout = CONNECT_TIMEOUT
+            call.set('connecting')
+            try:
+                super().connect()
+            except OSError as exc:
+                raise ConnectFailed('%s: %s' % (type(exc).__name__, exc)) from None
+            call.sock = self.sock
+            call.arm()
+            self.sock.settimeout(call.read_timeout())
+            call.set('sending')
+
+        def getresponse(self):
+            call.set('waiting')          # 请求已经完整发出，剩下只是等服务商处理
+            return super().getresponse()
+    return Connection
+
+
+def _opener(call):
+    class Http(HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_connection(http.client.HTTPConnection, call), req)
+
+    class Https(HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_connection(http.client.HTTPSConnection, call), req, context=self._context)
+    return build_opener(NoRedirect(), Http(), Https())
+
+
+def _interrupted(call, deadline):
+    """连上之后失败（或被看门狗掐断）：请求可能已经被服务商收到，不能重试。"""
+    if call is not None and call.fired and deadline:
+        sent = '文件已送达服务商，但' if call.phase == 'waiting' else ''
+        return TabwordError('%s服务商在 %d 秒内没有返回结果，已放弃等待' % (sent, deadline), 504)
+    return TabwordError('服务商连接中断，提交状态可能未确认；未自动重试', 502)
 
 
 @dataclass(frozen=True)
@@ -177,7 +295,12 @@ def dry_run(name, params=None, file=None):
             'file_bytes':len(file[1]) if file else 0,'message':'本地校验通过，未请求服务商、未提交、未计费。'}
 
 
-def open_call(name, params=None, file=None, catalog_read=False):
+def open_call(name, params=None, file=None, catalog_read=False, *, deadline=None, on_phase=None):
+    """向服务商发请求并返回 (接口, 响应, key)。
+
+    deadline   整个调用（含读完响应体）的硬截止秒数；不给就只有单次读写超时。
+    on_phase   阶段回调 on_phase(phase, **info)，phase 见 _Call。
+    连接阶段（TCP/TLS）失败会安全重试一次；连上之后的任何失败都不重试（请求可能已被服务商收到）。"""
     # Includes GET: querying a successful format job triggers billing upstream.
     if not enabled('TABWORD_ENABLE_CALLS') and not (catalog_read and name in FREE_CATALOG_OPERATIONS):
         raise TabwordError('当前仅校验，不向服务商提交请求',409)
@@ -186,29 +309,54 @@ def open_call(name, params=None, file=None, catalog_read=False):
     key=api_key()
     if not key or '\r' in key or '\n' in key: raise TabwordError('尚未配置独立的 Tabword API Key',503)
     r.add_header('Authorization','Bearer '+key)
-    try:
-        response=build_opener(NoRedirect()).open(r,timeout=150)
-    except HTTPError as e:
-        e.close()
-        raise TabwordError(f'服务商返回 HTTP {e.code}，未自动重试',e.code if 400<=e.code<=599 else 502) from None
-    except (URLError,TimeoutError,OSError):
-        raise TabwordError('服务商连接中断，提交状态可能未确认；未自动重试',502) from None
+    state=_Call(deadline,on_phase)
+    opener=_opener(state)
+    attempt=0
+    while True:
+        attempt+=1
+        try:
+            response=opener.open(r,timeout=CONNECT_TIMEOUT)
+            break
+        except HTTPError as e:
+            state.done();e.close()
+            raise TabwordError(f'服务商返回 HTTP {e.code}，未自动重试',e.code if 400<=e.code<=599 else 502) from None
+        except URLError as e:
+            state.done()
+            if isinstance(e.reason,ConnectFailed):
+                logger.warning("tabword %s: connect attempt %d failed: %s",name,attempt,e.reason)
+                if attempt<CONNECT_ATTEMPTS and state.time_left()>CONNECT_TIMEOUT+5:
+                    state.set('retrying',attempt=attempt);_pause(RETRY_PAUSE);continue
+                raise NotDelivered('无法连接服务商（连接阶段失败，请求没有送达）',503) from None
+            raise _interrupted(state,deadline) from None
+        except (OSError,http.client.HTTPException):
+            state.done()
+            raise _interrupted(state,deadline) from None
     expected='text/event-stream' if o.stream else 'application/json'
     if expected not in response.headers.get('Content-Type',''):
-        response.close();raise TabwordError('服务商响应类型与文档不符')
+        state.done();response.close();raise TabwordError('服务商响应类型与文档不符')
+    try: response._tw_call=state     # call() 读完响应体后据此撤掉看门狗
+    except AttributeError: pass
     return o,response,key
 
 
-def call(name, params=None, file=None, catalog_read=False):
+def call(name, params=None, file=None, catalog_read=False, *, deadline=None, on_phase=None):
     if catalog_read and name not in FREE_CATALOG_OPERATIONS:
         raise TabwordError('此接口不属于免费只读目录',403)
     if name in OPERATIONS and OPERATIONS[name].stream:
         raise TabwordError('流式接口请使用 stream_call',422)
-    o,response,key=open_call(name,params,file,catalog_read)
+    extra={k:v for k,v in (('deadline',deadline),('on_phase',on_phase)) if v is not None}
+    o,response,key=open_call(name,params,file,catalog_read,**extra)
+    state=getattr(response,'_tw_call',None)
     if o.stream:
+        if state: state.done()
         response.close();raise TabwordError('流式接口请使用 stream_call',422)
-    with response:
-        payload=response.read(10*1024*1024+1)
+    try:
+        with response:
+            payload=response.read(10*1024*1024+1)
+    except (OSError,http.client.HTTPException):
+        raise _interrupted(state,deadline) from None
+    finally:
+        if state: state.done()
     if len(payload)>10*1024*1024: raise TabwordError('服务商响应过大')
     try: result=json.loads(payload)
     except (ValueError,UnicodeDecodeError): raise TabwordError('服务商未返回有效 JSON') from None

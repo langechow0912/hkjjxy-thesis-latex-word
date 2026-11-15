@@ -636,3 +636,43 @@ def refund_spend(job_id, reason="服务处理失败，积分已全额退还"):
             return None
         return _show(-spent["delta"])
     return _transaction(run)
+
+
+def refund_paid_as_points(job_id, user_id, amount_cents, reason="服务处理失败，付款已按原额退还为积分"):
+    """支付宝付款的服务失败后，把付款原额退成积分（1 元 = 10 积分）。成功返回退回的积分数。
+
+    没有账号（匿名报价）、金额无效、已经退过的返回 None。同一任务只会退一次：
+    流水的 UNIQUE(kind, ref) 兜底（ref 带 "alipay:" 前缀，不和积分支付的退款撞车）。
+    只发积分，不动支付宝里的钱；如果之后又人工退了现金，要先把这些积分扣回。"""
+    try:
+        cents = int(amount_cents)
+        owner = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    if cents <= 0:
+        return None
+
+    def run(conn):
+        try:
+            _apply(conn, owner, cents, "refund", "alipay:" + job_id, reason)
+        except _Duplicate:
+            return None
+        return _show(cents)
+    return _transaction(run)
+
+
+def refund_failed(job_id, user_id, label):
+    """服务失败后原额退款，一律退成积分。返回 (积分数, 'spend' | 'alipay')；退不了返回 (None, None)。
+
+    'spend'：积分付的，退回当初扣的积分。
+    'alipay'：支付宝付的，按付款金额退成同额积分，用户马上能用积分重新提交。"""
+    refunded = refund_spend(job_id, "%s失败，积分已全额退还" % label)
+    if refunded is not None:
+        return refunded, "spend"
+    order = _paid_order(job_id)
+    if order and order.get("payment_product") == "page_pay":
+        refunded = refund_paid_as_points(job_id, user_id, order["amount_cents"],
+                                         "%s失败，支付宝付款已按原额退还为积分" % label)
+        if refunded is not None:
+            return refunded, "alipay"
+    return None, None

@@ -90,6 +90,47 @@ def deadlines():
 _WORKERS = ThreadPoolExecutor(max_workers=32, thread_name_prefix='tabword')
 
 
+# ---- 处理进度：让页面能告诉用户「连没连上、文件送没送到」 ----
+# 只在内存里（服务是单进程）；页面轮询订单状态时带回去。处理结束就清掉。
+_PROGRESS, _PROGRESS_LOCK = {}, threading.Lock()
+
+
+def progress_for(identity):
+    """登记一笔处理并返回阶段回调 note(phase, **info)。clear_progress 之后迟到的回调不会再写。"""
+    token, now = uuid.uuid4().hex, time.time()
+    if not identity:
+        return None
+    with _PROGRESS_LOCK:
+        _PROGRESS[identity] = {'token': token, 'phase': 'connecting', 'attempt': 1, 'started': now}
+
+    def note(phase, **info):
+        with _PROGRESS_LOCK:
+            entry = _PROGRESS.get(identity)
+            if entry and entry['token'] == token:
+                entry.update(phase=phase, attempt=info.get('attempt', entry['attempt']))
+    return note
+
+
+def get_progress(identity):
+    with _PROGRESS_LOCK:
+        entry = _PROGRESS.get(identity)
+        if not entry:
+            return None
+        return {'phase': entry['phase'], 'attempt': entry['attempt'],
+                'elapsed': int(time.time() - entry['started'])}
+
+
+def clear_progress(identity):
+    with _PROGRESS_LOCK:
+        _PROGRESS.pop(identity, None)
+
+
+def call_options(identity):
+    """传给 tabword.call 的参数。线程自己的硬截止时间比外层的等待早 2 秒：
+    这样「连接阶段失败」「文件已送达但没有结果」由线程如实报告，而不是外层统一报超时。"""
+    return {'deadline': max(1, deadline() - 2), 'on_phase': progress_for(identity)}
+
+
 def call_with_deadline(fn, on_finished=None, label=''):
     """在工作线程里调用服务商，最多等 deadline() 秒。
 
@@ -422,7 +463,7 @@ def fail_stuck(now=None):
     处理中的异步文档任务（submitted）不算卡住，它们本来就要等服务商。返回处理的订单号。"""
     now = now or time.time()
     with closing(connect()) as conn:
-        rows = conn.execute("""SELECT id, operation, state, started_at FROM service_quotes
+        rows = conn.execute("""SELECT id, operation, state, started_at, user_id FROM service_quotes
             WHERE state='processing' OR (state='submitted' AND operation IN (%s))"""
                             % ','.join('?' * len(STUCK_STREAMS)), STUCK_STREAMS).fetchall()
     fixed = []
@@ -438,20 +479,26 @@ def fail_stuck(now=None):
                                    (reason, row['id'], row['state'])).rowcount
         if claimed != 1:
             continue                                # 刚好在这一刻完成了，别动它
-        from core import points
-        try:
-            refunded = points.refund_spend(row['id'], "%s，积分已全额退还" % _TITLES.get(row['operation'], '服务处理'))
-        except Exception:                           # noqa: BLE001
-            logger.exception("refund failed for stuck order %s", row['id'])
-            refunded = None
-        logger.warning("stuck tabword order %s (%s) failed by sweeper; refunded=%s", row['id'], row['operation'], refunded)
+        refunded, how = _refund_failed(row['id'], row['user_id'], _TITLES.get(row['operation'], '服务处理'))
+        logger.warning("stuck tabword order %s (%s) failed by sweeper; refunded=%s via %s",
+                       row['id'], row['operation'], refunded, how)
         fixed.append(row['id'])
     if fixed:
         from core import alerts
         alerts.alert(('stuck',), '%d 笔订单处理中断，已标记失败' % len(fixed),
-                     '这些订单长时间停在「处理中」（页面关闭、网络断开或服务重启）：\n%s\n\n用积分支付的已自动退还。'
-                     % '\n'.join(fixed))
+                     '这些订单长时间停在「处理中」（页面关闭、网络断开或服务重启）：\n%s\n\n'
+                     '积分付款的已退还积分，支付宝付款的已按原额退成积分。' % '\n'.join(fixed))
     return fixed
+
+
+def _refund_failed(identity, user_id, label):
+    """失败订单退款（一律退成积分）。返回 (积分数, 'spend'|'alipay')，退不了返回 (None, None)；退款出错不能吞掉原来的错误。"""
+    from core import points
+    try:
+        return points.refund_failed(identity, user_id, label)
+    except Exception:                                            # noqa: BLE001
+        logger.exception("refund failed for %s", identity)
+        return None, None
 
 
 def create_payment(identity, referral=None, campaign='', resume_return=False):
@@ -494,11 +541,29 @@ def authorize(operation, values, file, order_id):
 
 
 FAILED_REFUNDED = "处理失败，积分已全额退还，可以重新提交"
+FAILED_ALIPAY_REFUNDED = "处理失败，支付宝付款已按原额退还为积分，可以用积分重新提交"
 FAILED_MANUAL = "处理失败；如已付款请保留订单号联系客服退款，可以重新提交"
+NOT_DELIVERED = "无法连接检测服务，文件没有送达服务商，不会重复收费；付款仍然有效。请稍后点「已付款但没有开始？点这里」重新提交"
+
+
+def release_unsubmitted(identity, operation, reason=''):
+    """文件根本没送到服务商（连接阶段失败）：服务商不可能处理或计费，把订单恢复成「可重新提交」。
+
+    不退款也不标记失败，付款继续有效，用户稍后用同一笔付款重新提交。
+    返回给用户的提示；订单不在「处理中」（已被别处处理）返回 None。"""
+    with closing(connect()) as conn, conn:
+        changed = conn.execute("""UPDATE service_quotes SET state='ready', started_at=NULL, elapsed=NULL, error=NULL
+                                  WHERE id=? AND state='processing'""", (identity,)).rowcount
+    logger.warning("tabword %s not delivered for %s; order released for resubmission: %s", operation, identity, reason)
+    from core import alerts
+    alerts.alert(('provider-connect', operation), '连接服务商失败，文件没有送达',
+                 '订单：%s\n原因：%s\n\n订单已恢复为「可重新提交」：付款仍然有效，没有退款，也没有标记失败。'
+                 % (identity, reason))
+    return NOT_DELIVERED if changed else None
 
 
 def record(identity, operation, result=None, error=None, stream=None, reason=''):
-    """记下处理结果。error 为真时标记失败、写入原因，并把积分原额退回。返回失败提示（成功返回 None）。"""
+    """记下处理结果。error 为真时标记失败、写入原因，并原额退款（一律退成积分）。返回失败提示（成功返回 None）。"""
     if not identity or operation in ('document_task', 'paraphrase_task'):
         return None
     payload = result if isinstance(result, dict) else {}
@@ -510,20 +575,18 @@ def record(identity, operation, result=None, error=None, stream=None, reason='')
     if error:
         reason = str(reason or (error if isinstance(error, str) else '') or '服务商未返回完整结果')[:300]
         logger.warning("tabword %s failed for %s: %s", operation, identity, reason)
-        from core import points
-        refunded = None
-        if identity:
-            try:
-                refunded = points.refund_spend(identity, "%s失败，积分已全额退还" % _TITLES.get(operation, '服务处理'))
-            except Exception:                                    # noqa: BLE001  退款失败不能吞掉原错误
-                logger.exception("points refund failed for %s", identity)
-        note = FAILED_REFUNDED if refunded is not None else FAILED_MANUAL
-        reason = '%s（%s）' % (reason, '积分已退' if refunded is not None else '未用积分或已退款，需人工核查')
+        with closing(connect()) as conn:
+            owner = conn.execute("SELECT user_id FROM service_quotes WHERE id=?", (identity,)).fetchone()
+        refunded, how = _refund_failed(identity, owner['user_id'] if owner else None, _TITLES.get(operation, '服务处理'))
+        note = {'spend': FAILED_REFUNDED, 'alipay': FAILED_ALIPAY_REFUNDED}.get(how, FAILED_MANUAL)
+        reason = '%s（%s）' % (reason, {'spend': '积分已退', 'alipay': '支付宝付款已退成积分'}.get(how, '未用积分或已退款，需人工核查'))
         from core import alerts
         alerts.alert(('provider', operation), '%s失败' % _TITLES.get(operation, operation),
-                     '订单：%s\n原因：%s\n%s' % (identity, reason,
-                                         '已自动退还积分。' if refunded is not None
-                                         else '没有用积分支付（或已退过），如是支付宝付款请人工退款。'))
+                     '订单：%s\n原因：%s\n%s' % (identity, reason, {
+                         'spend': '已自动退还积分。',
+                         'alipay': '支付宝付款已自动按原额退成积分（%s 积分），用户可直接用积分重试。'
+                                   '如果还要退现金，请先扣回这些积分，免得退两次。' % refunded}.get(
+                         how, '没有退款（匿名订单、或已经退过），如是支付宝付款请人工退款。')))
     with closing(connect()) as conn, conn:
         conn.execute("UPDATE service_quotes SET state=?,task_id=?,task_operation=?,error=?,result_json=?,result_sse=? WHERE id=?",
                      ('failed' if error else 'complete' if stream is not None or (result is not None and operation not in TASKS) else 'submitted', str(task_id) if task_id else None,
